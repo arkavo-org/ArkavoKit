@@ -111,10 +111,7 @@ public class AudioRouter {
         }
         sampleCount[sourceID]! += 1
 
-        // Log every 100 samples
-        if sampleCount[sourceID]! % 100 == 0 {
-            print("🎵 AudioRouter: Received \(sampleCount[sourceID]!) samples from [\(sourceID)]")
-        }
+        // Removed excessive logging - sample count tracking still maintained for debugging if needed
 
         guard let converter = converters[sourceID] else {
             print("⚠️ AudioRouter: No converter for source [\(sourceID)]")

@@ -418,6 +418,51 @@ public final class ArkavoClient: NSObject {
         )
     }
 
+    /// Decrypts a NanoTDF by coordinating with the KAS via WebSocket
+    /// - Parameter nanoTDFData: The serialized NanoTDF data to decrypt
+    /// - Returns: The decrypted plaintext
+    /// - Throws: ArkavoError or decryption errors
+    public func decryptNanoTDF(_ nanoTDFData: Data) async throws -> Data {
+        // Step 1: Parse the NanoTDF
+        let parser = BinaryParser(data: nanoTDFData)
+        let header = try parser.parseHeader()
+        let payload = try parser.parsePayload(config: header.payloadSignatureConfig)
+        let signature = try parser.parseSignature(config: header.payloadSignatureConfig)
+        let nanoTDF = NanoTDF(header: header, payload: payload, signature: signature)
+
+        // Step 2: Send rewrap request to KAS
+        let rewrapMessage = RewrapMessage(header: header)
+        try await sendMessage(rewrapMessage.toData())
+
+        // Step 3: Wait for rewrapped key response (0x04)
+        let rewrappedData = try await waitForMessage(type: .rewrappedKey)
+
+        // Step 4: Parse the rewrapped key response
+        // Format: [1 byte type] + [32 bytes identifier] + [60 bytes key data]
+        // Key data: [12 bytes nonce] + [32 bytes encrypted key] + [16 bytes auth tag]
+        guard rewrappedData.count == 93 else {
+            throw ArkavoError.messageError("Invalid rewrapped key response length: \(rewrappedData.count)")
+        }
+
+        let keyData = rewrappedData.suffix(60)
+        let nonce = keyData.prefix(12)
+        let encryptedKey = keyData.dropFirst(12).prefix(32)
+        let authTag = keyData.suffix(16)
+
+        // Step 5: Decrypt the rewrapped key to get the DEK
+        let dek = try decryptRewrappedKey(
+            nonce: nonce,
+            rewrappedKey: encryptedKey,
+            authTag: authTag,
+            isV13: true
+        )
+
+        // Step 6: Decrypt the payload using the DEK
+        let plaintext = try await nanoTDF.getPayloadPlaintext(symmetricKey: dek)
+
+        return plaintext
+    }
+
     private func handleKASKeyResponse(data: Data) throws {
         print("handleKASKeyResponse - Received data length: \(data.count)")
 

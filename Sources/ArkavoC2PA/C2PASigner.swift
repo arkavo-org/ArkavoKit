@@ -117,6 +117,26 @@ public actor C2PASigner {
             let errorMessage = String(data: errorData, encoding: .utf8) ?? "Unknown error"
             throw SigningError.signingFailed(errorMessage)
         }
+
+        // Validate output file was created and is valid
+        guard FileManager.default.fileExists(atPath: outputFile.path) else {
+            throw SigningError.signingFailed("Output file was not created by c2patool")
+        }
+
+        // Check file size is reasonable (should be similar to or larger than input)
+        let inputAttributes = try FileManager.default.attributesOfItem(atPath: inputFile.path)
+        let outputAttributes = try FileManager.default.attributesOfItem(atPath: outputFile.path)
+
+        guard let inputSize = inputAttributes[.size] as? Int64,
+              let outputSize = outputAttributes[.size] as? Int64 else {
+            throw SigningError.signingFailed("Unable to verify file sizes")
+        }
+
+        // Output should be at least 80% of input size (sanity check for corruption)
+        // C2PA adds metadata but shouldn't significantly reduce file size
+        if outputSize < Int64(Double(inputSize) * 0.8) {
+            throw SigningError.signingFailed("Output file size unexpectedly small - possible corruption")
+        }
     }
 
     /// Verifies a C2PA manifest in a file

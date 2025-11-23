@@ -15,3 +15,10 @@ extension UInt32 {
         return Data(bytes: &value, count: MemoryLayout<UInt32>.size)
     }
 }
+
+extension UInt64 {
+    var bigEndianBytes: Data {
+        var value = self.bigEndian
+        return Data(bytes: &value, count: MemoryLayout<UInt64>.size)
+    }
+}

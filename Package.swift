@@ -27,6 +27,7 @@ let package = Package(
                 "ArkavoAgent",
                 "ArkavoSocial",
                 "ArkavoContent",
+                "ArkavoMedia",
                 "ArkavoRecorder",
                 "ArkavoStreaming"
             ]
@@ -44,12 +45,16 @@ let package = Package(
             dependencies: []
         ),
         .target(
+            name: "ArkavoMedia",
+            dependencies: []
+        ),
+        .target(
             name: "ArkavoRecorder",
-            dependencies: ["ArkavoStreaming"]
+            dependencies: ["ArkavoMedia", "ArkavoStreaming"]
         ),
         .target(
             name: "ArkavoStreaming",
-            dependencies: []
+            dependencies: ["ArkavoMedia"]
         ),
         .testTarget(
             name: "ArkavoKitTests",

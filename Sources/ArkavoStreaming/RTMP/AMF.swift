@@ -134,16 +134,12 @@ public struct AMF0: Sendable {
 
     // MARK: - RTMP Commands
 
-    /// Create RTMP connect command
+    /// Create RTMP connect command for publishing
+    /// Following OBS's publisher connect format (not player format)
     public static func createConnectCommand(
         app: String,
-        flashVer: String = "FMLE/3.0",
+        flashVer: String = "FMLE/3.0 (compatible; FMSc/1.0)",
         tcUrl: String,
-        fpad: Bool = false,
-        capabilities: Double = 15.0,
-        audioCodecs: Double = 3191.0,
-        videoCodecs: Double = 252.0,
-        videoFunction: Double = 1.0,
         objectEncoding: Double = 0.0
     ) -> Data {
         var data = Data()
@@ -154,16 +150,13 @@ public struct AMF0: Sendable {
         // Transaction ID: 1
         data.append(encodeNumber(1.0))
 
-        // Command object
+        // Command object (publisher format - simpler than player format)
+        // OBS uses: app, type, flashVer, swfUrl, tcUrl, objectEncoding
         let commandObject: [String: AMFValue] = [
             "app": .string(app),
+            "type": .string("nonprivate"),  // Required for publishing
             "flashVer": .string(flashVer),
             "tcUrl": .string(tcUrl),
-            "fpad": .boolean(fpad),
-            "capabilities": .number(capabilities),
-            "audioCodecs": .number(audioCodecs),
-            "videoCodecs": .number(videoCodecs),
-            "videoFunction": .number(videoFunction),
             "objectEncoding": .number(objectEncoding)
         ]
         data.append(encodeObject(commandObject))
@@ -247,6 +240,42 @@ public struct AMF0: Sendable {
 
         // Stream name
         data.append(encodeString(streamName))
+
+        return data
+    }
+
+    public static func createFCUnpublishCommand(streamName: String, transactionId: Double) -> Data {
+        var data = Data()
+
+        // Command name: "FCUnpublish"
+        data.append(encodeString("FCUnpublish"))
+
+        // Transaction ID
+        data.append(encodeNumber(transactionId))
+
+        // Command object: null
+        data.append(encodeNull())
+
+        // Stream name
+        data.append(encodeString(streamName))
+
+        return data
+    }
+
+    public static func createDeleteStreamCommand(streamId: UInt32, transactionId: Double) -> Data {
+        var data = Data()
+
+        // Command name: "deleteStream"
+        data.append(encodeString("deleteStream"))
+
+        // Transaction ID
+        data.append(encodeNumber(transactionId))
+
+        // Command object: null
+        data.append(encodeNull())
+
+        // Stream ID
+        data.append(encodeNumber(Double(streamId)))
 
         return data
     }
