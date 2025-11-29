@@ -6,6 +6,61 @@ import Foundation
 import ArkavoStreaming
 import VideoToolbox
 
+/// Recording input mode determining which sources are active
+public enum RecordingInputMode: String, Sendable, CaseIterable, Identifiable {
+    case desktopWithCameraAndMic = "Desktop + Camera + Mic"
+    case desktopWithMic = "Desktop + Mic"
+    case desktopWithCamera = "Desktop + Camera"
+    case desktopOnly = "Desktop Only"
+    case cameraWithMic = "Camera + Mic"
+    case cameraOnly = "Camera Only"
+    case avatarWithMic = "Avatar + Mic"
+    case avatarOnly = "Avatar Only"
+    case audioOnly = "Audio Only"
+
+    public var id: String { rawValue }
+
+    public var needsDesktop: Bool {
+        switch self {
+        case .desktopWithCameraAndMic, .desktopWithMic, .desktopWithCamera, .desktopOnly:
+            return true
+        default:
+            return false
+        }
+    }
+
+    public var needsCamera: Bool {
+        switch self {
+        case .desktopWithCameraAndMic, .desktopWithCamera, .cameraWithMic, .cameraOnly:
+            return true
+        default:
+            return false
+        }
+    }
+
+    public var needsAvatar: Bool {
+        switch self {
+        case .avatarWithMic, .avatarOnly:
+            return true
+        default:
+            return false
+        }
+    }
+
+    public var needsMicrophone: Bool {
+        switch self {
+        case .desktopWithCameraAndMic, .desktopWithMic, .cameraWithMic, .avatarWithMic, .audioOnly:
+            return true
+        default:
+            return false
+        }
+    }
+
+    public var needsVideo: Bool {
+        self != .audioOnly
+    }
+}
+
 /// Coordinates screen, camera, and audio capture with composition and encoding
 @MainActor
 public final class RecordingSession: Sendable {
@@ -54,9 +109,42 @@ public final class RecordingSession: Sendable {
     nonisolated(unsafe) public var enableCamera: Bool = true
     nonisolated(unsafe) public var enableMicrophone: Bool = true
     nonisolated(unsafe) public var enableDesktop: Bool = true
+    nonisolated(unsafe) public var enableAvatar: Bool = false
+
+    /// Computed input mode based on current toggle states
+    public var inputMode: RecordingInputMode {
+        if enableDesktop {
+            if enableCamera && enableMicrophone { return .desktopWithCameraAndMic }
+            if enableCamera { return .desktopWithCamera }
+            if enableAvatar && enableMicrophone { return .desktopWithCameraAndMic } // Avatar as camera PiP
+            if enableAvatar { return .desktopWithCamera }
+            if enableMicrophone { return .desktopWithMic }
+            return .desktopOnly
+        } else if enableCamera {
+            if enableMicrophone { return .cameraWithMic }
+            return .cameraOnly
+        } else if enableAvatar {
+            if enableMicrophone { return .avatarWithMic }
+            return .avatarOnly
+        } else if enableMicrophone {
+            return .audioOnly
+        }
+        // Default fallback
+        return .desktopOnly
+    }
+
+    /// Provider for VRM avatar texture frames (set by AvatarViewModel when avatar mode is active)
+    nonisolated(unsafe) public var avatarTextureProvider: (@Sendable () -> CVPixelBuffer?)?
+
+    /// Timer for driving frame capture in non-desktop modes
+    nonisolated(unsafe) private var cameraFrameTimer: Timer?
+
+    /// Standard canvas size for camera/avatar-only modes (1080p)
+    private let standardCanvasSize = CGSize(width: 1920, height: 1080)
+
     public var cameraSourceIdentifiers: [String] = []
-public var cameraLayoutStrategy: MultiCameraLayout = .pictureInPicture
-public var metadataHandler: (@Sendable (CameraMetadataEvent) -> Void)?
+    public var cameraLayoutStrategy: MultiCameraLayout = .pictureInPicture
+    public var metadataHandler: (@Sendable (CameraMetadataEvent) -> Void)?
     public var previewHandler: (@Sendable (CameraPreviewEvent) -> Void)?
     nonisolated(unsafe) public var screenPreviewHandler: (@Sendable (CGImage) -> Void)?
     public var remoteSourcesHandler: (@Sendable ([String]) -> Void)?
@@ -100,7 +188,14 @@ public var metadataHandler: (@Sendable (CameraMetadataEvent) -> Void)?
 
     /// Starts a new recording session
     public func startRecording(outputURL: URL, title: String) async throws {
-        // Request permissions
+        let mode = inputMode
+
+        // Validate at least one input is enabled
+        guard enableDesktop || enableCamera || enableAvatar || enableMicrophone else {
+            throw RecorderError.permissionDenied // No inputs enabled
+        }
+
+        // Request permissions based on mode
         guard await requestPermissions() else {
             throw RecorderError.permissionDenied
         }
@@ -109,15 +204,15 @@ public var metadataHandler: (@Sendable (CameraMetadataEvent) -> Void)?
         isScreenPreviewOnly = false
 
         // Start screen capture if desktop recording is enabled
-        if enableDesktop {
+        if mode.needsDesktop {
             try screenCapture.startCapture()
         }
 
-        if enableCamera {
+        if mode.needsCamera {
             try startCameraCapturesIfNeeded()
         }
 
-        if enableMicrophone {
+        if mode.needsMicrophone {
             // Add microphone to audio router (but don't start it yet)
             print("🎙️ RecordingSession: Adding microphone to audio router")
             let micSource = await audioRouter.addMicrophone()
@@ -127,17 +222,25 @@ public var metadataHandler: (@Sendable (CameraMetadataEvent) -> Void)?
         // Start encoder FIRST with pre-created audio tracks for all sources
         let audioSourceIDs = audioRouter.allSourceIDs
         print("🎙️ RecordingSession: Creating encoder with audio tracks for: \(audioSourceIDs)")
-        try await encoder.startRecording(to: outputURL, title: title, audioSourceIDs: audioSourceIDs)
+        try await encoder.startRecording(to: outputURL, title: title, audioSourceIDs: audioSourceIDs, videoEnabled: mode.needsVideo)
         print("🎙️ RecordingSession: Encoder started and ready")
 
         // NOW start audio sources (after encoder is ready to receive samples)
         print("🎙️ RecordingSession: Starting all audio sources...")
         try? await audioRouter.startAll()
         print("🎙️ RecordingSession: Audio sources started. Active sources: \(audioRouter.activeSourceIDs)")
+
+        // Start camera/avatar frame driver if not using desktop (no screen capture to drive timing)
+        if !mode.needsDesktop && mode.needsVideo {
+            startCameraFrameDriver()
+        }
     }
 
     /// Stops the current recording session
     public func stopRecording() async throws -> URL {
+        // Stop frame driver if running
+        stopCameraFrameDriver()
+
         // Stop captures
         screenCapture.stopCapture()
         stopCameraCaptures()
@@ -202,6 +305,11 @@ public var metadataHandler: (@Sendable (CameraMetadataEvent) -> Void)?
     private nonisolated func processFrameSync(screen screenBuffer: CMSampleBuffer) async {
         guard encoder.isRecording else { return }
 
+        let mode = await MainActor.run { self.inputMode }
+
+        // Desktop modes use screen as base
+        guard mode.needsDesktop else { return }
+
         let cameraLayers = await MainActor.run { self.cameraLayersForComposition() }
         guard let composited = compositor.composite(
             screen: screenBuffer,
@@ -213,6 +321,71 @@ public var metadataHandler: (@Sendable (CameraMetadataEvent) -> Void)?
         // Encode the composited frame
         let timestamp = CMSampleBufferGetPresentationTimeStamp(screenBuffer)
         await encoder.encodeVideoFrame(composited, timestamp: timestamp)
+    }
+
+    /// Processes a frame for camera-only or avatar-only modes (called by timer)
+    private nonisolated func processCameraOrAvatarFrame() async {
+        guard encoder.isRecording else { return }
+
+        let mode = await MainActor.run { self.inputMode }
+        let canvasSize = standardCanvasSize
+
+        var composited: CVPixelBuffer?
+        var timestamp: CMTime
+
+        switch mode {
+        case .cameraWithMic, .cameraOnly:
+            // Camera-only modes: use first camera as primary, others as PiP
+            let cameraLayers = await MainActor.run { self.cameraLayersForComposition() }
+            guard !cameraLayers.isEmpty,
+                  let firstBuffer = cameraLayers.first?.buffer
+            else { return }
+
+            composited = compositor.composite(
+                cameraLayers: cameraLayers,
+                canvasSize: canvasSize
+            )
+            timestamp = CMSampleBufferGetPresentationTimeStamp(firstBuffer)
+
+        case .avatarWithMic, .avatarOnly:
+            // Avatar modes: use avatar texture as primary
+            guard let provider = avatarTextureProvider,
+                  let avatarTexture = provider()
+            else { return }
+
+            let cameraLayers = await MainActor.run { self.cameraLayersForComposition() }
+            composited = compositor.composite(
+                avatarTexture: avatarTexture,
+                cameraLayers: cameraLayers
+            )
+            timestamp = CMTime(seconds: CACurrentMediaTime(), preferredTimescale: 600)
+
+        default:
+            // Desktop modes are handled by processFrameSync, audio-only has no video
+            return
+        }
+
+        guard let output = composited else { return }
+        await encoder.encodeVideoFrame(output, timestamp: timestamp)
+    }
+
+    // MARK: - Camera/Avatar Frame Driver
+
+    /// Starts a timer to drive frame capture at 30fps for non-desktop modes
+    private func startCameraFrameDriver() {
+        stopCameraFrameDriver()
+
+        cameraFrameTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                await self?.processCameraOrAvatarFrame()
+            }
+        }
+    }
+
+    /// Stops the camera/avatar frame driver
+    private func stopCameraFrameDriver() {
+        cameraFrameTimer?.invalidate()
+        cameraFrameTimer = nil
     }
 
     private nonisolated func processAudioSampleSync(_ audioSample: CMSampleBuffer, sourceID: String) async {

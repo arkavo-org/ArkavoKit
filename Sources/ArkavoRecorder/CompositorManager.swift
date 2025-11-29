@@ -69,7 +69,56 @@ public final class CompositorManager: Sendable {
 
         let screenImage = CIImage(cvPixelBuffer: screenPixelBuffer)
         let screenSize = screenImage.extent.size
-        var composited = screenImage
+
+        return compositeWithBase(baseImage: screenImage, screenSize: screenSize, cameraLayers: cameraLayers)
+    }
+
+    /// Composites camera frames without a screen base layer (camera-only mode)
+    /// First camera becomes the primary full-canvas source, additional cameras become PiP overlays
+    public func composite(
+        cameraLayers: [CameraLayer],
+        canvasSize: CGSize
+    ) -> CVPixelBuffer? {
+        guard !cameraLayers.isEmpty else { return nil }
+
+        // Use first camera as the base layer
+        guard let firstLayer = cameraLayers.first,
+              let firstPixelBuffer = CMSampleBufferGetImageBuffer(firstLayer.buffer)
+        else {
+            return nil
+        }
+
+        let firstCameraImage = CIImage(cvPixelBuffer: firstPixelBuffer)
+
+        // Scale first camera to fill canvas (center crop to maintain aspect ratio)
+        let scaledBaseImage = scaleToFillCanvas(image: firstCameraImage, canvasSize: canvasSize)
+
+        // Remaining cameras become PiP overlays
+        let overlayLayers = Array(cameraLayers.dropFirst())
+
+        return compositeWithBase(baseImage: scaledBaseImage, screenSize: canvasSize, cameraLayers: overlayLayers)
+    }
+
+    /// Composites an avatar texture as the primary source with optional camera overlays
+    public func composite(
+        avatarTexture: CVPixelBuffer,
+        cameraLayers: [CameraLayer] = []
+    ) -> CVPixelBuffer? {
+        let avatarImage = CIImage(cvPixelBuffer: avatarTexture)
+        let screenSize = avatarImage.extent.size
+
+        return compositeWithBase(baseImage: avatarImage, screenSize: screenSize, cameraLayers: cameraLayers)
+    }
+
+    // MARK: - Private Composition Core
+
+    /// Core composition logic: takes a base image and overlays camera layers as PiP
+    private func compositeWithBase(
+        baseImage: CIImage,
+        screenSize: CGSize,
+        cameraLayers: [CameraLayer]
+    ) -> CVPixelBuffer? {
+        var composited = baseImage
 
         for (index, layer) in cameraLayers.enumerated() {
             guard let cameraPixelBuffer = CMSampleBufferGetImageBuffer(layer.buffer) else {
@@ -131,6 +180,30 @@ public final class CompositorManager: Sendable {
 
         // Render to pixel buffer
         return renderToPixelBuffer(image: composited, size: screenSize)
+    }
+
+    /// Scales an image to fill the canvas size (center crop)
+    private func scaleToFillCanvas(image: CIImage, canvasSize: CGSize) -> CIImage {
+        let imageAspect = image.extent.width / image.extent.height
+        let canvasAspect = canvasSize.width / canvasSize.height
+
+        let scale: CGFloat
+        if imageAspect > canvasAspect {
+            // Image is wider - scale by height
+            scale = canvasSize.height / image.extent.height
+        } else {
+            // Image is taller - scale by width
+            scale = canvasSize.width / image.extent.width
+        }
+
+        let scaledImage = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+
+        // Center crop to canvas size
+        let offsetX = (scaledImage.extent.width - canvasSize.width) / 2
+        let offsetY = (scaledImage.extent.height - canvasSize.height) / 2
+        let cropRect = CGRect(x: offsetX, y: offsetY, width: canvasSize.width, height: canvasSize.height)
+
+        return scaledImage.cropped(to: cropRect).transformed(by: CGAffineTransform(translationX: -offsetX, y: -offsetY))
     }
 
     // MARK: - Private Methods

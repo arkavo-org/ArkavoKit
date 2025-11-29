@@ -109,7 +109,8 @@ public final class VideoEncoder: Sendable {
     ///   - url: Output file URL
     ///   - title: Recording title for metadata
     ///   - audioSourceIDs: Optional array of audio source IDs to pre-create tracks for
-    public func startRecording(to url: URL, title: String, audioSourceIDs: [String] = []) async throws {
+    ///   - videoEnabled: Whether to include video track (false for audio-only recording)
+    public func startRecording(to url: URL, title: String, audioSourceIDs: [String] = [], videoEnabled: Bool = true) async throws {
         guard !isRecording else { return }
 
         outputURL = url
@@ -117,55 +118,65 @@ public final class VideoEncoder: Sendable {
         // Remove existing file if present
         try? FileManager.default.removeItem(at: url)
 
+        // Use appropriate file type: .mov for video, .m4a for audio-only
+        let fileType: AVFileType = videoEnabled ? .mov : .m4a
+
         // Create asset writer
-        assetWriter = try AVAssetWriter(url: url, fileType: .mov)
+        assetWriter = try AVAssetWriter(url: url, fileType: fileType)
 
         guard let assetWriter = assetWriter else {
             throw RecorderError.encodingFailed
         }
 
-        // Setup video input
-        let videoSettings: [String: Any] = [
-            AVVideoCodecKey: AVVideoCodecType.h264,
-            AVVideoWidthKey: videoWidth,
-            AVVideoHeightKey: videoHeight,
-            AVVideoCompressionPropertiesKey: [
-                AVVideoAverageBitRateKey: videoBitrate,
-                AVVideoExpectedSourceFrameRateKey: frameRate,
-                // Use High profile for better compression/quality
-                // High profile is widely supported and provides smaller file sizes
-                AVVideoProfileLevelKey: AVVideoProfileLevelH264High41,
-                // Disable frame reordering for RTMP compatibility
-                AVVideoAllowFrameReorderingKey: false,
-                // Set max keyframe interval (2 seconds)
-                AVVideoMaxKeyFrameIntervalKey: Int(frameRate * 2)
-            ],
-            // Add color space metadata for proper color reproduction
-            AVVideoColorPropertiesKey: [
-                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
-                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
-                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2
+        // Setup video input only if video is enabled
+        if videoEnabled {
+            let videoSettings: [String: Any] = [
+                AVVideoCodecKey: AVVideoCodecType.h264,
+                AVVideoWidthKey: videoWidth,
+                AVVideoHeightKey: videoHeight,
+                AVVideoCompressionPropertiesKey: [
+                    AVVideoAverageBitRateKey: videoBitrate,
+                    AVVideoExpectedSourceFrameRateKey: frameRate,
+                    // Use High profile for better compression/quality
+                    // High profile is widely supported and provides smaller file sizes
+                    AVVideoProfileLevelKey: AVVideoProfileLevelH264High41,
+                    // Disable frame reordering for RTMP compatibility
+                    AVVideoAllowFrameReorderingKey: false,
+                    // Set max keyframe interval (2 seconds)
+                    AVVideoMaxKeyFrameIntervalKey: Int(frameRate * 2)
+                ],
+                // Add color space metadata for proper color reproduction
+                AVVideoColorPropertiesKey: [
+                    AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                    AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                    AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2
+                ]
             ]
-        ]
 
-        videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
-        videoInput?.expectsMediaDataInRealTime = true
+            videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+            videoInput?.expectsMediaDataInRealTime = true
 
-        // Setup pixel buffer adaptor
-        let pixelBufferAttributes: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-            kCVPixelBufferWidthKey as String: videoWidth,
-            kCVPixelBufferHeightKey as String: videoHeight,
-            kCVPixelBufferMetalCompatibilityKey as String: true
-        ]
+            // Setup pixel buffer adaptor
+            let pixelBufferAttributes: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: videoWidth,
+                kCVPixelBufferHeightKey as String: videoHeight,
+                kCVPixelBufferMetalCompatibilityKey as String: true
+            ]
 
-        pixelBufferAdaptor = AVAssetWriterInputPixelBufferAdaptor(
-            assetWriterInput: videoInput!,
-            sourcePixelBufferAttributes: pixelBufferAttributes
-        )
+            pixelBufferAdaptor = AVAssetWriterInputPixelBufferAdaptor(
+                assetWriterInput: videoInput!,
+                sourcePixelBufferAttributes: pixelBufferAttributes
+            )
 
-        if let videoInput = videoInput {
-            assetWriter.add(videoInput)
+            if let videoInput = videoInput {
+                assetWriter.add(videoInput)
+            }
+        } else {
+            // Audio-only mode: no video input
+            videoInput = nil
+            pixelBufferAdaptor = nil
+            print("🎵 VideoEncoder: Audio-only mode enabled (no video track)")
         }
 
         // Pre-create audio inputs for known sources
@@ -446,12 +457,22 @@ public final class VideoEncoder: Sendable {
 
         // Handle file recording if active
         if isRecording {
-            guard startTime != nil else {
-                // Wait until video session has started to keep A/V in sync
+            guard let writer = assetWriter, writer.status == .writing else {
                 return
             }
 
-            guard let writer = assetWriter, writer.status == .writing else {
+            // For audio-only mode (no video input), start session on first audio sample
+            let isAudioOnly = videoInput == nil
+            if isAudioOnly && !sessionStarted {
+                let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+                sessionStarted = true
+                startTime = timestamp
+                writer.startSession(atSourceTime: .zero)
+                print("🎵 VideoEncoder: Audio-only session started, base timestamp \(timestamp.seconds)")
+            }
+
+            // Wait for session to start (video will start it normally, or audio-only above)
+            guard startTime != nil else {
                 return
             }
 
