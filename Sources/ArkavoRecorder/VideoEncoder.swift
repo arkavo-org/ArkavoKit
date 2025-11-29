@@ -25,6 +25,7 @@ public final class VideoEncoder: Sendable {
     nonisolated(unsafe) private var isPaused: Bool = false
     nonisolated(unsafe) private var pauseStartTime: CMTime?
     nonisolated(unsafe) private var totalPausedDuration: CMTime = .zero
+    nonisolated(unsafe) private var sessionStarted: Bool = false
 
     nonisolated(unsafe) public private(set) var isRecording: Bool = false
 
@@ -216,6 +217,7 @@ public final class VideoEncoder: Sendable {
         isPaused = false
         pauseStartTime = nil
         totalPausedDuration = .zero
+        sessionStarted = false
     }
 
     /// Finishes recording and returns the output URL
@@ -241,37 +243,55 @@ public final class VideoEncoder: Sendable {
         let sessionStarted = startTime != nil
         print("📊 Session started: \(sessionStarted), Asset writer status: \(assetWriter.status.rawValue)")
 
-        // Only finish if a session was started and asset writer is in writing state
-        if sessionStarted && assetWriter.status == .writing {
+        // Handle based on session and writer state
+        if !sessionStarted {
+            print("⚠️ No frames were written (session never started), cancelling asset writer")
+            assetWriter.cancelWriting()
+        } else if assetWriter.status == .writing {
             print("📝 Marking inputs as finished...")
 
-            // Mark inputs as finished if they exist and are ready
-            if let videoInput = videoInput, videoInput.isReadyForMoreMediaData {
+            // Always mark inputs as finished before finishWriting()
+            // Don't check isReadyForMoreMediaData - just mark them finished
+            if let videoInput = videoInput {
                 videoInput.markAsFinished()
                 print("  ✓ Video input marked as finished")
-            } else {
-                print("  ⚠️ Video input not ready or nil")
             }
 
             // Mark all audio inputs as finished
             for (sourceID, audioInput) in audioInputs {
-                if audioInput.isReadyForMoreMediaData {
-                    audioInput.markAsFinished()
-                    print("  ✓ Audio input [\(sourceID)] marked as finished")
-                } else {
-                    print("  ⚠️ Audio input [\(sourceID)] not ready")
-                }
+                audioInput.markAsFinished()
+                print("  ✓ Audio input [\(sourceID)] marked as finished")
             }
 
-            // Finish writing
+            // Finish writing - this writes the moov atom
             print("⏳ Finishing asset writer...")
             await assetWriter.finishWriting()
             print("✅ Asset writer finished with status: \(assetWriter.status.rawValue)")
-        } else if !sessionStarted {
-            print("⚠️ No frames were written (session never started), cancelling asset writer")
-            assetWriter.cancelWriting()
+
+            // Verify completion
+            if assetWriter.status != .completed {
+                print("❌ Asset writer did not complete successfully: \(assetWriter.status.rawValue)")
+                if let error = assetWriter.error {
+                    print("   Error: \(error.localizedDescription)")
+                }
+            }
+        } else if assetWriter.status == .failed {
+            print("❌ Asset writer already failed: \(assetWriter.error?.localizedDescription ?? "Unknown")")
+            // Don't call finishWriting on failed writer, just throw below
         } else {
-            print("⚠️ Asset writer not in writing state (status: \(assetWriter.status.rawValue)), cannot finish")
+            // Status is .unknown, .cancelled, or .completed already
+            print("⚠️ Asset writer in unexpected state: \(assetWriter.status.rawValue), attempting to finish anyway")
+            // Try to finish if possible - better than leaving file corrupted
+            if assetWriter.status != .cancelled && assetWriter.status != .completed {
+                if let videoInput = videoInput {
+                    videoInput.markAsFinished()
+                }
+                for (_, audioInput) in audioInputs {
+                    audioInput.markAsFinished()
+                }
+                await assetWriter.finishWriting()
+                print("  Finish attempt completed with status: \(assetWriter.status.rawValue)")
+            }
         }
 
         if assetWriter.status == .failed {
@@ -311,9 +331,9 @@ public final class VideoEncoder: Sendable {
 
     /// Current recording duration
     public var duration: TimeInterval {
-        guard let startTime = startTime else { return 0 }
-        let adjustedDuration = CMTimeSubtract(lastVideoTimestamp, startTime)
-        let finalDuration = CMTimeSubtract(adjustedDuration, totalPausedDuration)
+        guard startTime != nil else { return 0 }
+        // lastVideoTimestamp is already normalized to start at zero
+        let finalDuration = CMTimeSubtract(lastVideoTimestamp, totalPausedDuration)
         return CMTimeGetSeconds(finalDuration)
     }
 
@@ -331,11 +351,22 @@ public final class VideoEncoder: Sendable {
             return
         }
 
-        // Initialize start time on first frame
-        if startTime == nil {
+        // Check if asset writer is ready for writing
+        guard assetWriter.status == .writing else {
+            if assetWriter.status == .failed {
+                print("❌ Asset writer failed before encoding could start")
+            }
+            return
+        }
+
+        // Initialize session on first frame (thread-safe check)
+        if !sessionStarted {
+            sessionStarted = true
             startTime = timestamp
-            assetWriter.startSession(atSourceTime: timestamp)
-            lastVideoTimestamp = timestamp
+            // Start session at time zero - we'll normalize all timestamps
+            assetWriter.startSession(atSourceTime: .zero)
+            lastVideoTimestamp = .zero
+            print("📹 VideoEncoder: Session started, base timestamp \(timestamp.seconds)")
         }
 
         // Wait if input is not ready
@@ -343,7 +374,7 @@ public final class VideoEncoder: Sendable {
             return
         }
 
-        // Check if asset writer is still healthy before appending
+        // Double-check asset writer is still healthy
         guard assetWriter.status == .writing else {
             if assetWriter.status == .failed {
                 let errorMessage = assetWriter.error?.localizedDescription ?? "Unknown error"
@@ -356,16 +387,23 @@ public final class VideoEncoder: Sendable {
             return
         }
 
-        // Adjust timestamp for pauses
-        var adjustedTimestamp = timestamp
+        // Normalize timestamp relative to recording start
+        guard let baseTime = startTime else { return }
+        var adjustedTimestamp = CMTimeSubtract(timestamp, baseTime)
+
+        // Skip frames from before recording started (can happen with preview running)
+        if adjustedTimestamp.seconds < 0 {
+            return
+        }
+
+        // Adjust for pauses
         if !totalPausedDuration.seconds.isZero {
-            adjustedTimestamp = CMTimeSubtract(timestamp, totalPausedDuration)
+            adjustedTimestamp = CMTimeSubtract(adjustedTimestamp, totalPausedDuration)
         }
 
         // Ensure timestamps are monotonically increasing
         if CMTimeCompare(adjustedTimestamp, lastVideoTimestamp) <= 0 {
             // Timestamp is not increasing, skip this frame
-            print("⚠️ Dropping frame with non-increasing timestamp: \(adjustedTimestamp.seconds) <= \(lastVideoTimestamp.seconds)")
             return
         }
 

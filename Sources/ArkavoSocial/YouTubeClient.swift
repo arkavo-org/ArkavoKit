@@ -130,7 +130,7 @@ public actor YouTubeClient: ObservableObject {
             URLQueryItem(name: "client_id", value: clientId),
             URLQueryItem(name: "redirect_uri", value: redirectUri),
             URLQueryItem(name: "response_type", value: "code"),
-            URLQueryItem(name: "scope", value: "https://www.googleapis.com/auth/youtube.readonly https://www.googleapis.com/auth/youtube.upload"),
+            URLQueryItem(name: "scope", value: "https://www.googleapis.com/auth/youtube.readonly https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.force-ssl"),
             URLQueryItem(name: "access_type", value: "offline"),
             URLQueryItem(name: "state", value: state),
             URLQueryItem(name: "code_challenge", value: challenge),
@@ -425,9 +425,64 @@ public actor YouTubeClient: ObservableObject {
             }
         }
     }
+
+    // MARK: - Live Streaming API
+
+    /// Fetches the stream key from YouTube Live Streaming API
+    /// Returns the stream key (ingestion stream name) for the user's default live stream
+    public func fetchStreamKey() async throws -> String? {
+        let url = URL(string: "https://www.googleapis.com/youtube/v3/liveStreams?part=cdn,snippet&mine=true")!
+        let request = try await makeAuthorizedRequest(url: url)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw YouTubeError.invalidResponse
+        }
+
+        if httpResponse.statusCode == 200 {
+            let streamResponse = try JSONDecoder().decode(YouTubeLiveStreamResponse.self, from: data)
+            // Return the first active stream's key
+            if let stream = streamResponse.items.first {
+                return stream.cdn.ingestionInfo.streamName
+            }
+            return nil
+        } else if httpResponse.statusCode == 403 {
+            // User may not have Live Streaming enabled
+            throw YouTubeError.googleError("Live streaming is not enabled for this YouTube account. Enable it at studio.youtube.com")
+        } else {
+            if let errorResponse = try? JSONDecoder().decode(GoogleErrorResponse.self, from: data) {
+                throw YouTubeError.googleError(errorResponse.error_description ?? errorResponse.error)
+            }
+            throw YouTubeError.httpError(statusCode: httpResponse.statusCode)
+        }
+    }
 }
 
 // MARK: - Supporting Types
+
+struct YouTubeLiveStreamResponse: Codable {
+    let items: [LiveStream]
+
+    struct LiveStream: Codable {
+        let id: String
+        let snippet: Snippet
+        let cdn: CDN
+
+        struct Snippet: Codable {
+            let title: String
+        }
+
+        struct CDN: Codable {
+            let ingestionInfo: IngestionInfo
+
+            struct IngestionInfo: Codable {
+                let streamName: String  // This is the stream key
+                let ingestionAddress: String  // RTMP URL
+            }
+        }
+    }
+}
 
 public struct YouTubeChannelInfo {
     public let id: String

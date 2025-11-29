@@ -53,11 +53,14 @@ public final class RecordingSession: Sendable {
 
     nonisolated(unsafe) public var enableCamera: Bool = true
     nonisolated(unsafe) public var enableMicrophone: Bool = true
+    nonisolated(unsafe) public var enableDesktop: Bool = true
     public var cameraSourceIdentifiers: [String] = []
 public var cameraLayoutStrategy: MultiCameraLayout = .pictureInPicture
 public var metadataHandler: (@Sendable (CameraMetadataEvent) -> Void)?
     public var previewHandler: (@Sendable (CameraPreviewEvent) -> Void)?
+    nonisolated(unsafe) public var screenPreviewHandler: (@Sendable (CGImage) -> Void)?
     public var remoteSourcesHandler: (@Sendable ([String]) -> Void)?
+    nonisolated(unsafe) private var isScreenPreviewOnly: Bool = false
 
     // MARK: - Initialization
 
@@ -79,7 +82,7 @@ public var metadataHandler: (@Sendable (CameraMetadataEvent) -> Void)?
             // Process asynchronously to handle encoding
             // Note: CMSampleBuffer is not Sendable, but we process it immediately without retaining
             Task {
-                await self?.processFrameSync(screen: screenBuffer)
+                await self?.processScreenFrame(screenBuffer)
             }
         }
 
@@ -102,8 +105,13 @@ public var metadataHandler: (@Sendable (CameraMetadataEvent) -> Void)?
             throw RecorderError.permissionDenied
         }
 
-        // Start captures
-        try screenCapture.startCapture()
+        // Clear preview-only mode so frames go to encoder
+        isScreenPreviewOnly = false
+
+        // Start screen capture if desktop recording is enabled
+        if enableDesktop {
+            try screenCapture.startCapture()
+        }
 
         if enableCamera {
             try startCameraCapturesIfNeeded()
@@ -172,6 +180,24 @@ public var metadataHandler: (@Sendable (CameraMetadataEvent) -> Void)?
     }
 
     nonisolated(unsafe) private var latestCameraBuffers: [String: CMSampleBuffer] = [:]
+
+    private nonisolated func processScreenFrame(_ screenBuffer: CMSampleBuffer) async {
+        // Dispatch screen preview if handler is set
+        if let handler = screenPreviewHandler,
+           let pixelBuffer = CMSampleBufferGetImageBuffer(screenBuffer) {
+            var cgImage: CGImage?
+            let status = VTCreateCGImageFromCVPixelBuffer(pixelBuffer, options: nil, imageOut: &cgImage)
+            if status == noErr, let cgImage {
+                handler(cgImage)
+            }
+        }
+
+        // If preview-only mode, don't process for recording
+        guard !isScreenPreviewOnly else { return }
+
+        // Continue with recording if active
+        await processFrameSync(screen: screenBuffer)
+    }
 
     private nonisolated func processFrameSync(screen screenBuffer: CMSampleBuffer) async {
         guard encoder.isRecording else { return }
@@ -249,6 +275,18 @@ public var metadataHandler: (@Sendable (CameraMetadataEvent) -> Void)?
     /// Stops any preview camera capture sessions.
     public func stopCameraPreview() {
         stopCameraCaptures()
+    }
+
+    /// Starts screen capture purely for preview purposes (no recording).
+    public func startScreenPreview() throws {
+        isScreenPreviewOnly = true
+        try screenCapture.startCapture()
+    }
+
+    /// Stops screen preview capture.
+    public func stopScreenPreview() {
+        isScreenPreviewOnly = false
+        screenCapture.stopCapture()
     }
 
     // MARK: - Streaming
