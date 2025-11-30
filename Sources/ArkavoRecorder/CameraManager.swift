@@ -14,6 +14,10 @@ public final class CameraManager: NSObject, Sendable {
 
     nonisolated(unsafe) public var onFrame: (@Sendable (CMSampleBuffer) -> Void)?
 
+    /// Continuation for async first-frame signaling
+    private var firstFrameContinuation: CheckedContinuation<Void, Never>?
+    private var hasDeliveredFirstFrame: Bool = false
+
     // MARK: - Initialization
 
     public override init() {
@@ -115,8 +119,12 @@ public final class CameraManager: NSObject, Sendable {
 
         captureSession.commitConfiguration()
 
-        // Start the session
-        Task {
+        // Reset first frame tracking
+        hasDeliveredFirstFrame = false
+
+        // Start the session on a background thread to avoid blocking UI
+        // Use detached to ensure it runs on a non-main thread
+        Task.detached { [captureSession] in
             captureSession.startRunning()
         }
         #else
@@ -124,18 +132,47 @@ public final class CameraManager: NSObject, Sendable {
         #endif
     }
 
-    /// Stops camera capture
-    public func stopCapture() {
-        Task {
-            captureSession.stopRunning()
+    /// Starts camera capture and waits for the first frame to be delivered
+    /// This ensures the camera is actually producing frames before returning
+    public func startCaptureAndWaitForFirstFrame(with deviceID: String?) async throws {
+        #if os(macOS) || os(iOS)
+        // Start capture
+        try startCapture(with: deviceID)
 
-            captureSession.beginConfiguration()
-            if let input = cameraInput {
-                captureSession.removeInput(input)
-                cameraInput = nil
+        // Wait for first frame
+        await withCheckedContinuation { continuation in
+            if hasDeliveredFirstFrame {
+                // Already got a frame
+                continuation.resume()
+            } else {
+                // Store continuation to be resumed when first frame arrives
+                firstFrameContinuation = continuation
             }
-            captureSession.commitConfiguration()
         }
+
+        print("📷 [CameraManager] First frame delivered, capture ready")
+        #else
+        throw RecorderError.cameraUnavailable
+        #endif
+    }
+
+    /// Stops camera capture synchronously to avoid race conditions
+    public func stopCapture() {
+        // Stop synchronously to ensure clean state before any new capture starts
+        if captureSession.isRunning {
+            captureSession.stopRunning()
+        }
+
+        captureSession.beginConfiguration()
+        if let input = cameraInput {
+            captureSession.removeInput(input)
+            cameraInput = nil
+        }
+        captureSession.commitConfiguration()
+
+        // Reset state
+        hasDeliveredFirstFrame = false
+        firstFrameContinuation = nil
     }
 
     /// Returns available cameras, including Continuity Camera when available
@@ -204,6 +241,16 @@ public final class CameraManager: NSObject, Sendable {
     public func getPreviewSession() -> AVCaptureSession {
         return captureSession
     }
+
+    /// Signal that first frame was received (called from delegate on background queue)
+    private func signalFirstFrame() {
+        Task { @MainActor in
+            guard !self.hasDeliveredFirstFrame else { return }
+            self.hasDeliveredFirstFrame = true
+            self.firstFrameContinuation?.resume()
+            self.firstFrameContinuation = nil
+        }
+    }
 }
 
 // MARK: - AVCaptureVideoDataOutputSampleBufferDelegate
@@ -217,6 +264,11 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         // Forward frame to handler - calling directly on callback queue
         // CMSampleBuffer is not Sendable but we handle it synchronously
         onFrame?(sampleBuffer)
+
+        // Signal first frame for async startup
+        Task { @MainActor [weak self] in
+            self?.signalFirstFrame()
+        }
     }
 }
 

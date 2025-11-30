@@ -12,6 +12,9 @@ public final class CompositorManager: Sendable {
     private let commandQueue: MTLCommandQueue
     private let ciContext: CIContext
 
+    /// Output resolution for the composited frames (must match encoder resolution)
+    public nonisolated(unsafe) var outputSize: CGSize = CGSize(width: 1920, height: 1080)
+
     public struct CameraLayer {
         public let id: String
         public let buffer: CMSampleBuffer
@@ -60,7 +63,8 @@ public final class CompositorManager: Sendable {
     /// Composites screen and camera frames into a single frame with PiP layout
     public func composite(
         screen screenBuffer: CMSampleBuffer,
-        cameraLayers: [CameraLayer]
+        cameraLayers: [CameraLayer],
+        avatarTexture: CVPixelBuffer? = nil
     ) -> CVPixelBuffer? {
         // Get screen image buffer
         guard let screenPixelBuffer = CMSampleBufferGetImageBuffer(screenBuffer) else {
@@ -70,7 +74,16 @@ public final class CompositorManager: Sendable {
         let screenImage = CIImage(cvPixelBuffer: screenPixelBuffer)
         let screenSize = screenImage.extent.size
 
-        return compositeWithBase(baseImage: screenImage, screenSize: screenSize, cameraLayers: cameraLayers)
+        guard screenSize.width > 0 && screenSize.height > 0 else {
+            return nil
+        }
+
+        return compositeWithBase(
+            baseImage: screenImage,
+            screenSize: screenSize,
+            cameraLayers: cameraLayers,
+            avatarTexture: avatarTexture
+        )
     }
 
     /// Composites camera frames without a screen base layer (camera-only mode)
@@ -116,9 +129,59 @@ public final class CompositorManager: Sendable {
     private func compositeWithBase(
         baseImage: CIImage,
         screenSize: CGSize,
-        cameraLayers: [CameraLayer]
+        cameraLayers: [CameraLayer],
+        avatarTexture: CVPixelBuffer? = nil
     ) -> CVPixelBuffer? {
         var composited = baseImage
+
+        // Add avatar as PiP overlay if provided
+        if let avatarBuffer = avatarTexture {
+            let avatarImage = CIImage(cvPixelBuffer: avatarBuffer)
+
+            // Check if avatar image is valid
+            guard avatarImage.extent.width > 0 && avatarImage.extent.height > 0 else {
+                print("⚠️ [Compositor] Avatar image has zero extent: \(avatarImage.extent)")
+                return compositeWithBase(baseImage: baseImage, screenSize: screenSize, cameraLayers: cameraLayers, avatarTexture: nil)
+            }
+
+            // Debug: Sample pixels from avatar buffer to verify content
+            #if DEBUG
+            debugSampleAvatarBuffer(avatarBuffer)
+            #endif
+
+            // Calculate PiP dimensions for avatar (treat as single overlay)
+            let totalOverlays = cameraLayers.count + 1
+            let pipSize = pipSize(for: screenSize, cameraCount: totalOverlays)
+
+            // Scale avatar to PiP size maintaining aspect ratio
+            let avatarAspect = avatarImage.extent.width / avatarImage.extent.height
+            let pipAspect = pipSize.width / pipSize.height
+
+            var scaledAvatarSize = pipSize
+            if avatarAspect > pipAspect {
+                scaledAvatarSize.height = pipSize.width / avatarAspect
+            } else {
+                scaledAvatarSize.width = pipSize.height * avatarAspect
+            }
+
+            let scaleX = scaledAvatarSize.width / avatarImage.extent.width
+            let scaleY = scaledAvatarSize.height / avatarImage.extent.height
+            let scaledAvatar = avatarImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+
+            // Add rounded corners BEFORE positioning (mask needs to be at same origin as image)
+            let avatarWithEffects = addPiPEffects(to: scaledAvatar, size: scaledAvatarSize)
+
+            // Position avatar at the configured PiP position (first position)
+            let position = calculatePiPPosition(
+                screenSize: screenSize,
+                pipSize: scaledAvatarSize,
+                position: pipPosition
+            )
+
+            let positionedAvatar = avatarWithEffects.transformed(by: CGAffineTransform(translationX: position.x, y: position.y))
+
+            composited = positionedAvatar.composited(over: composited)
+        }
 
         for (index, layer) in cameraLayers.enumerated() {
             guard let cameraPixelBuffer = CMSampleBufferGetImageBuffer(layer.buffer) else {
@@ -163,14 +226,14 @@ public final class CompositorManager: Sendable {
                 )
             }
 
-            // Position the camera overlay
-            let positionedCamera = scaledCamera.transformed(by: CGAffineTransform(translationX: position.x, y: position.y))
+            // Add rounded corners BEFORE positioning (mask needs to be at same origin as image)
+            let cameraWithEffects = addPiPEffects(to: scaledCamera, size: scaledCameraSize)
 
-            // Add rounded corners and border to PiP
-            let pipWithEffects = addPiPEffects(to: positionedCamera, size: scaledCameraSize)
+            // Position the camera overlay
+            let positionedCamera = cameraWithEffects.transformed(by: CGAffineTransform(translationX: position.x, y: position.y))
 
             // Composite the images
-            composited = pipWithEffects.composited(over: composited)
+            composited = positionedCamera.composited(over: composited)
         }
 
         // Add watermark if enabled
@@ -178,8 +241,18 @@ public final class CompositorManager: Sendable {
             composited = addWatermark(to: composited, screenSize: screenSize)
         }
 
-        // Render to pixel buffer
-        return renderToPixelBuffer(image: composited, size: screenSize)
+        // Scale to output resolution if different from source
+        let finalImage: CIImage
+        if screenSize != outputSize {
+            let scaleX = outputSize.width / screenSize.width
+            let scaleY = outputSize.height / screenSize.height
+            finalImage = composited.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+        } else {
+            finalImage = composited
+        }
+
+        // Render to pixel buffer at output resolution
+        return renderToPixelBuffer(image: finalImage, size: outputSize)
     }
 
     /// Scales an image to fill the canvas size (center crop)
@@ -411,6 +484,53 @@ public final class CompositorManager: Sendable {
             )
         }
     }
+
+    // Debug logging throttle
+    private nonisolated(unsafe) static var lastAvatarDebugTime: Date?
+
+    #if DEBUG
+    private func debugSampleAvatarBuffer(_ buffer: CVPixelBuffer) {
+        // Throttle to once every 2 seconds
+        let now = Date()
+        if let last = Self.lastAvatarDebugTime, now.timeIntervalSince(last) < 2.0 {
+            return
+        }
+        Self.lastAvatarDebugTime = now
+
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+
+        guard let baseAddress = CVPixelBufferGetBaseAddress(buffer) else {
+            print("🎭 [Compositor] Avatar buffer has no base address")
+            return
+        }
+
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
+        let width = CVPixelBufferGetWidth(buffer)
+        let height = CVPixelBufferGetHeight(buffer)
+        let ptr = baseAddress.assumingMemoryBound(to: UInt8.self)
+
+        // Sample center pixel
+        let cx = width / 2
+        let cy = height / 2
+        let centerOffset = cy * bytesPerRow + cx * 4
+        let centerB = ptr[centerOffset + 0]
+        let centerG = ptr[centerOffset + 1]
+        let centerR = ptr[centerOffset + 2]
+        let centerA = ptr[centerOffset + 3]
+
+        // Sample corner pixel (where avatar might not be)
+        let cornerOffset = 10 * bytesPerRow + 10 * 4
+        let cornerB = ptr[cornerOffset + 0]
+        let cornerG = ptr[cornerOffset + 1]
+        let cornerR = ptr[cornerOffset + 2]
+        let cornerA = ptr[cornerOffset + 3]
+
+        print("🎭 [Compositor] Avatar \(width)x\(height)")
+        print("   Center: r=\(centerR) g=\(centerG) b=\(centerB) a=\(centerA)")
+        print("   Corner: r=\(cornerR) g=\(cornerG) b=\(cornerB) a=\(cornerA)")
+    }
+    #endif
 
     private func multiCameraPosition(
         screenSize: CGSize,

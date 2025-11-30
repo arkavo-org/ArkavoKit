@@ -7,38 +7,41 @@ import ArkavoMedia
 
 /// Encodes video and audio to MOV files using AVAssetWriter
 /// Supports optional simultaneous streaming via RTMP using VTCompressionSession
-public final class VideoEncoder: Sendable {
+///
+/// Thread Safety: This is an actor to ensure all mutable state is accessed safely.
+/// All encoding operations are serialized through the actor's executor.
+public actor VideoEncoder {
     // MARK: - Properties
 
-    nonisolated(unsafe) private var assetWriter: AVAssetWriter?
-    nonisolated(unsafe) private var videoInput: AVAssetWriterInput?
-    nonisolated(unsafe) private var audioInputs: [String: AVAssetWriterInput] = [:]  // sourceID -> audio input
-    nonisolated(unsafe) private var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
+    private var assetWriter: AVAssetWriter?
+    private var videoInput: AVAssetWriterInput?
+    private var audioInputs: [String: AVAssetWriterInput] = [:]  // sourceID -> audio input
+    private var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
 
     // ArkavoMedia encoders for streaming
-    nonisolated(unsafe) private var streamVideoEncoder: ArkavoMedia.VideoEncoder?
-    nonisolated(unsafe) private var streamAudioEncoder: ArkavoMedia.AudioEncoder?
+    private var streamVideoEncoder: ArkavoMedia.VideoEncoder?
+    private var streamAudioEncoder: ArkavoMedia.AudioEncoder?
 
-    nonisolated(unsafe) private var outputURL: URL?
-    nonisolated(unsafe) private var startTime: CMTime?
-    nonisolated(unsafe) private var lastVideoTimestamp: CMTime = .zero
-    nonisolated(unsafe) private var isPaused: Bool = false
-    nonisolated(unsafe) private var pauseStartTime: CMTime?
-    nonisolated(unsafe) private var totalPausedDuration: CMTime = .zero
-    nonisolated(unsafe) private var sessionStarted: Bool = false
+    private var outputURL: URL?
+    private var startTime: CMTime?
+    private var lastVideoTimestamp: CMTime = .zero
+    private var isPaused: Bool = false
+    private var pauseStartTime: CMTime?
+    private var totalPausedDuration: CMTime = .zero
+    private var sessionStarted: Bool = false
 
-    nonisolated(unsafe) public private(set) var isRecording: Bool = false
+    public private(set) var isRecording: Bool = false
 
     // Streaming support
-    nonisolated(unsafe) private var rtmpPublisher: RTMPPublisher?
-    nonisolated(unsafe) private var isStreaming: Bool = false
-    nonisolated(unsafe) private var videoFormatDescription: CMFormatDescription?
-    nonisolated(unsafe) private var audioFormatDescription: CMFormatDescription?
-    nonisolated(unsafe) private var sentVideoSequenceHeader: Bool = false
-    nonisolated(unsafe) private var sentAudioSequenceHeader: Bool = false
-    nonisolated(unsafe) private var streamStartTime: CMTime?  // Stream start time for relative timestamps
-    nonisolated(unsafe) private var lastStreamVideoTimestamp: CMTime = .zero  // Last video timestamp sent to stream
-    nonisolated(unsafe) private var lastStreamAudioTimestamp: CMTime = .zero  // Last audio timestamp sent to stream
+    private var rtmpPublisher: RTMPPublisher?
+    private var isStreaming: Bool = false
+    private var videoFormatDescription: CMFormatDescription?
+    private var audioFormatDescription: CMFormatDescription?
+    private var sentVideoSequenceHeader: Bool = false
+    private var sentAudioSequenceHeader: Bool = false
+    private var streamStartTime: CMTime?  // Stream start time for relative timestamps
+    private var lastStreamVideoTimestamp: CMTime = .zero  // Last video timestamp sent to stream
+    private var lastStreamAudioTimestamp: CMTime = .zero  // Last audio timestamp sent to stream
 
     // Encoding settings - adaptive based on system capabilities
     private let videoWidth: Int
@@ -351,7 +354,7 @@ public final class VideoEncoder: Sendable {
     // MARK: - Frame Encoding
 
     /// Encodes a video frame
-    public nonisolated func encodeVideoFrame(_ pixelBuffer: CVPixelBuffer, timestamp: CMTime) async {
+    public func encodeVideoFrame(_ pixelBuffer: CVPixelBuffer, timestamp: CMTime) {
         guard isRecording, !isPaused else { return }
         guard let videoInput = videoInput, let adaptor = pixelBufferAdaptor else { return }
         guard let assetWriter = assetWriter else { return }
@@ -447,7 +450,7 @@ public final class VideoEncoder: Sendable {
     /// - Parameters:
     ///   - sampleBuffer: Audio sample buffer (must be 48kHz PCM stereo)
     ///   - sourceID: Unique identifier for the audio source (e.g., "microphone", "screen", "remote-camera-123")
-    public nonisolated func encodeAudioSample(_ sampleBuffer: CMSampleBuffer, sourceID: String) async {
+    public func encodeAudioSample(_ sampleBuffer: CMSampleBuffer, sourceID: String) {
         // Allow audio processing if either recording OR streaming
         guard (isRecording || isStreaming) && !isPaused else { return }
 
@@ -487,17 +490,45 @@ public final class VideoEncoder: Sendable {
                 return
             }
 
-            // Adjust timestamp for pauses
-            var adjustedBuffer = sampleBuffer
+            // Normalize audio timestamp relative to recording start (same as video)
+            guard let baseTime = startTime else { return }
+            let originalTimestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+            var adjustedTimestamp = CMTimeSubtract(originalTimestamp, baseTime)
+
+            // Skip audio from before recording started
+            if adjustedTimestamp.seconds < 0 {
+                return
+            }
+
+            // Adjust for pauses
             if !totalPausedDuration.seconds.isZero {
-                // Create adjusted sample buffer with new timing
-                // This is simplified - full implementation would need proper timing adjustment
-                adjustedBuffer = sampleBuffer
+                adjustedTimestamp = CMTimeSubtract(adjustedTimestamp, totalPausedDuration)
+            }
+
+            // Create adjusted sample buffer with normalized timing
+            var adjustedBuffer: CMSampleBuffer?
+            var timingInfo = CMSampleTimingInfo(
+                duration: CMSampleBufferGetDuration(sampleBuffer),
+                presentationTimeStamp: adjustedTimestamp,
+                decodeTimeStamp: .invalid
+            )
+
+            let status = CMSampleBufferCreateCopyWithNewTiming(
+                allocator: kCFAllocatorDefault,
+                sampleBuffer: sampleBuffer,
+                sampleTimingEntryCount: 1,
+                sampleTimingArray: &timingInfo,
+                sampleBufferOut: &adjustedBuffer
+            )
+
+            guard status == noErr, let finalBuffer = adjustedBuffer else {
+                print("⚠️ Failed to create adjusted audio buffer")
+                return
             }
 
             // Append audio sample to file
             // AVAssetWriterInput will automatically encode PCM to AAC
-            if !audioInput.append(adjustedBuffer) {
+            if !audioInput.append(finalBuffer) {
                 print("⚠️ Audio input [\(sourceID)] rejected sample buffer; dropping frame")
                 return
             }
@@ -511,8 +542,8 @@ public final class VideoEncoder: Sendable {
     }
 
     /// Legacy method for backward compatibility - routes to "microphone" source
-    public nonisolated func encodeAudioSample(_ sampleBuffer: CMSampleBuffer) async {
-        await encodeAudioSample(sampleBuffer, sourceID: "microphone")
+    public func encodeAudioSample(_ sampleBuffer: CMSampleBuffer) {
+        encodeAudioSample(sampleBuffer, sourceID: "microphone")
     }
 
     // MARK: - Private Methods
@@ -579,12 +610,14 @@ public final class VideoEncoder: Sendable {
 
         // Wire up video encoder callback
         videoEncoder.onFrame = { [weak self, weak publisher] frame in
-            Task { [weak self] in
+            Task {
+                guard let self = self else { return }
                 do {
                     // Send sequence header ONLY ONCE on first keyframe
-                    if frame.isKeyframe, self?.sentVideoSequenceHeader == false, let formatDesc = frame.formatDescription {
+                    let needsHeader = await self.shouldSendVideoSequenceHeader()
+                    if frame.isKeyframe, needsHeader, let formatDesc = frame.formatDescription {
                         try await publisher?.sendVideoSequenceHeader(formatDescription: formatDesc)
-                        self?.sentVideoSequenceHeader = true
+                        await self.markVideoSequenceHeaderSent()
                         print("✅ Sent video sequence header (ONCE)")
                     }
 
@@ -598,10 +631,12 @@ public final class VideoEncoder: Sendable {
 
         // Wire up audio encoder callback
         audioEncoder.onFrame = { [weak self, weak publisher] frame in
-            Task { [weak self] in
+            Task {
+                guard let self = self else { return }
                 do {
                     // Send sequence header ONLY ONCE on first frame
-                    if self?.sentAudioSequenceHeader == false, let formatDesc = frame.formatDescription {
+                    let needsHeader = await self.shouldSendAudioSequenceHeader()
+                    if needsHeader, let formatDesc = frame.formatDescription {
                         // Extract AudioSpecificConfig from format description
                         var asc = Data()
                         var size: Int = 0
@@ -615,7 +650,7 @@ public final class VideoEncoder: Sendable {
                         }
 
                         try await publisher?.sendAudioSequenceHeader(asc: asc)
-                        self?.sentAudioSequenceHeader = true
+                        await self.markAudioSequenceHeaderSent()
                         print("✅ Sent audio sequence header (ONCE)")
                     }
 
@@ -667,6 +702,28 @@ public final class VideoEncoder: Sendable {
             guard let publisher = rtmpPublisher else { return nil }
             return await publisher.statistics
         }
+    }
+
+    // MARK: - Sequence Header State Helpers (for actor-safe callback access)
+
+    /// Returns true if video sequence header has not yet been sent
+    private func shouldSendVideoSequenceHeader() -> Bool {
+        !sentVideoSequenceHeader
+    }
+
+    /// Marks video sequence header as sent
+    private func markVideoSequenceHeaderSent() {
+        sentVideoSequenceHeader = true
+    }
+
+    /// Returns true if audio sequence header has not yet been sent
+    private func shouldSendAudioSequenceHeader() -> Bool {
+        !sentAudioSequenceHeader
+    }
+
+    /// Marks audio sequence header as sent
+    private func markAudioSequenceHeaderSent() {
+        sentAudioSequenceHeader = true
     }
 
     // MARK: - VTCompressionSession Setup

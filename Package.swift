@@ -58,7 +58,7 @@ let package = Package(
         ),
         .testTarget(
             name: "ArkavoKitTests",
-            dependencies: ["ArkavoKit"]
+            dependencies: ["ArkavoKit", "ArkavoRecorder"]
         ),
         .target(
             name: "ArkavoC2PA",
