@@ -429,11 +429,11 @@ public actor YouTubeClient: ObservableObject {
     // MARK: - Live Streaming API
 
     /// Fetches the stream key from YouTube Live Streaming API
-    /// Returns the stream key (ingestion stream name) for the user's default live stream
+    /// If no stream exists, creates a reusable one automatically
+    /// Returns the stream key (ingestion stream name) for the user's live stream
     public func fetchStreamKey() async throws -> String? {
         let url = URL(string: "https://www.googleapis.com/youtube/v3/liveStreams?part=cdn,snippet&mine=true")!
         let request = try await makeAuthorizedRequest(url: url)
-
         let (data, response) = try await URLSession.shared.data(for: request)
 
         guard let httpResponse = response as? HTTPURLResponse else {
@@ -446,10 +446,52 @@ public actor YouTubeClient: ObservableObject {
             if let stream = streamResponse.items.first {
                 return stream.cdn.ingestionInfo.streamName
             }
-            return nil
+            // No streams exist - create one automatically
+            return try await createLiveStream()
         } else if httpResponse.statusCode == 403 {
-            // User may not have Live Streaming enabled
-            throw YouTubeError.googleError("Live streaming is not enabled for this YouTube account. Enable it at studio.youtube.com")
+            throw YouTubeError.googleError("Live streaming is not enabled for this YouTube account. Enable it in YouTube Studio first.")
+        } else {
+            if let errorResponse = try? JSONDecoder().decode(GoogleErrorResponse.self, from: data) {
+                throw YouTubeError.googleError(errorResponse.error_description ?? errorResponse.error)
+            }
+            throw YouTubeError.httpError(statusCode: httpResponse.statusCode)
+        }
+    }
+
+    /// Creates a new reusable live stream and returns its stream key
+    private func createLiveStream() async throws -> String {
+        let url = URL(string: "https://www.googleapis.com/youtube/v3/liveStreams?part=snippet,cdn,contentDetails")!
+
+        var request = try await makeAuthorizedRequest(url: url)
+        request.httpMethod = "POST"
+
+        let requestBody: [String: Any] = [
+            "snippet": [
+                "title": "Arkavo Creator Stream"
+            ],
+            "cdn": [
+                "ingestionType": "rtmp",
+                "frameRate": "30fps",
+                "resolution": "1080p"
+            ],
+            "contentDetails": [
+                "isReusable": true
+            ]
+        ]
+
+        request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw YouTubeError.invalidResponse
+        }
+
+        if httpResponse.statusCode == 200 || httpResponse.statusCode == 201 {
+            let stream = try JSONDecoder().decode(YouTubeLiveStreamResponse.LiveStream.self, from: data)
+            return stream.cdn.ingestionInfo.streamName
+        } else if httpResponse.statusCode == 403 {
+            throw YouTubeError.googleError("Cannot create live stream. Live streaming may not be enabled for this account.")
         } else {
             if let errorResponse = try? JSONDecoder().decode(GoogleErrorResponse.self, from: data) {
                 throw YouTubeError.googleError(errorResponse.error_description ?? errorResponse.error)

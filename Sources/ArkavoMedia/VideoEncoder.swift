@@ -255,9 +255,25 @@ public final class VideoEncoder: Sendable {
 
         onFrame?(frame)
 
-        // Log only keyframes for debugging
+        // Log frames for debugging
         if isKeyframe {
             print("🎥 Encoded keyframe: \(h264Data.count) bytes at \(timestamp.seconds)s")
+        } else {
+            // Log P-frames occasionally using static counter
+            let count = Self.incrementFrameCount()
+            if count % 30 == 0 {
+                print("🎥 Encoded P-frame #\(count): \(h264Data.count) bytes at \(timestamp.seconds)s")
+            }
         }
+    }
+
+    // Static counter for P-frame logging (thread-safe via lock)
+    private static let frameCountLock = NSLock()
+    private nonisolated(unsafe) static var _frameCount: Int = 0
+    private static func incrementFrameCount() -> Int {
+        frameCountLock.lock()
+        defer { frameCountLock.unlock() }
+        _frameCount += 1
+        return _frameCount
     }
 }

@@ -78,7 +78,8 @@ public actor RTMPPublisher {
     private var streamKey: String?
     private var streamId: UInt32 = 1  // Stream ID from createStream response
     private var transactionId: Double = 0  // Transaction counter for invoke commands (incremented before each use)
-    private var firstMediaTimestamp: CMTime?  // First media frame timestamp (for normalizing to stream start = 0)
+    private var firstVideoTimestamp: CMTime?  // First video frame timestamp (for normalizing to stream start = 0)
+    private var firstAudioTimestamp: CMTime?  // First audio frame timestamp
 
     // Statistics
     private var bytesSent: UInt64 = 0
@@ -201,17 +202,32 @@ public actor RTMPPublisher {
         print("✅ RTMP publishing started")
     }
 
-    /// Normalize timestamp to stream start (OBS pattern: first frame = 0ms)
-    private func normalizeTimestamp(_ timestamp: CMTime) -> UInt32 {
-        // Store first media timestamp as reference point
-        if firstMediaTimestamp == nil {
-            firstMediaTimestamp = timestamp
-            print("📊 First media timestamp: \(timestamp.seconds)s - normalizing to 0ms")
+    /// Normalize video timestamp to stream start (first video frame = 0ms)
+    private func normalizeVideoTimestamp(_ timestamp: CMTime) -> UInt32 {
+        // Store first video timestamp as reference point
+        if firstVideoTimestamp == nil {
+            firstVideoTimestamp = timestamp
+            print("📊 First video timestamp: \(timestamp.seconds)s - normalizing to 0ms")
             return 0
         }
 
         // Calculate relative timestamp in milliseconds
-        let relativeTime = timestamp - firstMediaTimestamp!
+        let relativeTime = timestamp - firstVideoTimestamp!
+        let timestampMs = UInt32(max(0, relativeTime.seconds * 1000))
+        return timestampMs
+    }
+
+    /// Normalize audio timestamp to stream start (first audio frame = 0ms)
+    private func normalizeAudioTimestamp(_ timestamp: CMTime) -> UInt32 {
+        // Store first audio timestamp as reference point
+        if firstAudioTimestamp == nil {
+            firstAudioTimestamp = timestamp
+            print("📊 First audio timestamp: \(timestamp.seconds)s - normalizing to 0ms")
+            return 0
+        }
+
+        // Calculate relative timestamp in milliseconds
+        let relativeTime = timestamp - firstAudioTimestamp!
         let timestampMs = UInt32(max(0, relativeTime.seconds * 1000))
         return timestampMs
     }
@@ -236,7 +252,7 @@ public actor RTMPPublisher {
 
         // Create video payload and send via RTMP message
         let payload = try FLVMuxer.createVideoPayload(sampleBuffer: buffer, isKeyframe: isKeyframe)
-        let timestampMs = normalizeTimestamp(timestamp)
+        let timestampMs = normalizeVideoTimestamp(timestamp)
         try await sendRTMPVideoMessage(data: payload, timestamp: timestampMs)
 
         framesSent += 1
@@ -291,7 +307,7 @@ public actor RTMPPublisher {
 
         // Create audio payload and send via RTMP message
         let payload = try FLVMuxer.createAudioPayload(sampleBuffer: buffer)
-        let timestampMs = normalizeTimestamp(timestamp)
+        let timestampMs = normalizeAudioTimestamp(timestamp)
         try await sendRTMPAudioMessage(data: payload, timestamp: timestampMs)
     }
 
@@ -309,10 +325,16 @@ public actor RTMPPublisher {
 
         // Create video payload from encoded frame
         let payload = FLVMuxer.createVideoPayload(from: frame)
-        let timestampMs = normalizeTimestamp(frame.pts)
+        let timestampMs = normalizeVideoTimestamp(frame.pts)
         try await sendRTMPVideoMessage(data: payload, timestamp: timestampMs)
 
         framesSent += 1
+        bytesSent += UInt64(payload.count)
+
+        // Log P-frames occasionally to verify they're being sent
+        if !frame.isKeyframe && framesSent % 30 == 0 {
+            print("📹 Sent P-frame #\(framesSent): \(payload.count) bytes at \(timestampMs)ms")
+        }
     }
 
     /// Send encoded audio frame
@@ -327,7 +349,7 @@ public actor RTMPPublisher {
 
         // Create audio payload from encoded frame
         let payload = FLVMuxer.createAudioPayload(from: frame)
-        let timestampMs = normalizeTimestamp(frame.pts)
+        let timestampMs = normalizeAudioTimestamp(frame.pts)
         try await sendRTMPAudioMessage(data: payload, timestamp: timestampMs)
     }
 
@@ -431,7 +453,8 @@ public actor RTMPPublisher {
         bytesSent = 0
         framesSent = 0
         startTime = nil
-        firstMediaTimestamp = nil  // Reset timestamp normalization for next stream
+        firstVideoTimestamp = nil  // Reset timestamp normalization for next stream
+        firstAudioTimestamp = nil
 
         print("✅ RTMP disconnected gracefully")
     }

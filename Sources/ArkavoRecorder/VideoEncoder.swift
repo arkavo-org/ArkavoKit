@@ -440,11 +440,17 @@ public actor VideoEncoder {
         if isStreaming, let encoder = streamVideoEncoder {
             do {
                 try encoder.encode(pixelBuffer, timestamp: adjustedTimestamp)
+                streamFrameCount += 1
+                if streamFrameCount % 30 == 0 {
+                    print("📊 Fed frame #\(streamFrameCount) to stream encoder at \(adjustedTimestamp.seconds)s")
+                }
             } catch {
                 print("❌ Stream video encoder failed: \(error)")
             }
         }
     }
+
+    private var streamFrameCount: Int = 0
 
     /// Encodes an audio sample from a specific source
     /// - Parameters:
@@ -580,6 +586,12 @@ public actor VideoEncoder {
 
     // MARK: - Streaming Methods
 
+    // Frame queue continuations for serialized sending
+    private var videoFrameContinuation: AsyncStream<EncodedVideoFrame>.Continuation?
+    private var audioFrameContinuation: AsyncStream<EncodedAudioFrame>.Continuation?
+    private var videoSendTask: Task<Void, Never>?
+    private var audioSendTask: Task<Void, Never>?
+
     /// Start streaming to RTMP destination(s) while recording
     public func startStreaming(to destination: RTMPPublisher.Destination, streamKey: String) async throws {
         guard !isStreaming else {
@@ -608,31 +620,59 @@ public actor VideoEncoder {
         // Create audio encoder
         let audioEncoder = try ArkavoMedia.AudioEncoder(bitrate: 128_000)
 
-        // Wire up video encoder callback
-        videoEncoder.onFrame = { [weak self, weak publisher] frame in
-            Task {
-                guard let self = self else { return }
+        // Create AsyncStreams to serialize frame sending (prevents burst/out-of-order issues)
+        let (videoStream, videoContinuation) = AsyncStream<EncodedVideoFrame>.makeStream()
+        let (audioStream, audioContinuation) = AsyncStream<EncodedAudioFrame>.makeStream()
+        self.videoFrameContinuation = videoContinuation
+        self.audioFrameContinuation = audioContinuation
+
+        // Wire up video encoder callback - just queue frames
+        // Capture continuation locally to avoid actor isolation issues
+        let videoCont = videoContinuation
+        videoEncoder.onFrame = { frame in
+            videoCont.yield(frame)
+        }
+
+        // Wire up audio encoder callback - just queue frames
+        let audioCont = audioContinuation
+        audioEncoder.onFrame = { frame in
+            audioCont.yield(frame)
+        }
+
+        // Start video send task - serializes frame sending
+        // Frames arrive from camera at realtime pace, so we just need to send them in order
+        // without additional pacing (the camera/encoder already gates the frame rate)
+        videoSendTask = Task { [weak self, weak publisher] in
+            for await frame in videoStream {
+                guard let self = self, let publisher = publisher else { break }
+                guard !Task.isCancelled else { break }
+
                 do {
                     // Send sequence header ONLY ONCE on first keyframe
                     let needsHeader = await self.shouldSendVideoSequenceHeader()
                     if frame.isKeyframe, needsHeader, let formatDesc = frame.formatDescription {
-                        try await publisher?.sendVideoSequenceHeader(formatDescription: formatDesc)
+                        try await publisher.sendVideoSequenceHeader(formatDescription: formatDesc)
                         await self.markVideoSequenceHeaderSent()
                         print("✅ Sent video sequence header (ONCE)")
                     }
 
-                    // Send video frame
-                    try await publisher?.send(video: frame)
+                    // Send video frame immediately - frames arrive at realtime from camera
+                    try await publisher.send(video: frame)
+                } catch is CancellationError {
+                    break
                 } catch {
                     print("❌ Failed to send video frame: \(error)")
                 }
             }
         }
 
-        // Wire up audio encoder callback
-        audioEncoder.onFrame = { [weak self, weak publisher] frame in
-            Task {
-                guard let self = self else { return }
+        // Start audio send task - serializes frame sending
+        // Audio frames arrive from encoder at realtime pace
+        audioSendTask = Task { [weak self, weak publisher] in
+            for await frame in audioStream {
+                guard let self = self, let publisher = publisher else { break }
+                guard !Task.isCancelled else { break }
+
                 do {
                     // Send sequence header ONLY ONCE on first frame
                     let needsHeader = await self.shouldSendAudioSequenceHeader()
@@ -649,13 +689,15 @@ public actor VideoEncoder {
                             asc = Data([byte1, byte2])
                         }
 
-                        try await publisher?.sendAudioSequenceHeader(asc: asc)
+                        try await publisher.sendAudioSequenceHeader(asc: asc)
                         await self.markAudioSequenceHeaderSent()
                         print("✅ Sent audio sequence header (ONCE)")
                     }
 
-                    // Send audio frame
-                    try await publisher?.send(audio: frame)
+                    // Send audio frame immediately - frames arrive at realtime from encoder
+                    try await publisher.send(audio: frame)
+                } catch is CancellationError {
+                    break
                 } catch {
                     print("❌ Failed to send audio frame: \(error)")
                 }
@@ -680,6 +722,19 @@ public actor VideoEncoder {
         guard isStreaming, let publisher = rtmpPublisher else { return }
 
         print("📡 Stopping RTMP stream...")
+
+        // Finish the frame queues first
+        videoFrameContinuation?.finish()
+        audioFrameContinuation?.finish()
+        videoFrameContinuation = nil
+        audioFrameContinuation = nil
+
+        // Wait for send tasks to complete
+        videoSendTask?.cancel()
+        audioSendTask?.cancel()
+        videoSendTask = nil
+        audioSendTask = nil
+
         await publisher.disconnect()
 
         // Stop encoders
