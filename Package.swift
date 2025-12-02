@@ -16,6 +16,10 @@ let package = Package(
             name: "ArkavoC2PA",
             targets: ["ArkavoC2PA"]
         ),
+        .executable(
+            name: "ntdf-test",
+            targets: ["NTDFTestCLI"]
+        ),
     ],
     dependencies: [
         .package(url: "https://github.com/arkavo-org/OpenTDFKit", branch: "main")
@@ -54,15 +58,19 @@ let package = Package(
         ),
         .target(
             name: "ArkavoStreaming",
-            dependencies: ["ArkavoMedia"]
+            dependencies: ["ArkavoMedia", "OpenTDFKit"]
         ),
         .testTarget(
             name: "ArkavoKitTests",
-            dependencies: ["ArkavoKit", "ArkavoRecorder"]
+            dependencies: ["ArkavoKit", "ArkavoRecorder", "ArkavoStreaming", "ArkavoMedia"]
         ),
         .target(
             name: "ArkavoC2PA",
             dependencies: []
+        ),
+        .executableTarget(
+            name: "NTDFTestCLI",
+            dependencies: ["ArkavoStreaming", "ArkavoMedia", "OpenTDFKit"]
         ),
     ]
 )

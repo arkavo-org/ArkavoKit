@@ -495,12 +495,20 @@ public struct FLVMuxer: Sendable {
     // MARK: - Metadata
 
     /// Creates FLV metadata tag (onMetaData)
+    /// - Parameters:
+    ///   - width: Video width in pixels
+    ///   - height: Video height in pixels
+    ///   - framerate: Video framerate (fps)
+    ///   - videoBitrate: Video bitrate in bits/sec
+    ///   - audioBitrate: Audio bitrate in bits/sec
+    ///   - customFields: Optional custom string fields (e.g., ntdf_header for NanoTDF encryption)
     public static func createMetadata(
         width: Int,
         height: Int,
         framerate: Double,
         videoBitrate: Double,
-        audioBitrate: Double
+        audioBitrate: Double,
+        customFields: [String: String]? = nil
     ) -> Data {
         // Create AMF0 encoded onMetaData script
         // Format: @setDataFrame string + onMetaData string + ECMA array with properties
@@ -518,9 +526,11 @@ public struct FLVMuxer: Sendable {
         metadata.append(contentsOf: UInt16(onMetaData.count).bigEndianBytes)
         metadata.append(onMetaData.data(using: .utf8)!)
 
-        // ECMA Array marker (0x08) + approximate count (we'll use 10 properties)
+        // ECMA Array marker (0x08) + approximate count
+        let basePropertyCount: UInt32 = 10
+        let customFieldCount = UInt32(customFields?.count ?? 0)
         metadata.append(0x08)  // AMF0 ECMA Array marker
-        metadata.append(contentsOf: UInt32(10).bigEndianBytes)  // Property count
+        metadata.append(contentsOf: (basePropertyCount + customFieldCount).bigEndianBytes)  // Property count
 
         // Helper to add property (name + value)
         func addNumberProperty(name: String, value: Double) {
@@ -556,6 +566,13 @@ public struct FLVMuxer: Sendable {
         addBooleanProperty(name: "stereo", value: true)
         addStringProperty(name: "videocodecid", value: "avc1")  // H.264
         addStringProperty(name: "audiocodecid", value: "mp4a")  // AAC
+
+        // Add custom fields (e.g., ntdf_header for NanoTDF encryption)
+        if let customFields {
+            for (key, value) in customFields {
+                addStringProperty(name: key, value: value)
+            }
+        }
 
         // Object end marker (0x00 0x00 0x09)
         metadata.append(contentsOf: [0x00, 0x00, 0x09])

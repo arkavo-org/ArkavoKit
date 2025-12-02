@@ -1,5 +1,5 @@
 {
-  "originHash" : "c056875e91577d318a5f4bf2add3a88f19b19fe2bcffe328c2bba93724552e49",
+  "originHash" : "560a44e84dd7cf18104872c260c8069e6e6eec201a9bd843b7138ba602258eb9",
   "pins" : [
     {
       "identity" : "cryptoswift",
@@ -16,7 +16,7 @@
       "location" : "https://github.com/arkavo-org/OpenTDFKit",
       "state" : {
         "branch" : "main",
-        "revision" : "ee840a0f2f703090d699064e325c796eb14a315c"
+        "revision" : "c211d3b05f801ea5fb37d9ac1fc7c1e42015c362"
       }
     },
     {

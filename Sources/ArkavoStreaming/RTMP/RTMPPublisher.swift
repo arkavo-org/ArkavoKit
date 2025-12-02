@@ -382,12 +382,20 @@ public actor RTMPPublisher {
     }
 
     /// Send stream metadata (@setDataFrame onMetaData)
+    /// - Parameters:
+    ///   - width: Video width in pixels
+    ///   - height: Video height in pixels
+    ///   - framerate: Video framerate (fps)
+    ///   - videoBitrate: Video bitrate in bits/sec
+    ///   - audioBitrate: Audio bitrate in bits/sec
+    ///   - customFields: Optional custom string fields (e.g., ntdf_header for NanoTDF encryption)
     public func sendMetadata(
         width: Int,
         height: Int,
         framerate: Double,
         videoBitrate: Double,
-        audioBitrate: Double
+        audioBitrate: Double,
+        customFields: [String: String]? = nil
     ) async throws {
         guard state == .publishing else {
             throw RTMPError.notConnected
@@ -399,7 +407,8 @@ public actor RTMPPublisher {
             height: height,
             framerate: framerate,
             videoBitrate: videoBitrate,
-            audioBitrate: audioBitrate
+            audioBitrate: audioBitrate,
+            customFields: customFields
         )
 
         // Send as RTMP Script Data message (type 18, timestamp 0)
@@ -606,10 +615,40 @@ public actor RTMPPublisher {
 
         print("✅ Connect command sent")
 
-        // Wait for connect response (_result or _error)
+        // Wait for connect response - may receive control messages first (SetChunkSize, WindowAck, etc.)
         print("⏳ Waiting for connect response...")
-        let (connectResponseData, connectResponseBytes) = try await receiveRTMPChunk()
-        bytesReceived += UInt64(connectResponseBytes)
+        var receivedConnectResult = false
+        for _ in 0..<10 {
+            let (messageType, messageData, messageBytes) = try await receiveRTMPMessage()
+            bytesReceived += UInt64(messageBytes)
+
+            switch messageType {
+            case 1:  // Set Chunk Size - CRITICAL: update receive chunk size
+                if messageData.count >= 4 {
+                    let chunkSize = UInt32(messageData[0]) << 24 | UInt32(messageData[1]) << 16 |
+                                   UInt32(messageData[2]) << 8 | UInt32(messageData[3])
+                    receiveChunkSize = Int(chunkSize)
+                    print("📥 Server Set Chunk Size: \(chunkSize) (updated receiveChunkSize)")
+                }
+            case 5:  // Window Acknowledgement Size
+                if messageData.count >= 4 {
+                    serverWindowAckSize = UInt32(messageData[0]) << 24 | UInt32(messageData[1]) << 16 |
+                                         UInt32(messageData[2]) << 8 | UInt32(messageData[3])
+                    print("📥 Server Window Ack Size: \(serverWindowAckSize)")
+                }
+            case 6:  // Set Peer Bandwidth
+                print("📥 Server Set Peer Bandwidth")
+            case 20:  // AMF0 Command - could be _result
+                print("📥 Received AMF0 command during connect")
+                receivedConnectResult = true
+            default:
+                print("📥 Connect phase: received message type \(messageType)")
+            }
+
+            if receivedConnectResult {
+                break
+            }
+        }
         print("✅ Received connect response")
 
         // Release stream (transaction ID 2)
