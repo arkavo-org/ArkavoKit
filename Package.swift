@@ -16,6 +16,10 @@ let package = Package(
             name: "ArkavoC2PA",
             targets: ["ArkavoC2PA"]
         ),
+        .library(
+            name: "ArkavoStore",
+            targets: ["ArkavoStore"]
+        ),
         .executable(
             name: "ntdf-test",
             targets: ["NTDFTestCLI"]
@@ -66,6 +70,10 @@ let package = Package(
         ),
         .target(
             name: "ArkavoC2PA",
+            dependencies: []
+        ),
+        .target(
+            name: "ArkavoStore",
             dependencies: []
         ),
         .executableTarget(

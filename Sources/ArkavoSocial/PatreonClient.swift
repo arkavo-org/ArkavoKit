@@ -34,7 +34,7 @@ public actor PatreonClient: ObservableObject {
     let clientId: String
     let clientSecret: String
     public var config: PatreonConfig = .init()
-    public static let redirectURI = "https://webauthn.arkavo.net/oauth/arkavocreator/patreon"
+    public static var redirectURI: String { ArkavoConfiguration.shared.oauthRedirectURL(for: "patreon") }
     private let urlSession: URLSession
 
     @MainActor @Published public var isAuthenticated = false

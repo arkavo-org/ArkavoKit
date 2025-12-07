@@ -180,6 +180,8 @@ public final class ArkavoClient: NSObject {
             currentState = .authenticating
             let token = try await authenticateUser(accountName: accountName)
             try KeychainManager.saveAuthenticationToken(token)
+            // Save the account name (handle) for future sessions
+            try KeychainManager.saveArkavoHandle(accountName)
 
             // Then establish WebSocket connection
             currentState = .connecting
@@ -1101,13 +1103,15 @@ extension ArkavoClient: ASAuthorizationControllerPresentationContextProviding {
     public func presentationAnchor(for _: ASAuthorizationController) -> ASPresentationAnchor {
         #if os(iOS)
             guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-                  let window = scene.windows.first
+                  let window = scene.windows.first(where: { $0.isKeyWindow }) ?? scene.windows.first
             else {
                 fatalError("No window found in the current window scene")
             }
             return window
         #elseif os(macOS)
-            guard let window = NSApplication.shared.windows.first else {
+            // Use the key window to properly anchor the passkey prompt,
+            // especially when sheets are presented
+            guard let window = NSApplication.shared.keyWindow ?? NSApplication.shared.windows.first else {
                 fatalError("No window found in the application")
             }
             return window
@@ -1289,7 +1293,8 @@ private extension String {
 #elseif os(macOS)
     private class DefaultMacPresentationProvider: NSObject, ASAuthorizationControllerPresentationContextProviding {
         func presentationAnchor(for _: ASAuthorizationController) -> ASPresentationAnchor {
-            guard let window = NSApplication.shared.windows.first else {
+            // Use key window to properly anchor passkey prompt when sheets are presented
+            guard let window = NSApplication.shared.keyWindow ?? NSApplication.shared.windows.first else {
                 fatalError("No window found in the application")
             }
             return window

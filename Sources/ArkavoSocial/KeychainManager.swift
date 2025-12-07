@@ -4,6 +4,12 @@ import Foundation
 
 public class KeychainManager {
     private static let didKeyTag = "com.arkavo.did"
+
+    /// Shared keychain access group for credential sharing across Arkavo apps.
+    /// Uses com.arkavo.webauthn which is provisioned in all apps' keychain-access-groups.
+    /// The Team ID prefix (AppIdentifierPrefix) must be included.
+    public static let sharedAccessGroup = "M8GS7ZT95Y.com.arkavo.webauthn"
+
     enum KeychainError: Error {
         case duplicateItem
         case unknown(OSStatus)
@@ -11,16 +17,16 @@ public class KeychainManager {
         case invalidHandle
     }
 
-    public static func save(value: String, service: String, account: String) {
+    public static func save(value: String, service: String, account: String, accessGroup: String? = nil) {
         do {
-            try save(value.data(using: .utf8)!, service: service, account: account)
+            try save(value.data(using: .utf8)!, service: service, account: account, accessGroup: accessGroup)
         } catch {
             // ignore, use save(data...) throws
         }
     }
 
-    public static func save(_ data: Data, service: String, account: String) throws {
-        let query: [String: AnyObject] = [
+    public static func save(_ data: Data, service: String, account: String, accessGroup: String? = nil) throws {
+        var query: [String: AnyObject] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service as AnyObject,
             kSecAttrAccount as String: account as AnyObject,
@@ -28,6 +34,10 @@ public class KeychainManager {
             kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
             kSecUseDataProtectionKeychain as String: true as AnyObject,
         ]
+
+        if let accessGroup = accessGroup {
+            query[kSecAttrAccessGroup as String] = accessGroup as AnyObject
+        }
 
         let status = SecItemAdd(query as CFDictionary, nil)
 
@@ -45,8 +55,8 @@ public class KeychainManager {
         }
     }
 
-    public static func load(service: String, account: String) throws -> Data {
-        let query: [String: AnyObject] = [
+    public static func load(service: String, account: String, accessGroup: String? = nil) throws -> Data {
+        var query: [String: AnyObject] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service as AnyObject,
             kSecAttrAccount as String: account as AnyObject,
@@ -54,6 +64,10 @@ public class KeychainManager {
             kSecMatchLimit as String: kSecMatchLimitOne,
             kSecUseDataProtectionKeychain as String: true as AnyObject,
         ]
+
+        if let accessGroup = accessGroup {
+            query[kSecAttrAccessGroup as String] = accessGroup as AnyObject
+        }
 
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
@@ -72,22 +86,26 @@ public class KeychainManager {
         return data
     }
 
-    public static func getValue(service: String, account: String) -> String? {
+    public static func getValue(service: String, account: String, accessGroup: String? = nil) -> String? {
         do {
-            let data = try load(service: service, account: account)
+            let data = try load(service: service, account: account, accessGroup: accessGroup)
             return String(data: data, encoding: .utf8)
         } catch {
             return nil
         }
     }
 
-    public static func delete(service: String, account: String) throws {
-        let query: [String: AnyObject] = [
+    public static func delete(service: String, account: String, accessGroup: String? = nil) throws {
+        var query: [String: AnyObject] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service as AnyObject,
             kSecAttrAccount as String: account as AnyObject,
             kSecUseDataProtectionKeychain as String: true as AnyObject,
         ]
+
+        if let accessGroup = accessGroup {
+            query[kSecAttrAccessGroup as String] = accessGroup as AnyObject
+        }
 
         let status = SecItemDelete(query as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
@@ -218,16 +236,20 @@ public class KeychainManager {
         try? delete(service: "com.arkavo.bluesky", account: "handle")
     }
 
-    // Arkavo service
+    // MARK: - Shared Arkavo Authentication (shared across all Arkavo apps)
+
     public static func saveAuthenticationToken(_ token: String) throws {
         try save(token.data(using: .utf8)!,
                  service: "com.arkavo.webauthn",
-                 account: "authentication_token")
+                 account: "authentication_token",
+                 accessGroup: sharedAccessGroup)
     }
 
     public static func getAuthenticationToken() -> String? {
         do {
-            let data = try load(service: "com.arkavo.webauthn", account: "authentication_token")
+            let data = try load(service: "com.arkavo.webauthn",
+                               account: "authentication_token",
+                               accessGroup: sharedAccessGroup)
             return String(data: data, encoding: .utf8)
         } catch {
             return nil
@@ -235,7 +257,9 @@ public class KeychainManager {
     }
 
     public static func deleteAuthenticationToken() {
-        try? delete(service: "com.arkavo.webauthn", account: "authentication_token")
+        try? delete(service: "com.arkavo.webauthn",
+                   account: "authentication_token",
+                   accessGroup: sharedAccessGroup)
     }
 }
 
@@ -434,47 +458,53 @@ public extension KeychainManager {
         }
     }
 
-    // Arkavo Handle
+    // MARK: - Shared Arkavo Handle (shared across all Arkavo apps)
+
     static func saveArkavoHandle(_ handle: String) throws {
         try save(handle.data(using: .utf8)!,
                  service: "com.arkavo.handle",
-                 account: "arkavo")
+                 account: "arkavo",
+                 accessGroup: sharedAccessGroup)
     }
 
     static func getArkavoHandle() -> String? {
         do {
             let data = try load(service: "com.arkavo.handle",
-                                account: "arkavo")
+                                account: "arkavo",
+                                accessGroup: sharedAccessGroup)
             return String(data: data, encoding: .utf8)
         } catch {
             return nil
         }
     }
 
-    // Arkavo DID
+    // MARK: - Shared Arkavo DID (shared across all Arkavo apps)
+
     static func saveArkavoDID(_ did: String) throws {
         try save(did.data(using: .utf8)!,
                  service: "com.arkavo.did",
-                 account: "arkavo")
+                 account: "arkavo",
+                 accessGroup: sharedAccessGroup)
     }
 
     static func getArkavoDID() -> String? {
         do {
             let data = try load(service: "com.arkavo.did",
-                                account: "arkavo")
+                                account: "arkavo",
+                                accessGroup: sharedAccessGroup)
             return String(data: data, encoding: .utf8)
         } catch {
             return nil
         }
     }
 
-    // Helper to save both at once
+    // Helper to save both at once (shared across all Arkavo apps)
     static func saveArkavoCredentials(handle: String, did: String) throws {
         try saveArkavoHandle(handle)
         try saveArkavoDID(did)
     }
 
-    // Helper to get both at once
+    // Helper to get both at once (shared across all Arkavo apps)
     static func getArkavoCredentials() -> (handle: String, did: String)? {
         guard let handle = getArkavoHandle(),
               let did = getArkavoDID()
@@ -484,10 +514,10 @@ public extension KeychainManager {
         return (handle: handle, did: did)
     }
 
-    // Helper to delete both
+    // Helper to delete both (shared across all Arkavo apps)
     static func deleteArkavoCredentials() {
-        try? delete(service: "com.arkavo.handle", account: "arkavo")
-        try? delete(service: "com.arkavo.did", account: "arkavo")
+        try? delete(service: "com.arkavo.handle", account: "arkavo", accessGroup: sharedAccessGroup)
+        try? delete(service: "com.arkavo.did", account: "arkavo", accessGroup: sharedAccessGroup)
     }
 
     // MARK: - Stream Key Management

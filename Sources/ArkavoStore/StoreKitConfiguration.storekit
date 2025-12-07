@@ -1,0 +1,190 @@
+{
+  "identifier" : "ArkavoEncryption",
+  "nonRenewingSubscriptions" : [
+
+  ],
+  "products" : [
+
+  ],
+  "settings" : {
+    "_applicationInternalID" : "1234567890",
+    "_developerTeamID" : "XXXXXXXXXX",
+    "_failTransactionsEnabled" : false,
+    "_locale" : "en_US",
+    "_storefront" : "USA",
+    "_storeKitErrors" : [
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Load Products"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Purchase"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Verification"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "App Store Sync"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Subscription Status"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "App Transaction"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Manage Subscriptions Sheet"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Refund Request Sheet"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Offer Code Redeem Sheet"
+      }
+    ]
+  },
+  "subscriptionGroups" : [
+    {
+      "id" : "arkavo_encryption",
+      "localizations" : [
+
+      ],
+      "name" : "Arkavo Encryption",
+      "subscriptions" : [
+        {
+          "adHocOffers" : [
+
+          ],
+          "codeOffers" : [
+
+          ],
+          "displayPrice" : "4.99",
+          "familyShareable" : false,
+          "groupNumber" : 1,
+          "internalID" : "encryption_medium_monthly",
+          "introductoryOffer" : null,
+          "localizations" : [
+            {
+              "description" : "Enhanced encryption with additional key derivation",
+              "displayName" : "Enhanced Encryption - Monthly",
+              "locale" : "en_US"
+            }
+          ],
+          "productID" : "com.arkavo.encryption.medium.monthly",
+          "recurringSubscriptionPeriod" : "P1M",
+          "referenceName" : "Enhanced Encryption Monthly",
+          "subscriptionGroupID" : "arkavo_encryption",
+          "type" : "RecurringSubscription",
+          "winbackOffers" : [
+
+          ]
+        },
+        {
+          "adHocOffers" : [
+
+          ],
+          "codeOffers" : [
+
+          ],
+          "displayPrice" : "49.99",
+          "familyShareable" : false,
+          "groupNumber" : 1,
+          "internalID" : "encryption_medium_yearly",
+          "introductoryOffer" : null,
+          "localizations" : [
+            {
+              "description" : "Enhanced encryption with additional key derivation",
+              "displayName" : "Enhanced Encryption - Yearly",
+              "locale" : "en_US"
+            }
+          ],
+          "productID" : "com.arkavo.encryption.medium.yearly",
+          "recurringSubscriptionPeriod" : "P1Y",
+          "referenceName" : "Enhanced Encryption Yearly",
+          "subscriptionGroupID" : "arkavo_encryption",
+          "type" : "RecurringSubscription",
+          "winbackOffers" : [
+
+          ]
+        },
+        {
+          "adHocOffers" : [
+
+          ],
+          "codeOffers" : [
+
+          ],
+          "displayPrice" : "9.99",
+          "familyShareable" : false,
+          "groupNumber" : 2,
+          "internalID" : "encryption_high_monthly",
+          "introductoryOffer" : null,
+          "localizations" : [
+            {
+              "description" : "Maximum security with hardware-backed keys and forward secrecy",
+              "displayName" : "Maximum Encryption - Monthly",
+              "locale" : "en_US"
+            }
+          ],
+          "productID" : "com.arkavo.encryption.high.monthly",
+          "recurringSubscriptionPeriod" : "P1M",
+          "referenceName" : "Maximum Encryption Monthly",
+          "subscriptionGroupID" : "arkavo_encryption",
+          "type" : "RecurringSubscription",
+          "winbackOffers" : [
+
+          ]
+        },
+        {
+          "adHocOffers" : [
+
+          ],
+          "codeOffers" : [
+
+          ],
+          "displayPrice" : "99.99",
+          "familyShareable" : false,
+          "groupNumber" : 2,
+          "internalID" : "encryption_high_yearly",
+          "introductoryOffer" : null,
+          "localizations" : [
+            {
+              "description" : "Maximum security with hardware-backed keys and forward secrecy",
+              "displayName" : "Maximum Encryption - Yearly",
+              "locale" : "en_US"
+            }
+          ],
+          "productID" : "com.arkavo.encryption.high.yearly",
+          "recurringSubscriptionPeriod" : "P1Y",
+          "referenceName" : "Maximum Encryption Yearly",
+          "subscriptionGroupID" : "arkavo_encryption",
+          "type" : "RecurringSubscription",
+          "winbackOffers" : [
+
+          ]
+        }
+      ]
+    }
+  ],
+  "version" : {
+    "major" : 3,
+    "minor" : 0
+  }
+}
