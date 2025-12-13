@@ -138,7 +138,7 @@ public struct AMF0: Sendable {
     /// Following OBS's publisher connect format (not player format)
     public static func createConnectCommand(
         app: String,
-        flashVer: String = "FMLE/3.0 (compatible; FMSc/1.0)",
+        flashVer: String = "ArkavoCreator/1.0 (compatible; FMLE/3.0)",
         tcUrl: String,
         objectEncoding: Double = 0.0
     ) -> Data {

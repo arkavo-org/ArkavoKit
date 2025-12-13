@@ -107,6 +107,16 @@ public actor RTMPSubscriber {
     private var windowAckSize: UInt32 = 2500000
     private var serverWindowAckSize: UInt32 = 250000
 
+    // Per-chunk-stream state for handling type 1, 2, 3 headers
+    private struct ChunkStreamState {
+        var messageLength: UInt32 = 0
+        var messageTypeId: UInt8 = 0
+        var timestamp: UInt32 = 0
+        var remainingBytes: UInt32 = 0  // Bytes remaining in current message (for interleaved handling)
+        var hasExtendedTimestamp: Bool = false  // Track if extended timestamp is used
+    }
+    private var chunkStreamStates: [UInt32: ChunkStreamState] = [:]
+
     // Statistics
     private var bytesReceived: UInt64 = 0
     private var framesReceived: UInt64 = 0
@@ -329,7 +339,7 @@ public actor RTMPSubscriber {
         // Wait for connect response
         var receivedConnectResult = false
         for _ in 0 ..< 10 {
-            let (messageType, messageData, messageBytes) = try await receiveRTMPMessage()
+            let (messageType, messageData, _, messageBytes) = try await receiveRTMPMessage()
             bytesReceived += UInt64(messageBytes)
 
             switch messageType {
@@ -344,6 +354,7 @@ public actor RTMPSubscriber {
                 if messageData.count >= 4 {
                     serverWindowAckSize = UInt32(messageData[0]) << 24 | UInt32(messageData[1]) << 16 |
                         UInt32(messageData[2]) << 8 | UInt32(messageData[3])
+                    print("📥 Server Window Ack Size: \(serverWindowAckSize)")
                 }
             case 20:  // AMF0 Command
                 receivedConnectResult = true
@@ -376,7 +387,7 @@ public actor RTMPSubscriber {
         // Wait for createStream response
         var receivedStreamId = false
         for _ in 0 ..< 10 {
-            let (messageType, messageData, messageBytes) = try await receiveRTMPMessage()
+            let (messageType, messageData, _, messageBytes) = try await receiveRTMPMessage()
             bytesReceived += UInt64(messageBytes)
 
             if messageType == 20 {  // AMF0 Command
@@ -430,8 +441,11 @@ public actor RTMPSubscriber {
         receiveTask = Task { [weak self] in
             guard let self else { return }
 
+            print("🔄 Starting receive loop...")
+            var messageCount = 0
             while !Task.isCancelled {
                 do {
+                    messageCount += 1
                     let (messageType, messageData, timestamp, _) = try await self.receiveMediaMessage()
 
                     switch messageType {
@@ -444,10 +458,7 @@ public actor RTMPSubscriber {
                     case 20:  // AMF0 Command
                         await self.handleCommand(messageData)
                     default:
-                        let verbose = await self.verboseLogging
-                        if verbose {
-                            print("📥 Received message type \(messageType): \(messageData.count) bytes")
-                        }
+                        break
                     }
                 } catch {
                     if !Task.isCancelled {
@@ -467,10 +478,11 @@ public actor RTMPSubscriber {
         let isKeyframe = frameType == 1
 
         // Check for sequence header (AVC)
-        if codecId == 7, data.count > 1, data[1] == 0 {
+        let isSequenceHeader = codecId == 7 && data[1] == 0
+        if isSequenceHeader {
             videoSequenceHeader = data
             print("📥 Video sequence header: \(data.count) bytes")
-            return
+            // Continue to pass to onFrame so NTDFStreamingSubscriber can parse it
         }
 
         framesReceived += 1
@@ -479,7 +491,7 @@ public actor RTMPSubscriber {
             type: .video,
             data: data,
             timestamp: timestamp,
-            isKeyframe: isKeyframe
+            isKeyframe: isKeyframe || isSequenceHeader  // Sequence headers are keyframes
         )
 
         await onFrame?(frame)
@@ -491,10 +503,11 @@ public actor RTMPSubscriber {
         let soundFormat = (data[0] >> 4) & 0x0F
 
         // Check for sequence header (AAC)
-        if soundFormat == 10, data.count > 1, data[1] == 0 {
+        let isSequenceHeader = soundFormat == 10 && data[1] == 0
+        if isSequenceHeader {
             audioSequenceHeader = data
             print("📥 Audio sequence header: \(data.count) bytes")
-            return
+            // Continue to pass to onFrame so NTDFStreamingSubscriber can parse it
         }
 
         let frame = MediaFrame(
@@ -508,27 +521,32 @@ public actor RTMPSubscriber {
     }
 
     private func handleMetadata(_ data: Data) async {
-        print("📥 Metadata: \(data.count) bytes")
-
         // Parse AMF0 metadata
         var parser = AMF0Parser(data: data)
 
         // Read all values
         while parser.bytesRemaining > 0 {
-            guard let value = try? parser.readValue() else { break }
+            do {
+                let value = try parser.readValue()
 
-            // Look for object/array with metadata fields
-            if case let .object(dict) = value {
-                parseMetadataDict(dict)
-            } else if case let .array(arr) = value {
-                for item in arr {
-                    if case let .object(dict) = item {
-                        parseMetadataDict(dict)
+                // Look for object/array with metadata fields
+                if case let .object(dict) = value {
+                    parseMetadataDict(dict)
+                } else if case let .array(arr) = value {
+                    for item in arr {
+                        if case let .object(dict) = item {
+                            parseMetadataDict(dict)
+                        }
                     }
                 }
+            } catch {
+                break
             }
         }
 
+        if metadata.ntdfHeader != nil {
+            print("📥 [RTMPSub] Metadata received with NTDF header")
+        }
         await onMetadata?(metadata)
     }
 
@@ -557,7 +575,6 @@ public actor RTMPSubscriber {
         // NTDF-RTMP: Extract encrypted stream header
         if case let .string(ntdfHeader) = dict["ntdf_header"] {
             metadata.ntdfHeader = ntdfHeader
-            print("🔐 Received ntdf_header: \(ntdfHeader.prefix(50))...")
         }
     }
 
@@ -594,12 +611,11 @@ public actor RTMPSubscriber {
     // MARK: - RTMP Protocol
 
     private func receiveMediaMessage() async throws -> (messageType: UInt8, data: Data, timestamp: UInt32, bytes: Int) {
-        let (messageType, data, bytes) = try await receiveRTMPMessage()
-        // TODO: Extract timestamp from chunk header properly
-        return (messageType, data, 0, bytes)
+        let (messageType, data, timestamp, bytes) = try await receiveRTMPMessage()
+        return (messageType, data, timestamp, bytes)
     }
 
-    private func receiveRTMPMessage() async throws -> (messageType: UInt8, data: Data, bytes: Int) {
+    private func receiveRTMPMessage() async throws -> (messageType: UInt8, data: Data, timestamp: UInt32, bytes: Int) {
         // Read chunk basic header
         guard let basicHeader = try await receiveDataExact(length: 1) else {
             throw RTMPSubscriberError.connectionFailed("Failed to read chunk header")
@@ -624,10 +640,14 @@ public actor RTMPSubscriber {
             totalBytes += 2
         }
 
+        // Get or create state for this chunk stream
+        var csState = chunkStreamStates[chunkStreamId] ?? ChunkStreamState()
+
         // Read message header based on format
         var messageLength: UInt32 = 0
         var messageTypeId: UInt8 = 0
         var timestamp: UInt32 = 0
+        var rawTimestampField: UInt32 = 0  // Raw 3-byte value for extended timestamp check
 
         switch format {
         case 0:  // Full header (11 bytes)
@@ -635,43 +655,96 @@ public actor RTMPSubscriber {
                 throw RTMPSubscriberError.connectionFailed("Failed to read type 0 header")
             }
             totalBytes += 11
-            timestamp = UInt32(header[0]) << 16 | UInt32(header[1]) << 8 | UInt32(header[2])
+            rawTimestampField = UInt32(header[0]) << 16 | UInt32(header[1]) << 8 | UInt32(header[2])
+            timestamp = rawTimestampField
             messageLength = UInt32(header[3]) << 16 | UInt32(header[4]) << 8 | UInt32(header[5])
             messageTypeId = header[6]
+            // Store state for future type 1, 2, 3 chunks
+            csState.messageLength = messageLength
+            csState.messageTypeId = messageTypeId
+            csState.timestamp = timestamp
 
-        case 1:  // 7 bytes (no stream id)
+        case 1:  // 7 bytes (no stream id) - timestamp is DELTA
             guard let header = try await receiveDataExact(length: 7) else {
                 throw RTMPSubscriberError.connectionFailed("Failed to read type 1 header")
             }
             totalBytes += 7
-            timestamp = UInt32(header[0]) << 16 | UInt32(header[1]) << 8 | UInt32(header[2])
+            rawTimestampField = UInt32(header[0]) << 16 | UInt32(header[1]) << 8 | UInt32(header[2])
+            // If rawTimestampField is 0xFFFFFF, extended timestamp will be used - don't add here
+            if rawTimestampField != 0xFF_FFFF {
+                timestamp = csState.timestamp &+ rawTimestampField  // Wrapping add (timestamps can wrap)
+            } else {
+                timestamp = csState.timestamp  // Will be updated with extended timestamp later
+            }
             messageLength = UInt32(header[3]) << 16 | UInt32(header[4]) << 8 | UInt32(header[5])
             messageTypeId = header[6]
+            // Store state for future type 2, 3 chunks
+            csState.messageLength = messageLength
+            csState.messageTypeId = messageTypeId
+            csState.timestamp = timestamp
 
         case 2:  // 3 bytes (timestamp delta only)
             guard let header = try await receiveDataExact(length: 3) else {
                 throw RTMPSubscriberError.connectionFailed("Failed to read type 2 header")
             }
             totalBytes += 3
-            timestamp = UInt32(header[0]) << 16 | UInt32(header[1]) << 8 | UInt32(header[2])
-            // Use previous message length and type
+            rawTimestampField = UInt32(header[0]) << 16 | UInt32(header[1]) << 8 | UInt32(header[2])
+            // If rawTimestampField is 0xFFFFFF, extended timestamp will be used - don't add here
+            if rawTimestampField != 0xFF_FFFF {
+                timestamp = csState.timestamp &+ rawTimestampField  // Wrapping add (timestamps can wrap)
+            } else {
+                timestamp = csState.timestamp  // Will be updated with extended timestamp later
+            }
+            // Use previous message length and type from stored state
+            messageLength = csState.messageLength
+            messageTypeId = csState.messageTypeId
+            csState.timestamp = timestamp
 
         case 3:  // 0 bytes (continuation)
-            // Use previous everything
-            break
+            // Use previous everything from stored state
+            timestamp = csState.timestamp
+            messageLength = csState.messageLength
+            messageTypeId = csState.messageTypeId
 
         default:
             break
         }
 
-        // Extended timestamp
-        if timestamp == 0xFF_FFFF {
+        // Save state back
+        chunkStreamStates[chunkStreamId] = csState
+
+        // Extended timestamp handling
+        // For type 0/1/2: check if RAW 3-byte field is 0xFFFFFF
+        // For type 3: check if previous chunk had extended timestamp
+        let needsExtendedTimestamp = (format != 3 && rawTimestampField == 0xFF_FFFF) ||
+                                     (format == 3 && csState.hasExtendedTimestamp)
+
+        if needsExtendedTimestamp {
             guard let extTs = try await receiveDataExact(length: 4) else {
                 throw RTMPSubscriberError.connectionFailed("Failed to read extended timestamp")
             }
             totalBytes += 4
-            timestamp = UInt32(extTs[0]) << 24 | UInt32(extTs[1]) << 16 |
+            let extendedTimestamp = UInt32(extTs[0]) << 24 | UInt32(extTs[1]) << 16 |
                 UInt32(extTs[2]) << 8 | UInt32(extTs[3])
+
+            // For type 0: extended timestamp is absolute
+            // For type 1/2: extended timestamp is delta (add to previous)
+            // For type 3: use same timestamp as previous chunk
+            if format == 0 {
+                timestamp = extendedTimestamp
+            } else if format == 1 || format == 2 {
+                timestamp = csState.timestamp &+ extendedTimestamp  // Wrapping add (timestamps can wrap)
+            }
+            // For type 3, timestamp stays the same as previous chunk
+
+            // Update state
+            csState.timestamp = timestamp
+            csState.hasExtendedTimestamp = true
+            chunkStreamStates[chunkStreamId] = csState
+        } else if format != 3 {
+            // No extended timestamp for this chunk stream
+            csState.hasExtendedTimestamp = false
+            chunkStreamStates[chunkStreamId] = csState
         }
 
         // Read payload in chunks
@@ -687,16 +760,141 @@ public actor RTMPSubscriber {
             totalBytes += chunkSize
             remaining -= chunkSize
 
-            // Read continuation header if more chunks
+            // Read continuation header if more chunks needed
             if remaining > 0 {
-                guard let contHeader = try await receiveDataExact(length: 1) else {
-                    throw RTMPSubscriberError.connectionFailed("Failed to read continuation header")
-                }
-                totalBytes += 1
-                // Verify it's a type 3 continuation
-                let contFormat = (contHeader[0] >> 6) & 0x03
-                if contFormat != 3 {
-                    print("⚠️ Expected type 3 continuation, got type \(contFormat)")
+                // Keep reading until we get a type 3 continuation for OUR chunk stream
+                var gotOurContinuation = false
+                while !gotOurContinuation {
+                    guard let contHeader = try await receiveDataExact(length: 1) else {
+                        throw RTMPSubscriberError.connectionFailed("Failed to read continuation header")
+                    }
+                    totalBytes += 1
+
+                    // Parse continuation header
+                    let contFormat = (contHeader[0] >> 6) & 0x03
+                    var contCsid = UInt32(contHeader[0] & 0x3F)
+
+                    // Handle extended chunk stream ID
+                    if contCsid == 0 {
+                        guard let extByte = try await receiveDataExact(length: 1) else {
+                            throw RTMPSubscriberError.connectionFailed("Failed to read extended csid in continuation")
+                        }
+                        contCsid = UInt32(extByte[0]) + 64
+                        totalBytes += 1
+                    } else if contCsid == 1 {
+                        guard let extBytes = try await receiveDataExact(length: 2) else {
+                            throw RTMPSubscriberError.connectionFailed("Failed to read extended csid in continuation")
+                        }
+                        contCsid = UInt32(extBytes[1]) * 256 + UInt32(extBytes[0]) + 64
+                        totalBytes += 2
+                    }
+
+                    // Check if this is our continuation
+                    if contFormat == 3 && contCsid == chunkStreamId {
+                        // Read extended timestamp if our message has one
+                        if csState.hasExtendedTimestamp {
+                            guard let _ = try await receiveDataExact(length: 4) else {
+                                throw RTMPSubscriberError.connectionFailed("Failed to read continuation extended timestamp")
+                            }
+                            totalBytes += 4
+                            // Extended timestamp in continuation is same as first chunk
+                        }
+                        gotOurContinuation = true
+                    } else {
+                        // Interleaved chunk from another stream - parse and skip it
+
+                        // Get state for the interleaved chunk stream
+                        var interleavedState = chunkStreamStates[contCsid] ?? ChunkStreamState()
+                        var rawTimestampField: UInt32 = 0
+
+                        // Parse header based on format
+                        switch contFormat {
+                        case 0:  // Full header (11 bytes)
+                            guard let header = try await receiveDataExact(length: 11) else {
+                                throw RTMPSubscriberError.connectionFailed("Failed to read interleaved type 0 header")
+                            }
+                            totalBytes += 11
+                            rawTimestampField = UInt32(header[0]) << 16 | UInt32(header[1]) << 8 | UInt32(header[2])
+                            interleavedState.timestamp = rawTimestampField
+                            interleavedState.messageLength = UInt32(header[3]) << 16 | UInt32(header[4]) << 8 | UInt32(header[5])
+                            interleavedState.messageTypeId = header[6]
+                            // New message starts - set remainingBytes
+                            interleavedState.remainingBytes = interleavedState.messageLength
+
+                        case 1:  // 7 bytes (no stream id)
+                            guard let header = try await receiveDataExact(length: 7) else {
+                                throw RTMPSubscriberError.connectionFailed("Failed to read interleaved type 1 header")
+                            }
+                            totalBytes += 7
+                            rawTimestampField = UInt32(header[0]) << 16 | UInt32(header[1]) << 8 | UInt32(header[2])
+                            // Only add delta if not extended timestamp marker
+                            if rawTimestampField != 0xFF_FFFF {
+                                interleavedState.timestamp &+= rawTimestampField  // Wrapping add
+                            }
+                            interleavedState.messageLength = UInt32(header[3]) << 16 | UInt32(header[4]) << 8 | UInt32(header[5])
+                            interleavedState.messageTypeId = header[6]
+                            // New message starts - set remainingBytes
+                            interleavedState.remainingBytes = interleavedState.messageLength
+
+                        case 2:  // 3 bytes (timestamp delta only)
+                            guard let header = try await receiveDataExact(length: 3) else {
+                                throw RTMPSubscriberError.connectionFailed("Failed to read interleaved type 2 header")
+                            }
+                            totalBytes += 3
+                            rawTimestampField = UInt32(header[0]) << 16 | UInt32(header[1]) << 8 | UInt32(header[2])
+                            // Only add delta if not extended timestamp marker
+                            if rawTimestampField != 0xFF_FFFF {
+                                interleavedState.timestamp &+= rawTimestampField  // Wrapping add
+                            }
+                            // Format 2: if remainingBytes == 0, this is a new message with same length
+                            if interleavedState.remainingBytes == 0 {
+                                interleavedState.remainingBytes = interleavedState.messageLength
+                            }
+
+                        case 3:  // 0 bytes - use existing state
+                            // Format 3: if remainingBytes == 0, this is a new message with same params
+                            if interleavedState.remainingBytes == 0 {
+                                interleavedState.remainingBytes = interleavedState.messageLength
+                            }
+
+                        default:
+                            break
+                        }
+
+                        // Handle extended timestamp for interleaved chunks
+                        let needsExtendedTimestamp = (contFormat != 3 && rawTimestampField == 0xFF_FFFF) ||
+                                                     (contFormat == 3 && interleavedState.hasExtendedTimestamp)
+                        if needsExtendedTimestamp {
+                            guard let extTs = try await receiveDataExact(length: 4) else {
+                                throw RTMPSubscriberError.connectionFailed("Failed to read interleaved extended timestamp")
+                            }
+                            totalBytes += 4
+                            let extendedTimestamp = UInt32(extTs[0]) << 24 | UInt32(extTs[1]) << 16 |
+                                UInt32(extTs[2]) << 8 | UInt32(extTs[3])
+                            if contFormat == 0 {
+                                interleavedState.timestamp = extendedTimestamp
+                            } else if contFormat == 1 || contFormat == 2 {
+                                // Extended timestamp is the actual delta - add to previous timestamp
+                                interleavedState.timestamp &+= extendedTimestamp  // Wrapping add
+                            }
+                            // For format 3, timestamp stays the same as previous chunk
+                            interleavedState.hasExtendedTimestamp = true
+                        } else if contFormat != 3 {
+                            interleavedState.hasExtendedTimestamp = false
+                        }
+
+                        // Skip one chunk's worth of data for the interleaved message
+                        // Use remainingBytes (not messageLength) to track how much is left
+                        let skipSize = min(Int(interleavedState.remainingBytes), receiveChunkSize)
+                        if skipSize > 0 {
+                            _ = try await receiveDataExact(length: skipSize)
+                            totalBytes += skipSize
+                            interleavedState.remainingBytes -= UInt32(skipSize)
+                        }
+
+                        // Save updated state after skip
+                        chunkStreamStates[contCsid] = interleavedState
+                    }
                 }
             }
         }
@@ -704,11 +902,12 @@ public actor RTMPSubscriber {
         // Send acknowledgement if needed
         bytesReceived += UInt64(totalBytes)
         if bytesReceived - lastAckSent >= UInt64(serverWindowAckSize) {
+            print("📤 [RTMPSub] Sending acknowledgement: bytesReceived=\(bytesReceived)")
             try await sendAcknowledgement()
             lastAckSent = bytesReceived
         }
 
-        return (messageTypeId, payload, totalBytes)
+        return (messageTypeId, payload, timestamp, totalBytes)
     }
 
     private func sendRTMPMessage(chunkStreamId: UInt8, messageTypeId: UInt8, messageStreamId: UInt32, payload: Data) async throws {
@@ -826,15 +1025,25 @@ public actor RTMPSubscriber {
         }
 
         var receivedData = Data()
+        let startTime = ContinuousClock.now
 
         while receivedData.count < length {
             let remaining = length - receivedData.count
 
+            // Check for timeout (10 seconds)
+            let elapsed = ContinuousClock.now - startTime
+            if elapsed > .seconds(10) {
+                print("⏰ [RTMPSub] Receive timeout after 10s waiting for \(length) bytes (got \(receivedData.count))")
+                throw RTMPSubscriberError.connectionFailed("Receive timeout")
+            }
+
             let data = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data?, Error>) in
                 connection.receive(minimumIncompleteLength: 1, maximumLength: remaining) { data, _, isComplete, error in
                     if let error {
+                        print("❌ [RTMPSub] Connection receive error: \(error.localizedDescription)")
                         continuation.resume(throwing: RTMPSubscriberError.connectionFailed(error.localizedDescription))
                     } else if isComplete {
+                        print("⚠️ [RTMPSub] Connection closed by server (isComplete=true, bytesReceived=\(data?.count ?? 0))")
                         continuation.resume(returning: nil)
                     } else {
                         continuation.resume(returning: data)

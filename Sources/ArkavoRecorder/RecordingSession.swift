@@ -633,9 +633,19 @@ public final class RecordingSession: Sendable {
         try await encoder.startStreaming(to: destination, streamKey: streamKey)
     }
 
+    /// Start NTDF-encrypted streaming to Arkavo
+    /// - Parameters:
+    ///   - kasURL: KAS URL for key access (e.g., https://100.arkavo.net)
+    ///   - rtmpURL: RTMP server URL (e.g., rtmp://100.arkavo.net:1935)
+    ///   - streamKey: Stream key (e.g., live/test)
+    public func startNTDFStreaming(kasURL: URL, rtmpURL: String, streamKey: String) async throws {
+        try await encoder.startNTDFStreaming(kasURL: kasURL, rtmpURL: rtmpURL, streamKey: streamKey)
+    }
+
     /// Stop streaming
     public func stopStreaming() async {
         await encoder.stopStreaming()
+        await encoder.stopNTDFStreaming()
     }
 
     /// Get streaming statistics

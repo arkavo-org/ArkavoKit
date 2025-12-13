@@ -60,13 +60,28 @@ public actor KASPublicKeyService {
             throw KASPublicKeyError.networkError("HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)")
         }
 
-        // Response is PEM-encoded public key
-        guard let pemString = String(data: data, encoding: .utf8) else {
-            throw KASPublicKeyError.invalidResponse
+        // Response is JSON: {"public_key": "-----BEGIN PUBLIC KEY-----\r\n...", "kid": "ec:secp256r1"}
+        struct KASResponse: Decodable {
+            let public_key: String
+            let kid: String
         }
 
-        // Parse PEM to extract DER-encoded public key
-        let publicKeyData = try parsePEMPublicKey(pemString)
+        let kasResponse: KASResponse
+        do {
+            kasResponse = try JSONDecoder().decode(KASResponse.self, from: data)
+        } catch {
+            // Fallback: try parsing as raw PEM (for backwards compatibility)
+            guard let pemString = String(data: data, encoding: .utf8) else {
+                throw KASPublicKeyError.invalidResponse
+            }
+            let publicKeyData = try parsePEMPublicKey(pemString)
+            cachedPublicKey = publicKeyData
+            print("✅ Got KAS public key (raw PEM): \(publicKeyData.count) bytes")
+            return publicKeyData
+        }
+
+        // Parse PEM from JSON response
+        let publicKeyData = try parsePEMPublicKey(kasResponse.public_key)
 
         // Cache the result
         cachedPublicKey = publicKeyData

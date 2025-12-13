@@ -162,7 +162,8 @@ struct AMF0Parser {
         case .object:
             return try .object(readObject())
         case .array:
-            return try .array(readECMAArray())
+            // ECMA arrays have string keys like objects (e.g., onMetaData)
+            return try .object(readECMAArray())
         case .strictArray:
             return try .array(readStrictArray())
         case .null:
@@ -261,22 +262,22 @@ struct AMF0Parser {
     }
 
     /// Read an ECMA array without reading the marker
-    /// - Returns: The parsed array
+    /// - Returns: The parsed object (ECMA arrays have string keys, not numeric indices)
     /// - Throws: ParseError if data is malformed
-    mutating func readECMAArray() throws -> [Value] {
+    mutating func readECMAArray() throws -> [String: Value] {
         // ECMA arrays start with a 32-bit count (usually ignored)
         guard offset + 4 <= data.count else {
             throw ParseError.insufficientData(need: 4, have: data.count - offset)
         }
-        offset += 4  // Skip the count
+        let count = Int(data[offset]) << 24 | Int(data[offset + 1]) << 16 |
+                    Int(data[offset + 2]) << 8 | Int(data[offset + 3])
+        offset += 4
+        print("🔍 [AMF0] Reading ECMA array with count: \(count)")
 
-        // ECMA arrays are essentially objects with numeric keys
-        // For simplicity, we'll read as object and extract values
+        // ECMA arrays are essentially objects with string keys (like onMetaData)
         let obj = try readObject()
-
-        // Convert to array (assuming keys are sequential numbers starting from 0)
-        let sortedKeys = obj.keys.compactMap { Int($0) }.sorted()
-        return sortedKeys.map { obj[String($0)]! }
+        print("🔍 [AMF0] ECMA array keys: \(obj.keys.sorted())")
+        return obj
     }
 
     /// Read a strict array without reading the marker

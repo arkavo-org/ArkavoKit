@@ -74,7 +74,8 @@ let package = Package(
         ),
         .target(
             name: "ArkavoStore",
-            dependencies: []
+            dependencies: [],
+            exclude: ["StoreKitConfiguration.storekit"]
         ),
         .executableTarget(
             name: "NTDFTestCLI",

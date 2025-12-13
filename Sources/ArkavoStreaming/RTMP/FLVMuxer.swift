@@ -570,6 +570,7 @@ public struct FLVMuxer: Sendable {
         // Add custom fields (e.g., ntdf_header for NanoTDF encryption)
         if let customFields {
             for (key, value) in customFields {
+                print("📤 [FLVMuxer] Adding custom field: \(key) = \(value.prefix(50))...")
                 addStringProperty(name: key, value: value)
             }
         }

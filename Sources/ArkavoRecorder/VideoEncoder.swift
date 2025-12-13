@@ -34,7 +34,9 @@ public actor VideoEncoder {
 
     // Streaming support
     private var rtmpPublisher: RTMPPublisher?
+    private var ntdfStreamingManager: NTDFStreamingManager?
     private var isStreaming: Bool = false
+    private var isNTDFStreaming: Bool = false
     private var videoFormatDescription: CMFormatDescription?
     private var audioFormatDescription: CMFormatDescription?
     private var sentVideoSequenceHeader: Bool = false
@@ -355,9 +357,8 @@ public actor VideoEncoder {
 
     /// Encodes a video frame
     public func encodeVideoFrame(_ pixelBuffer: CVPixelBuffer, timestamp: CMTime) {
-        guard isRecording, !isPaused else { return }
-        guard let videoInput = videoInput, let adaptor = pixelBufferAdaptor else { return }
-        guard let assetWriter = assetWriter else { return }
+        // Allow frames through if recording OR streaming (NTDF or regular)
+        guard (isRecording || isStreaming || isNTDFStreaming), !isPaused else { return }
 
         // Validate timestamp
         guard timestamp.isValid, timestamp.seconds >= 0 else {
@@ -365,79 +366,112 @@ public actor VideoEncoder {
             return
         }
 
-        // Check if asset writer is ready for writing
-        guard assetWriter.status == .writing else {
-            if assetWriter.status == .failed {
-                print("❌ Asset writer failed before encoding could start")
-            }
-            return
-        }
+        // Calculate adjusted timestamp for both recording and streaming
+        var adjustedTimestamp = timestamp
 
-        // Initialize session on first frame (thread-safe check)
-        if !sessionStarted {
-            sessionStarted = true
-            startTime = timestamp
-            // Start session at time zero - we'll normalize all timestamps
-            assetWriter.startSession(atSourceTime: .zero)
-            lastVideoTimestamp = .zero
-            print("📹 VideoEncoder: Session started, base timestamp \(timestamp.seconds)")
-        }
+        // If recording to file, handle file-specific logic
+        if isRecording {
+            guard let videoInput = videoInput, let adaptor = pixelBufferAdaptor else { return }
+            guard let assetWriter = assetWriter else { return }
 
-        // Wait if input is not ready
-        if !videoInput.isReadyForMoreMediaData {
-            return
-        }
-
-        // Double-check asset writer is still healthy
-        guard assetWriter.status == .writing else {
-            if assetWriter.status == .failed {
-                let errorMessage = assetWriter.error?.localizedDescription ?? "Unknown error"
-                let underlyingError = (assetWriter.error as NSError?)?.userInfo[NSUnderlyingErrorKey] as? NSError
-                print("❌ Asset writer failed during video encoding: \(errorMessage)")
-                if let underlyingError = underlyingError {
-                    print("   Underlying error: Domain=\(underlyingError.domain) Code=\(underlyingError.code)")
+            // Check if asset writer is ready for writing
+            guard assetWriter.status == .writing else {
+                if assetWriter.status == .failed {
+                    print("❌ Asset writer failed before encoding could start")
                 }
+                return
             }
-            return
-        }
 
-        // Normalize timestamp relative to recording start
-        guard let baseTime = startTime else { return }
-        var adjustedTimestamp = CMTimeSubtract(timestamp, baseTime)
+            // Initialize session on first frame (thread-safe check)
+            if !sessionStarted {
+                sessionStarted = true
+                startTime = timestamp
+                // Start session at time zero - we'll normalize all timestamps
+                assetWriter.startSession(atSourceTime: .zero)
+                lastVideoTimestamp = .zero
+                print("📹 VideoEncoder: Session started, base timestamp \(timestamp.seconds)")
+            }
 
-        // Skip frames from before recording started (can happen with preview running)
-        if adjustedTimestamp.seconds < 0 {
-            return
-        }
+            // Wait if input is not ready
+            if !videoInput.isReadyForMoreMediaData {
+                return
+            }
 
-        // Adjust for pauses
-        if !totalPausedDuration.seconds.isZero {
-            adjustedTimestamp = CMTimeSubtract(adjustedTimestamp, totalPausedDuration)
-        }
-
-        // Ensure timestamps are monotonically increasing
-        if CMTimeCompare(adjustedTimestamp, lastVideoTimestamp) <= 0 {
-            // Timestamp is not increasing, skip this frame
-            return
-        }
-
-        // Append pixel buffer to file
-        if !adaptor.append(pixelBuffer, withPresentationTime: adjustedTimestamp) {
-            print("❌ Failed to append video frame at timestamp \(adjustedTimestamp.seconds)")
-            if assetWriter.status == .failed {
-                let errorMessage = assetWriter.error?.localizedDescription ?? "Unknown error"
-                let underlyingError = (assetWriter.error as NSError?)?.userInfo[NSUnderlyingErrorKey] as? NSError
-                print("   Asset writer error: \(errorMessage)")
-                if let underlyingError = underlyingError {
-                    print("   Underlying error: Domain=\(underlyingError.domain) Code=\(underlyingError.code)")
+            // Double-check asset writer is still healthy
+            guard assetWriter.status == .writing else {
+                if assetWriter.status == .failed {
+                    let errorMessage = assetWriter.error?.localizedDescription ?? "Unknown error"
+                    let underlyingError = (assetWriter.error as NSError?)?.userInfo[NSUnderlyingErrorKey] as? NSError
+                    print("❌ Asset writer failed during video encoding: \(errorMessage)")
+                    if let underlyingError = underlyingError {
+                        print("   Underlying error: Domain=\(underlyingError.domain) Code=\(underlyingError.code)")
+                    }
                 }
+                return
             }
-            return
-        }
-        lastVideoTimestamp = adjustedTimestamp
 
-        // Also stream if streaming is active
-        if isStreaming, let encoder = streamVideoEncoder {
+            // Normalize timestamp relative to recording start
+            guard let baseTime = startTime else { return }
+            adjustedTimestamp = CMTimeSubtract(timestamp, baseTime)
+
+            // Skip frames from before recording started (can happen with preview running)
+            if adjustedTimestamp.seconds < 0 {
+                return
+            }
+
+            // Adjust for pauses
+            if !totalPausedDuration.seconds.isZero {
+                adjustedTimestamp = CMTimeSubtract(adjustedTimestamp, totalPausedDuration)
+            }
+
+            // Ensure timestamps are monotonically increasing
+            if CMTimeCompare(adjustedTimestamp, lastVideoTimestamp) <= 0 {
+                // Timestamp is not increasing, skip this frame
+                return
+            }
+
+            // Append pixel buffer to file
+            if !adaptor.append(pixelBuffer, withPresentationTime: adjustedTimestamp) {
+                print("❌ Failed to append video frame at timestamp \(adjustedTimestamp.seconds)")
+                if assetWriter.status == .failed {
+                    let errorMessage = assetWriter.error?.localizedDescription ?? "Unknown error"
+                    let underlyingError = (assetWriter.error as NSError?)?.userInfo[NSUnderlyingErrorKey] as? NSError
+                    print("   Asset writer error: \(errorMessage)")
+                    if let underlyingError = underlyingError {
+                        print("   Underlying error: Domain=\(underlyingError.domain) Code=\(underlyingError.code)")
+                    }
+                }
+                return
+            }
+            lastVideoTimestamp = adjustedTimestamp
+        } else if isStreaming || isNTDFStreaming {
+            // Streaming-only mode: initialize stream timing on first frame
+            if !sessionStarted {
+                sessionStarted = true
+                startTime = timestamp
+                lastVideoTimestamp = .zero
+                print("📹 VideoEncoder: Stream session started, base timestamp \(timestamp.seconds)")
+            }
+
+            // Normalize timestamp for streaming
+            if let baseTime = startTime {
+                adjustedTimestamp = CMTimeSubtract(timestamp, baseTime)
+            }
+
+            // Skip frames from before stream started
+            if adjustedTimestamp.seconds < 0 {
+                return
+            }
+
+            // Ensure timestamps are monotonically increasing
+            if CMTimeCompare(adjustedTimestamp, lastVideoTimestamp) <= 0 {
+                return
+            }
+            lastVideoTimestamp = adjustedTimestamp
+        }
+
+        // Stream if streaming is active (either regular RTMP or NTDF-encrypted)
+        if (isStreaming || isNTDFStreaming), let encoder = streamVideoEncoder {
             do {
                 try encoder.encode(pixelBuffer, timestamp: adjustedTimestamp)
                 streamFrameCount += 1
@@ -457,8 +491,8 @@ public actor VideoEncoder {
     ///   - sampleBuffer: Audio sample buffer (must be 48kHz PCM stereo)
     ///   - sourceID: Unique identifier for the audio source (e.g., "microphone", "screen", "remote-camera-123")
     public func encodeAudioSample(_ sampleBuffer: CMSampleBuffer, sourceID: String) {
-        // Allow audio processing if either recording OR streaming
-        guard (isRecording || isStreaming) && !isPaused else { return }
+        // Allow audio processing if either recording OR streaming (regular or NTDF-encrypted)
+        guard (isRecording || isStreaming || isNTDFStreaming) && !isPaused else { return }
 
         guard CMSampleBufferIsValid(sampleBuffer) else {
             return
@@ -541,7 +575,7 @@ public actor VideoEncoder {
         }
 
         // Stream the first audio track for RTMP (typically microphone)
-        if isStreaming, let encoder = streamAudioEncoder, sourceID == "microphone" {
+        if (isStreaming || isNTDFStreaming), let encoder = streamAudioEncoder, sourceID == "microphone" {
             // Feed PCM audio to encoder for AAC conversion
             encoder.feed(sampleBuffer)
         }
@@ -751,11 +785,178 @@ public actor VideoEncoder {
         print("✅ RTMP stream stopped")
     }
 
+    // MARK: - NTDF Streaming Methods
+
+    /// Start NTDF-encrypted streaming to Arkavo
+    /// - Parameters:
+    ///   - kasURL: KAS URL for key access (e.g., https://100.arkavo.net)
+    ///   - rtmpURL: RTMP server URL (e.g., rtmp://100.arkavo.net:1935)
+    ///   - streamKey: Stream key (e.g., live/test)
+    public func startNTDFStreaming(kasURL: URL, rtmpURL: String, streamKey: String) async throws {
+        guard !isNTDFStreaming else {
+            print("⚠️ Already NTDF streaming")
+            return
+        }
+
+        print("🔐 Starting NTDF-encrypted stream...")
+
+        // Create and initialize NTDF streaming manager
+        let manager = NTDFStreamingManager(kasURL: kasURL)
+        try await manager.initialize()
+
+        // Connect to RTMP with encrypted header in metadata
+        try await manager.connect(
+            rtmpURL: rtmpURL,
+            streamKey: streamKey,
+            width: videoWidth,
+            height: videoHeight,
+            framerate: Double(frameRate),
+            videoBitrate: Double(videoBitrate),
+            audioBitrate: Double(audioBitrate)
+        )
+
+        // Create video encoder
+        let videoEncoder = ArkavoMedia.VideoEncoder(quality: .auto)
+        try videoEncoder.start()
+
+        // Create audio encoder
+        let audioEncoder = try ArkavoMedia.AudioEncoder(bitrate: audioBitrate)
+
+        // Create AsyncStreams to serialize frame sending
+        let (videoStream, videoContinuation) = AsyncStream<EncodedVideoFrame>.makeStream()
+        let (audioStream, audioContinuation) = AsyncStream<EncodedAudioFrame>.makeStream()
+        self.videoFrameContinuation = videoContinuation
+        self.audioFrameContinuation = audioContinuation
+
+        // Wire up video encoder callback
+        let videoCont = videoContinuation
+        videoEncoder.onFrame = { frame in
+            videoCont.yield(frame)
+        }
+
+        // Wire up audio encoder callback
+        let audioCont = audioContinuation
+        audioEncoder.onFrame = { frame in
+            audioCont.yield(frame)
+        }
+
+        // Start video send task with encryption
+        videoSendTask = Task { [weak self, weak manager] in
+            for await frame in videoStream {
+                guard let self = self, let manager = manager else { break }
+                guard !Task.isCancelled else { break }
+
+                do {
+                    // Send sequence header ONLY ONCE on first keyframe (unencrypted)
+                    let needsHeader = await self.shouldSendVideoSequenceHeader()
+                    if frame.isKeyframe, needsHeader, let formatDesc = frame.formatDescription {
+                        try await manager.sendVideoSequenceHeader(formatDescription: formatDesc)
+                        await self.markVideoSequenceHeaderSent()
+                        print("✅ Sent video sequence header (ONCE)")
+                    }
+
+                    // Send encrypted video frame
+                    try await manager.sendEncryptedVideo(frame: frame)
+                } catch is CancellationError {
+                    break
+                } catch {
+                    print("❌ Failed to send encrypted video frame: \(error)")
+                }
+            }
+        }
+
+        // Start audio send task with encryption
+        audioSendTask = Task { [weak self, weak manager] in
+            for await frame in audioStream {
+                guard let self = self, let manager = manager else { break }
+                guard !Task.isCancelled else { break }
+
+                do {
+                    // Send sequence header ONLY ONCE on first frame (unencrypted)
+                    let needsHeader = await self.shouldSendAudioSequenceHeader()
+                    if needsHeader, let formatDesc = frame.formatDescription {
+                        var asc = Data()
+                        var size: Int = 0
+                        if let cookie = CMAudioFormatDescriptionGetMagicCookie(formatDesc, sizeOut: &size), size > 0 {
+                            asc = Data(bytes: cookie, count: size)
+                        } else {
+                            let byte1: UInt8 = 0x11
+                            let byte2: UInt8 = 0x90
+                            asc = Data([byte1, byte2])
+                        }
+
+                        try await manager.sendAudioSequenceHeader(asc: asc)
+                        await self.markAudioSequenceHeaderSent()
+                        print("✅ Sent audio sequence header (ONCE)")
+                    }
+
+                    // Send encrypted audio frame
+                    try await manager.sendEncryptedAudio(frame: frame)
+                } catch is CancellationError {
+                    break
+                } catch {
+                    print("❌ Failed to send encrypted audio frame: \(error)")
+                }
+            }
+        }
+
+        streamVideoEncoder = videoEncoder
+        streamAudioEncoder = audioEncoder
+        ntdfStreamingManager = manager
+        isNTDFStreaming = true
+        sentVideoSequenceHeader = false
+        sentAudioSequenceHeader = false
+        streamStartTime = startTime ?? CMClockGetTime(CMClockGetHostTimeClock())
+        lastStreamVideoTimestamp = .zero
+        lastStreamAudioTimestamp = .zero
+
+        print("✅ NTDF-encrypted stream started")
+    }
+
+    /// Stop NTDF streaming
+    public func stopNTDFStreaming() async {
+        guard isNTDFStreaming, let manager = ntdfStreamingManager else { return }
+
+        print("🔐 Stopping NTDF stream...")
+
+        // Finish the frame queues first
+        videoFrameContinuation?.finish()
+        audioFrameContinuation?.finish()
+        videoFrameContinuation = nil
+        audioFrameContinuation = nil
+
+        // Wait for send tasks to complete
+        videoSendTask?.cancel()
+        audioSendTask?.cancel()
+        videoSendTask = nil
+        audioSendTask = nil
+
+        await manager.disconnect()
+
+        // Stop encoders
+        streamVideoEncoder?.stop()
+        streamAudioEncoder = nil
+        streamVideoEncoder = nil
+
+        ntdfStreamingManager = nil
+        isNTDFStreaming = false
+        sentVideoSequenceHeader = false
+        sentAudioSequenceHeader = false
+        streamStartTime = nil
+
+        print("✅ NTDF stream stopped")
+    }
+
     /// Get streaming statistics
     public var streamStatistics: RTMPPublisher.StreamStatistics? {
         get async {
-            guard let publisher = rtmpPublisher else { return nil }
-            return await publisher.statistics
+            if let publisher = rtmpPublisher {
+                return await publisher.statistics
+            }
+            if let manager = ntdfStreamingManager {
+                return await manager.statistics
+            }
+            return nil
         }
     }
 
