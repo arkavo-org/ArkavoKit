@@ -39,17 +39,27 @@ public final class LocalAIAgent: NSObject, ObservableObject {
     // In-process chat sessions (for direct calls, not WebSocket)
     private var inProcessSessions: [String: InProcessChatSession] = [:]
 
+    /// Key for persisted agent ID in UserDefaults
+    private static let agentIdKey = "com.arkavo.localai.agentId"
+
     private override init() {
-        // Generate unique agent ID using device name and identifier
+        // Generate unique agent ID - use persisted random ID instead of device identifiers
+        let deviceId: String
+        if let existingId = UserDefaults.standard.string(forKey: Self.agentIdKey) {
+            deviceId = existingId
+        } else {
+            // Generate and persist a new random ID (8 chars)
+            let newId = String(UUID().uuidString.prefix(8))
+            UserDefaults.standard.set(newId, forKey: Self.agentIdKey)
+            deviceId = newId
+        }
+
         #if os(iOS)
         let deviceName = UIDevice.current.name
-        let deviceId = UIDevice.current.identifierForVendor?.uuidString.prefix(8) ?? "unknown"
         #elseif os(macOS)
         let deviceName = Host.current().localizedName ?? "Mac"
-        let deviceId = UUID().uuidString.prefix(8) // macOS doesn't have persistent device ID
         #else
         let deviceName = "Device"
-        let deviceId = UUID().uuidString.prefix(8)
         #endif
 
         self.agentId = "local_ai_\(deviceId)"

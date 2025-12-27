@@ -4,6 +4,7 @@ import Foundation
 #if os(macOS)
 @preconcurrency import AVFoundation
 import ArkavoStreaming
+import CoreImage
 import VideoToolbox
 
 /// Recording input mode determining which sources are active
@@ -82,6 +83,10 @@ public final class RecordingSession: Sendable {
     // This is updated when recording starts/stops
     nonisolated(unsafe) private var _isRecording: Bool = false
     nonisolated(unsafe) private var recordingStartTime: Date?
+    private let previewCIContext = CIContext()
+
+    // Cache for floating head segmentation to avoid running it twice per frame
+    nonisolated(unsafe) private var cachedSegmentedImages: [String: CIImage] = [:]
 
     nonisolated public var isRecording: Bool {
         _isRecording
@@ -113,6 +118,12 @@ public final class RecordingSession: Sendable {
     public var watermarkOpacity: Float {
         get { compositor.watermarkOpacity }
         set { compositor.watermarkOpacity = newValue }
+    }
+
+    /// Enable floating head mode (person segmentation with transparent background)
+    public var floatingHeadEnabled: Bool {
+        get { compositor.floatingHeadEnabled }
+        set { compositor.floatingHeadEnabled = newValue }
     }
 
     nonisolated(unsafe) public var enableCamera: Bool = true
@@ -773,6 +784,9 @@ public final class RecordingSession: Sendable {
         }
     }
 
+    // Debug throttle for floating head logging
+    nonisolated(unsafe) private static var lastFloatingHeadLogTime: Date?
+
     private func dispatchPreview(for identifier: String, buffer: CMSampleBuffer) {
         guard let handler = previewHandler,
               let pixelBuffer = CMSampleBufferGetImageBuffer(buffer)
@@ -781,9 +795,36 @@ public final class RecordingSession: Sendable {
         }
 
         var cgImage: CGImage?
-        let status = VTCreateCGImageFromCVPixelBuffer(pixelBuffer, options: nil, imageOut: &cgImage)
+        let isFloatingHead = compositor.floatingHeadEnabled
 
-        if status == noErr, let cgImage {
+        // Debug logging (throttled to once per second)
+        let now = Date()
+        if Self.lastFloatingHeadLogTime == nil || now.timeIntervalSince(Self.lastFloatingHeadLogTime!) >= 1.0 {
+            Self.lastFloatingHeadLogTime = now
+            print("🎭 [Preview] floatingHeadEnabled=\(isFloatingHead)")
+        }
+
+        // Apply person segmentation for floating head preview
+        // Skip during recording to avoid running segmentation twice (compositor handles it)
+        if isFloatingHead && !_isRecording {
+            let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+            if let segmentedImage = compositor.applyFloatingHeadSegmentation(to: ciImage, pixelBuffer: pixelBuffer) {
+                cgImage = previewCIContext.createCGImage(segmentedImage, from: segmentedImage.extent)
+                if Self.lastFloatingHeadLogTime == now {
+                    print("🎭 [Preview] Segmentation applied successfully")
+                }
+            } else if Self.lastFloatingHeadLogTime == now {
+                print("🎭 [Preview] Segmentation returned nil")
+            }
+        }
+
+        // Fall back to direct conversion if segmentation didn't produce an image
+        if cgImage == nil {
+            let status = VTCreateCGImageFromCVPixelBuffer(pixelBuffer, options: nil, imageOut: &cgImage)
+            guard status == noErr else { return }
+        }
+
+        if let cgImage {
             handler(CameraPreviewEvent(sourceID: identifier, image: cgImage))
         }
     }

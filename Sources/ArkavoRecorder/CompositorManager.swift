@@ -36,6 +36,10 @@ public final class CompositorManager: Sendable {
     public nonisolated(unsafe) var watermarkPosition: WatermarkPosition = .bottomCenter
     public nonisolated(unsafe) var watermarkOpacity: Float = 0.6 // 60% opacity
 
+    // Floating head (person segmentation) configuration
+    public nonisolated(unsafe) var floatingHeadEnabled: Bool = false
+    private let segmentationProcessor = PersonSegmentationProcessor()
+
     // Cached watermark image
     private nonisolated(unsafe) var watermarkImage: CIImage?
 
@@ -188,7 +192,17 @@ public final class CompositorManager: Sendable {
                 continue
             }
 
-            let cameraImage = CIImage(cvPixelBuffer: cameraPixelBuffer)
+            var cameraImage = CIImage(cvPixelBuffer: cameraPixelBuffer)
+
+            // Apply person segmentation if floating head mode is enabled
+            if floatingHeadEnabled {
+                segmentationProcessor.isEnabled = true
+                if let mask = segmentationProcessor.processFrame(cameraPixelBuffer) {
+                    cameraImage = segmentationProcessor.applyMask(to: cameraImage, mask: mask)
+                }
+            } else {
+                segmentationProcessor.isEnabled = false
+            }
 
             // Calculate PiP dimensions and position
             let pipSize = pipSize(for: screenSize, cameraCount: cameraLayers.count)
@@ -227,7 +241,8 @@ public final class CompositorManager: Sendable {
             }
 
             // Add rounded corners BEFORE positioning (mask needs to be at same origin as image)
-            let cameraWithEffects = addPiPEffects(to: scaledCamera, size: scaledCameraSize)
+            // Skip rounded corners when floating head is enabled (person shape is the border)
+            let cameraWithEffects = floatingHeadEnabled ? scaledCamera : addPiPEffects(to: scaledCamera, size: scaledCameraSize)
 
             // Position the camera overlay
             let positionedCamera = cameraWithEffects.transformed(by: CGAffineTransform(translationX: position.x, y: position.y))
@@ -297,6 +312,22 @@ public final class CompositorManager: Sendable {
         case .bottomRight:
             return CGPoint(x: screenSize.width - pipSize.width - margin, y: margin)
         }
+    }
+
+    /// Apply floating head segmentation to a camera image for preview
+    /// - Parameters:
+    ///   - image: The camera image as CIImage
+    ///   - pixelBuffer: The original pixel buffer for Vision processing
+    /// - Returns: The segmented image with transparent background, or nil if segmentation fails
+    public nonisolated func applyFloatingHeadSegmentation(to image: CIImage, pixelBuffer: CVPixelBuffer) -> CIImage? {
+        guard floatingHeadEnabled else { return nil }
+
+        segmentationProcessor.isEnabled = true
+        guard let mask = segmentationProcessor.processFrame(pixelBuffer) else {
+            return nil
+        }
+
+        return segmentationProcessor.applyMask(to: image, mask: mask)
     }
 
     private func addPiPEffects(to image: CIImage, size: CGSize) -> CIImage {

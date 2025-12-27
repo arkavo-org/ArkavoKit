@@ -1,5 +1,5 @@
 {
-  "originHash" : "7ce382a95228102742f262bfaa8650fcd745ff543ca807fdd0b47e6b9600840f",
+  "originHash" : "85556aacd01073b6c97e57fbfc9bdce447b11035a59660e135527342c3737bfa",
   "pins" : [
     {
       "identity" : "cryptoswift",
@@ -8,6 +8,15 @@
       "state" : {
         "revision" : "e45a26384239e028ec87fbcc788f513b67e10d8f",
         "version" : "1.9.0"
+      }
+    },
+    {
+      "identity" : "iroh-swift",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/arkavo-org/iroh-swift",
+      "state" : {
+        "revision" : "172a3e0efaae2bdeb02aeee80ca42081a4d0d47e",
+        "version" : "0.2.5"
       }
     },
     {

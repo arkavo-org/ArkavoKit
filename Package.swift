@@ -26,7 +26,8 @@ let package = Package(
         ),
     ],
     dependencies: [
-        .package(url: "https://github.com/arkavo-org/OpenTDFKit", branch: "main")
+        .package(url: "https://github.com/arkavo-org/OpenTDFKit", branch: "main"),
+        .package(url: "https://github.com/arkavo-org/iroh-swift", from: "0.2.5")
     ],
     targets: [
         .target(
@@ -46,7 +47,10 @@ let package = Package(
         ),
         .target(
             name: "ArkavoSocial",
-            dependencies: ["OpenTDFKit"]
+            dependencies: [
+                "OpenTDFKit",
+                .product(name: "IrohSwift", package: "iroh-swift")
+            ]
         ),
         .target(
             name: "ArkavoContent",
