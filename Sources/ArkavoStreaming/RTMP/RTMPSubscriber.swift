@@ -87,7 +87,7 @@ public actor RTMPSubscriber {
         public var audioCodec: String?
         public var ntdfHeader: String?  // Base64-encoded NanoTDF header for encrypted streams
 
-        public init() {}
+        public init() { /* Uses default property values */ }
     }
 
     // MARK: - Properties
@@ -143,7 +143,7 @@ public actor RTMPSubscriber {
 
     // MARK: - Initialization
 
-    public init() {}
+    public init() { /* Uses default property values */ }
 
     // MARK: - Public Methods
 

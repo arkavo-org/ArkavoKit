@@ -137,9 +137,9 @@ public class RedditClient: ObservableObject {
 
     public func logout() {
         // Clear Keychain
-        try! KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.accessToken)
-        try! KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.refreshToken)
-        try! KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.tokenExpiration)
+        try? KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.accessToken)
+        try? KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.refreshToken)
+        try? KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.tokenExpiration)
         // Clear memory
         accessToken = nil
         refreshToken = nil

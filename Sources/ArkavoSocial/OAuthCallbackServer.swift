@@ -46,7 +46,7 @@ public final class OAuthCallbackServer: @unchecked Sendable {
         "http://127.0.0.1:\(port)"
     }
 
-    public init() {}
+    public init() { /* Uses default property values */ }
 
     /// Start the server and wait for OAuth callback
     /// - Parameter state: The state parameter to validate against CSRF

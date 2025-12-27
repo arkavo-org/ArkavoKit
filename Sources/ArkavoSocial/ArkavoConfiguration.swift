@@ -17,7 +17,7 @@ public struct ArkavoConfiguration: Sendable {
     /// Domains for certificate pinning
     public let pinnedDomains: Set<String> = ["identity.arkavo.net", "kas.arkavo.net", "app.arkavo.com"]
 
-    private init() {}
+    private init() { /* Singleton: prevents external instantiation */ }
 
     /// Generate OAuth redirect URL for a specific service
     /// - Parameters:

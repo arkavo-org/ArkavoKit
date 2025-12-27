@@ -80,7 +80,7 @@ public final class ArkavoIrohManager: Sendable {
     @MainActor
     private var config: ArkavoIrohConfig?
 
-    private init() {}
+    private init() { /* Singleton: prevents external instantiation */ }
 
     // MARK: - Initialization
 

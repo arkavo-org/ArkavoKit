@@ -33,7 +33,7 @@ public struct RegisteredSource: Sendable {
 public actor CaptureSourceRegistry {
     private var sources: [String: RegisteredSource] = [:]
 
-    public init() {}
+    public init() { /* Actor requires explicit public initializer */ }
 
     /// Register a capture source with its startup function
     public func register(_ source: RegisteredSource) {

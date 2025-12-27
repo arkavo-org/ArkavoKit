@@ -162,7 +162,7 @@ public actor RTMPPublisher {
 
     // MARK: - Initialization
 
-    public init() {}
+    public init() { /* Uses default property values */ }
 
     // MARK: - Public Methods
 
