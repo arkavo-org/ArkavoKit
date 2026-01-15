@@ -1635,14 +1635,8 @@ public actor RTMPPublisher {
 
                 if let data = data {
                     print("📥 Received \(data.count) bytes (requested \(length))")
-                    // If we got some data but not enough, we need to read more
-                    if data.count < length {
-                        // For now, just return what we got - the caller will need to read more
-                        // This is a limitation of the current architecture
-                        continuation.resume(returning: data)
-                    } else {
-                        continuation.resume(returning: data)
-                    }
+                    // Return whatever data we received - caller handles partial reads
+                    continuation.resume(returning: data)
                 } else if isComplete {
                     print("❌ Connection closed by server (isComplete=true, no data)")
                     continuation.resume(throwing: RTMPError.connectionFailed("Connection closed"))

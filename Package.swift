@@ -32,10 +32,20 @@ let package = Package(
             name: "ntdf-test",
             targets: ["NTDFTestCLI"]
         ),
+        .executable(
+            name: "tdf-create",
+            targets: ["TDFCreateCLI"]
+        ),
+        .executable(
+            name: "tdf-fetch",
+            targets: ["TDFFetchCLI"]
+        ),
     ],
     dependencies: [
-        .package(url: "https://github.com/arkavo-org/OpenTDFKit", branch: "main"),
-        .package(url: "https://github.com/arkavo-org/iroh-swift", from: "0.2.5")
+        .package(url: "https://github.com/arkavo-org/OpenTDFKit", revision: "d8ffeff"),
+        .package(url: "https://github.com/arkavo-org/iroh-swift", from: "0.2.5"),
+        .package(url: "https://github.com/weichsel/ZIPFoundation", from: "0.9.19"),
+        .package(path: "../ArkavoMediaKit")
     ],
     targets: [
         .target(
@@ -59,7 +69,9 @@ let package = Package(
             name: "ArkavoSocial",
             dependencies: [
                 "OpenTDFKit",
-                .product(name: "IrohSwift", package: "iroh-swift")
+                .product(name: "IrohSwift", package: "iroh-swift"),
+                "ZIPFoundation",
+                .product(name: "ArkavoMediaKit", package: "ArkavoMediaKit"),
             ],
             swiftSettings: sharedSwiftSettings
         ),
@@ -85,7 +97,14 @@ let package = Package(
         ),
         .testTarget(
             name: "ArkavoKitTests",
-            dependencies: ["ArkavoKit", "ArkavoRecorder", "ArkavoStreaming", "ArkavoMedia"],
+            dependencies: [
+                "ArkavoKit",
+                "ArkavoRecorder",
+                "ArkavoStreaming",
+                "ArkavoMedia",
+                "ArkavoSocial",
+                .product(name: "ArkavoMediaKit", package: "ArkavoMediaKit"),
+            ],
             swiftSettings: sharedSwiftSettings
         ),
         .target(
@@ -102,6 +121,24 @@ let package = Package(
         .executableTarget(
             name: "NTDFTestCLI",
             dependencies: ["ArkavoStreaming", "ArkavoMedia", "OpenTDFKit"],
+            swiftSettings: sharedSwiftSettings
+        ),
+        .executableTarget(
+            name: "TDFCreateCLI",
+            dependencies: [
+                "ArkavoSocial",
+                .product(name: "IrohSwift", package: "iroh-swift"),
+                .product(name: "ArkavoMediaKit", package: "ArkavoMediaKit"),
+                "OpenTDFKit",
+            ],
+            swiftSettings: sharedSwiftSettings
+        ),
+        .executableTarget(
+            name: "TDFFetchCLI",
+            dependencies: [
+                "ArkavoSocial",
+                .product(name: "IrohSwift", package: "iroh-swift"),
+            ],
             swiftSettings: sharedSwiftSettings
         ),
     ]

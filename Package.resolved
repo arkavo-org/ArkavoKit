@@ -1,5 +1,5 @@
 {
-  "originHash" : "85556aacd01073b6c97e57fbfc9bdce447b11035a59660e135527342c3737bfa",
+  "originHash" : "dd99b2f453f2380665c199ee95d370820daa930085208643362acda324cd015d",
   "pins" : [
     {
       "identity" : "cryptoswift",
@@ -15,8 +15,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/arkavo-org/iroh-swift",
       "state" : {
-        "revision" : "172a3e0efaae2bdeb02aeee80ca42081a4d0d47e",
-        "version" : "0.2.5"
+        "revision" : "4b3632cba5de6cb47d6c185ac9e569f1e271bd7c",
+        "version" : "0.3.0"
       }
     },
     {
@@ -24,8 +24,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/arkavo-org/OpenTDFKit",
       "state" : {
-        "branch" : "main",
-        "revision" : "e3ffe32d86a51e7d0f219fcb0a6b746df418fb98"
+        "branch" : "d8ffeff",
+        "revision" : "d8ffeff99e00ec3334aa57b1fe5f9e1c7f38d2a9"
       }
     },
     {

@@ -12,30 +12,40 @@ public struct ArkavoIrohConfig: Sendable {
     public var storagePath: URL?
     /// Enable relay servers for NAT traversal (default: true)
     public var relayEnabled: Bool
+    /// Custom relay server URL (e.g., "https://iroh.arkavo.org")
+    public var customRelayUrl: String?
+
+    /// Arkavo's relay server URL
+    public static let arkavoRelayUrl = "https://iroh.arkavo.org"
 
     public init(
         storagePath: URL? = nil,
-        relayEnabled: Bool = true
+        relayEnabled: Bool = true,
+        customRelayUrl: String? = nil
     ) {
         self.storagePath = storagePath
         self.relayEnabled = relayEnabled
+        self.customRelayUrl = customRelayUrl
     }
 
-    /// Default configuration
-    public static let `default` = ArkavoIrohConfig()
+    /// Default configuration using n0's public relay for NAT traversal
+    public static let `default` = ArkavoIrohConfig(
+        relayEnabled: true
+        // Uses n0's public relays when customRelayUrl is nil
+    )
 
     /// Convert to IrohConfig
     func toIrohConfig() -> IrohConfig {
-        if let storagePath {
-            return IrohConfig(storagePath: storagePath, relayEnabled: relayEnabled)
-        } else {
-            // Use default storage with custom subdirectory for Arkavo
-            let defaultPath = FileManager.default
-                .urls(for: .applicationSupportDirectory, in: .userDomainMask)
-                .first!
-                .appendingPathComponent("arkavo-iroh", isDirectory: true)
-            return IrohConfig(storagePath: defaultPath, relayEnabled: relayEnabled)
-        }
+        let defaultPath = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first!
+            .appendingPathComponent("arkavo-iroh", isDirectory: true)
+
+        return IrohConfig(
+            storagePath: storagePath ?? defaultPath,
+            relayEnabled: relayEnabled,
+            customRelayUrl: customRelayUrl
+        )
     }
 }
 
@@ -67,6 +77,10 @@ public final class ArkavoIrohManager: Sendable {
     /// The profile service (created when node is ready)
     @MainActor
     private var _profileService: IrohProfileService?
+
+    /// The content service (created when node is ready)
+    @MainActor
+    private var _contentService: IrohContentService?
 
     /// Whether the manager is currently initializing
     @MainActor
@@ -104,6 +118,7 @@ public final class ArkavoIrohManager: Sendable {
 
         if let node = manager.node {
             _profileService = IrohProfileService(node: node)
+            _contentService = IrohContentService(node: node)
         } else if let managerError = manager.error {
             error = managerError
         }
@@ -117,6 +132,7 @@ public final class ArkavoIrohManager: Sendable {
         nodeManager?.reset()
         nodeManager = nil
         _profileService = nil
+        _contentService = nil
         error = nil
         isInitializing = false
         config = nil
@@ -134,6 +150,12 @@ public final class ArkavoIrohManager: Sendable {
     @MainActor
     public var profileService: IrohProfileService? {
         _profileService
+    }
+
+    /// The content service, if node is initialized
+    @MainActor
+    public var contentService: IrohContentService? {
+        _contentService
     }
 
     /// Whether the node is ready for use
