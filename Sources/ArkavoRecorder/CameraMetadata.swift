@@ -60,10 +60,17 @@ public enum CameraMetadata: Sendable, Codable {
 public struct ARFaceMetadata: Sendable, Codable {
     public let blendShapes: [String: Float]
     public let trackingState: ARFaceTrackingState
+    /// Head transform as 16-element column-major 4x4 matrix (position + rotation)
+    public let headTransform: [Float]?
 
-    public init(blendShapes: [String: Float], trackingState: ARFaceTrackingState = .unknown) {
+    public init(
+        blendShapes: [String: Float],
+        trackingState: ARFaceTrackingState = .unknown,
+        headTransform: [Float]? = nil
+    ) {
         self.blendShapes = blendShapes
         self.trackingState = trackingState
+        self.headTransform = headTransform
     }
 }
 

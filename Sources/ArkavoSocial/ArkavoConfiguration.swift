@@ -14,6 +14,9 @@ public struct ArkavoConfiguration: Sendable {
     /// WebSocket server URL for real-time communication
     public let websocketURL = URL(string: "wss://100.arkavo.net/ws")!
 
+    /// API server URL for agent authorization and other services
+    public let apiURL = URL(string: "https://100.arkavo.net")!
+
     /// Domains for certificate pinning
     public let pinnedDomains: Set<String> = ["identity.arkavo.net", "kas.arkavo.net", "app.arkavo.com"]
 

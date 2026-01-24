@@ -34,7 +34,7 @@ public final class LocalAIAgent: NSObject, ObservableObject {
     // Unique agent ID based on device
     private let agentId: String
     private let agentName: String
-    private let agentPurpose = "Local AI for on-device intelligence and sensor access"
+    private let agentPurpose = "On-device intelligence and sensor access"
 
     // In-process chat sessions (for direct calls, not WebSocket)
     private var inProcessSessions: [String: InProcessChatSession] = [:]
@@ -62,8 +62,8 @@ public final class LocalAIAgent: NSObject, ObservableObject {
         let deviceName = "Device"
         #endif
 
-        self.agentId = "local_ai_\(deviceId)"
-        self.agentName = "LocalAI (\(deviceName))"
+        self.agentId = "device_agent_\(deviceId)"
+        self.agentName = "Device Agent (\(deviceName))"
 
         sensorBridge = SensorBridge()
         appleIntelligenceClient = AppleIntelligenceClient()

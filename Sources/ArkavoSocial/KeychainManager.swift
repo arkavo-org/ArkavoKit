@@ -144,7 +144,7 @@ public class KeychainManager {
                  account: "refresh_token")
     }
 
-    static func deleteTokens() {
+    public static func deleteTokens() {
         try? delete(service: "com.arkavo.patreon", account: "access_token")
         try? delete(service: "com.arkavo.patreon", account: "refresh_token")
         try? delete(service: "com.arkavo.patreon", account: "campaign_id")
@@ -170,6 +170,52 @@ public class KeychainManager {
         try? delete(service: "com.arkavo.patreon", account: "access_token")
         try? delete(service: "com.arkavo.patreon", account: "refresh_token")
         try? delete(service: "com.arkavo.patreon", account: "campaign_id")
+    }
+
+    // MARK: - Apple Account Linking Methods
+
+    public static func saveAppleUserID(_ userID: String) throws {
+        try save(userID.data(using: .utf8)!,
+                 service: "com.arkavo.apple",
+                 account: "user_id")
+    }
+
+    public static func getAppleUserID() -> String? {
+        getValue(service: "com.arkavo.apple", account: "user_id")
+    }
+
+    public static func saveAppleEmail(_ email: String) throws {
+        try save(email.data(using: .utf8)!,
+                 service: "com.arkavo.apple",
+                 account: "email")
+    }
+
+    public static func getAppleEmail() -> String? {
+        getValue(service: "com.arkavo.apple", account: "email")
+    }
+
+    public static func saveAppleFullName(_ fullName: String) throws {
+        try save(fullName.data(using: .utf8)!,
+                 service: "com.arkavo.apple",
+                 account: "full_name")
+    }
+
+    public static func getAppleFullName() -> String? {
+        getValue(service: "com.arkavo.apple", account: "full_name")
+    }
+
+    public static func deleteAppleAccount() {
+        try? delete(service: "com.arkavo.apple", account: "user_id")
+        try? delete(service: "com.arkavo.apple", account: "email")
+        try? delete(service: "com.arkavo.apple", account: "full_name")
+    }
+
+    public static func isAppleAccountLinked() -> Bool {
+        getAppleUserID() != nil
+    }
+
+    public static func isPatreonAccountLinked() -> Bool {
+        getAccessToken() != nil
     }
 
     static func saveBlueskyTokens(accessToken: String, refreshToken: String) throws {
@@ -476,6 +522,12 @@ public extension KeychainManager {
         } catch {
             return nil
         }
+    }
+
+    public static func deleteArkavoHandle() {
+        try? delete(service: "com.arkavo.handle",
+                    account: "arkavo",
+                    accessGroup: sharedAccessGroup)
     }
 
     // MARK: - Shared Arkavo DID (shared across all Arkavo apps)
