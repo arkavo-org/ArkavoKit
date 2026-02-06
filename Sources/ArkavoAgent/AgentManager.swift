@@ -140,12 +140,12 @@ public final class AgentManager: ObservableObject {
                     // Update agents list
                     self.agents = discoveredAgents
 
-                    // Auto-connect to new agents (skip LocalAIAgent - it's in-process)
+                    // Auto-connect to new discovered agents
+                    // Note: This device's agent is NOT in mDNS discovery - it's added directly in AgentService
+                    // So all agents here are remote and need WebSocket connections
                     if self.autoConnect {
                         for agent in discoveredAgents {
-                            // Skip LocalAIAgent - it doesn't need WebSocket connection
-                            let isLocalAgent = agent.id.lowercased().contains("local")
-                            if !isLocalAgent && self.connections[agent.id] == nil {
+                            if self.connections[agent.id] == nil {
                                 print("Auto-connecting to discovered agent: \(agent.id)")
                                 try? await self.connect(to: agent)
                             }

@@ -60,6 +60,7 @@ public actor PatreonClient: ObservableObject {
         case campaigns
         case campaign(id: String)
         case campaignMembers(id: String)
+        case campaignPosts(campaignId: String)
         case member(id: String)
         case oauthToken
 
@@ -69,6 +70,7 @@ public actor PatreonClient: ObservableObject {
             case .campaigns: "campaigns"
             case let .campaign(id): "campaigns/\(id)"
             case let .campaignMembers(id): "campaigns/\(id)/members"
+            case let .campaignPosts(campaignId): "campaigns/\(campaignId)/posts"
             case let .member(id): "members/\(id)"
             case .oauthToken: "token"
             }
@@ -914,6 +916,374 @@ public extension PatreonClient {
                 amount: Double(amountCents) / 100.0,
                 patronCount: included.attributes["patron_count"]?.value as? Int,
             )
+        }
+    }
+}
+
+// MARK: - Membership Models (Creators User Supports)
+
+public struct PatreonMembership: Identifiable, Sendable {
+    public let id: String
+    public let creatorName: String
+    public let creatorAvatarURL: URL?
+    public let campaignId: String
+    public let tierName: String?
+    public let tierAmount: Double
+    public let status: String
+    public let pledgeCadence: Int
+    public let campaignURL: URL?
+    public let isActive: Bool
+    
+    public init(id: String, creatorName: String, creatorAvatarURL: URL?, campaignId: String, tierName: String?, tierAmount: Double, status: String, pledgeCadence: Int, campaignURL: URL?, isActive: Bool) {
+        self.id = id
+        self.creatorName = creatorName
+        self.creatorAvatarURL = creatorAvatarURL
+        self.campaignId = campaignId
+        self.tierName = tierName
+        self.tierAmount = tierAmount
+        self.status = status
+        self.pledgeCadence = pledgeCadence
+        self.campaignURL = campaignURL
+        self.isActive = isActive
+    }
+}
+
+public extension PatreonClient {
+    /// Fetches the creators that the current user supports (their memberships)
+    func getMyMemberships() async throws -> [PatreonMembership] {
+        guard let accessToken = KeychainManager.getAccessToken() else {
+            throw PatreonError.authorizationFailed
+        }
+        
+        let response: MembershipsResponse = try await request(
+            endpoint: .identity,
+            accessToken: accessToken,
+            queryItems: [
+                URLQueryItem(name: "include", value: "memberships.currently_entitled_tiers,memberships.campaign"),
+                URLQueryItem(name: "fields[user]", value: "full_name,image_url,url"),
+                URLQueryItem(name: "fields[member]", value: "full_name,patron_status,currently_entitled_amount_cents,pledge_cadence,campaign_lifetime_support_cents"),
+                URLQueryItem(name: "fields[campaign]", value: "creation_name,url,patron_count"),
+                URLQueryItem(name: "fields[tier]", value: "title,amount_cents"),
+            ],
+        )
+        
+        return parseMemberships(from: response)
+    }
+    
+    private func parseMemberships(from response: MembershipsResponse) -> [PatreonMembership] {
+        // Build lookup maps from included data
+        var campaignMap: [String: MembershipsResponse.IncludedMembershipData] = [:]
+        var tierMap: [String: MembershipsResponse.IncludedMembershipData] = [:]
+        
+        for included in response.included {
+            if included.type == "campaign" {
+                campaignMap[included.id] = included
+            } else if included.type == "tier" {
+                tierMap[included.id] = included
+            }
+        }
+        
+        // Map membership data
+        return response.data.relationships.memberships.data.compactMap { membershipRel -> PatreonMembership? in
+            guard let membership = membershipRel.attributes else { return nil }
+            
+            // Get campaign data
+            let campaignId = membershipRel.relationships?.campaign?.data.id
+            let campaign = campaignId.flatMap { campaignMap[$0] }
+            
+            // Get tier info
+            let tierId = membershipRel.relationships?.currentlyEntitledTiers?.data.first?.id
+            let tier = tierId.flatMap { tierMap[$0] }
+            
+            let isActive = membership.patronStatus?.lowercased() == "active_patron"
+            
+            return PatreonMembership(
+                id: membershipRel.id,
+                creatorName: campaign?.attributes.creationName ?? membershipRel.attributes?.fullName ?? "Unknown Creator",
+                creatorAvatarURL: nil, // Would need to fetch campaign creator separately
+                campaignId: campaignId ?? "",
+                tierName: tier?.attributes.title,
+                tierAmount: tier.map { Double($0.attributes.amountCents ?? 0) / 100.0 } ?? Double(membership.currentlyEntitledAmountCents ?? 0) / 100.0,
+                status: membership.patronStatus?.replacingOccurrences(of: "_", with: " ").capitalized ?? "Unknown",
+                pledgeCadence: membership.pledgeCadence ?? 1,
+                campaignURL: campaign.flatMap { URL(string: $0.attributes.url ?? "") },
+                isActive: isActive
+            )
+        }
+    }
+    
+    // MARK: - Memberships Response Models
+    
+    struct MembershipsResponse: Codable {
+        let data: UserMembershipData
+        let included: [IncludedMembershipData]
+        
+        struct UserMembershipData: Codable {
+            let id: String
+            let type: String
+            let relationships: UserRelationships
+            
+            struct UserRelationships: Codable {
+                let memberships: MembershipsList
+                
+                struct MembershipsList: Codable {
+                    let data: [MembershipItem]
+                }
+            }
+        }
+        
+        struct MembershipItem: Codable {
+            let id: String
+            let type: String
+            var attributes: MemberAttributes?
+            var relationships: MemberRelationships?
+            
+            struct MemberAttributes: Codable {
+                let fullName: String?
+                let patronStatus: String?
+                let currentlyEntitledAmountCents: Int?
+                let pledgeCadence: Int?
+                
+                enum CodingKeys: String, CodingKey {
+                    case fullName = "full_name"
+                    case patronStatus = "patron_status"
+                    case currentlyEntitledAmountCents = "currently_entitled_amount_cents"
+                    case pledgeCadence = "pledge_cadence"
+                }
+            }
+            
+            struct MemberRelationships: Codable {
+                let campaign: CampaignRelationship?
+                let currentlyEntitledTiers: TiersRelationship?
+                
+                enum CodingKeys: String, CodingKey {
+                    case campaign
+                    case currentlyEntitledTiers = "currently_entitled_tiers"
+                }
+                
+                struct CampaignRelationship: Codable {
+                    let data: CampaignData
+                    
+                    struct CampaignData: Codable {
+                        let id: String
+                        let type: String
+                    }
+                }
+                
+                struct TiersRelationship: Codable {
+                    let data: [TierItem]
+                    
+                    struct TierItem: Codable {
+                        let id: String
+                        let type: String
+                    }
+                }
+            }
+        }
+        
+        struct IncludedMembershipData: Codable {
+            let id: String
+            let type: String
+            let attributes: IncludedAttributes
+            
+            struct IncludedAttributes: Codable {
+                // Campaign attributes
+                let creationName: String?
+                let url: String?
+                let patronCount: Int?
+                
+                // Tier attributes
+                let title: String?
+                let amountCents: Int?
+                
+                enum CodingKeys: String, CodingKey {
+                    case creationName = "creation_name"
+                    case url
+                    case patronCount = "patron_count"
+                    case title
+                    case amountCents = "amount_cents"
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Post Models (Creator Content)
+
+public struct PatreonPost: Identifiable, Sendable {
+    public let id: String
+    public let title: String
+    public let content: String?
+    public let publishedAt: Date
+    public let isPublic: Bool
+    public let minTierAmount: Double?
+    public let imageURL: URL?
+    public let url: URL?
+    public let likeCount: Int
+    public let commentCount: Int
+    
+    public init(id: String, title: String, content: String?, publishedAt: Date, isPublic: Bool, minTierAmount: Double?, imageURL: URL?, url: URL?, likeCount: Int, commentCount: Int) {
+        self.id = id
+        self.title = title
+        self.content = content
+        self.publishedAt = publishedAt
+        self.isPublic = isPublic
+        self.minTierAmount = minTierAmount
+        self.imageURL = imageURL
+        self.url = url
+        self.likeCount = likeCount
+        self.commentCount = commentCount
+    }
+}
+
+public extension PatreonClient {
+    /// Fetches posts from a creator's campaign
+    func getPosts(campaignId: String) async throws -> [PatreonPost] {
+        guard let accessToken = KeychainManager.getAccessToken() else {
+            throw PatreonError.authorizationFailed
+        }
+        
+        let response: PostsResponse = try await request(
+            endpoint: .campaignPosts(campaignId: campaignId),
+            accessToken: accessToken,
+            queryItems: [
+                URLQueryItem(name: "include", value: "user,campaign,attachments"),
+                URLQueryItem(name: "fields[post]", value: "title,content,is_paid,is_public,published_at,url,like_count,comment_count,image,tiers"),
+                URLQueryItem(name: "fields[tier]", value: "amount_cents,title"),
+                URLQueryItem(name: "sort", value: "-published_at"),
+                URLQueryItem(name: "page[count]", value: "20"),
+            ],
+        )
+        
+        return parsePosts(from: response)
+    }
+    
+    private func parsePosts(from response: PostsResponse) -> [PatreonPost] {
+        // Build tier lookup for min tier amounts
+        var tierMap: [String: Int] = [:]
+        for included in response.included {
+            if included.type == "tier",
+               let amountCents = included.attributes.amountCents {
+                tierMap[included.id] = amountCents
+            }
+        }
+        
+        let dateFormatter = ISO8601DateFormatter()
+        dateFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        
+        return response.data.compactMap { post in
+            let minTierCents = post.relationships.tiers?.data.compactMap { tierMap[$0.id] }.min()
+            
+            return PatreonPost(
+                id: post.id,
+                title: post.attributes.title ?? "Untitled",
+                content: post.attributes.content,
+                publishedAt: post.attributes.publishedAt.flatMap { dateFormatter.date(from: $0) } ?? Date(),
+                isPublic: post.attributes.isPublic ?? false,
+                minTierAmount: minTierCents.map { Double($0) / 100.0 },
+                imageURL: post.attributes.image.flatMap { URL(string: $0.url) },
+                url: post.attributes.url.flatMap { URL(string: $0) },
+                likeCount: post.attributes.likeCount ?? 0,
+                commentCount: post.attributes.commentCount ?? 0
+            )
+        }
+    }
+    
+    // MARK: - Posts Response Models
+    
+    struct PostsResponse: Codable {
+        let data: [PostData]
+        let included: [IncludedPostData]
+        let meta: PostsMeta?
+        
+        struct PostData: Codable {
+            let id: String
+            let type: String
+            let attributes: PostAttributes
+            let relationships: PostRelationships
+            
+            struct PostAttributes: Codable {
+                let title: String?
+                let content: String?
+                let isPaid: Bool?
+                let isPublic: Bool?
+                let publishedAt: String?
+                let url: String?
+                let likeCount: Int?
+                let commentCount: Int?
+                let image: PostImage?
+                
+                enum CodingKeys: String, CodingKey {
+                    case title
+                    case content
+                    case isPaid = "is_paid"
+                    case isPublic = "is_public"
+                    case publishedAt = "published_at"
+                    case url
+                    case likeCount = "like_count"
+                    case commentCount = "comment_count"
+                    case image
+                }
+            }
+            
+            struct PostImage: Codable {
+                let url: String
+                let width: Int
+                let height: Int
+            }
+            
+            struct PostRelationships: Codable {
+                let campaign: PostRelationshipData?
+                let user: PostRelationshipData?
+                let tiers: TiersRelationship?
+                
+                struct TiersRelationship: Codable {
+                    let data: [TierData]
+                    
+                    struct TierData: Codable {
+                        let id: String
+                        let type: String
+                    }
+                }
+            }
+            
+            struct PostRelationshipData: Codable {
+                let data: RelationshipItem
+                
+                struct RelationshipItem: Codable {
+                    let id: String
+                    let type: String
+                }
+            }
+        }
+        
+        struct IncludedPostData: Codable {
+            let id: String
+            let type: String
+            let attributes: IncludedAttributes
+            
+            struct IncludedAttributes: Codable {
+                let amountCents: Int?
+                let title: String?
+                
+                enum CodingKeys: String, CodingKey {
+                    case amountCents = "amount_cents"
+                    case title
+                }
+            }
+        }
+        
+        struct PostsMeta: Codable {
+            let pagination: Pagination?
+            
+            struct Pagination: Codable {
+                let cursors: Cursors?
+                let total: Int?
+                
+                struct Cursors: Codable {
+                    let next: String?
+                }
+            }
         }
     }
 }

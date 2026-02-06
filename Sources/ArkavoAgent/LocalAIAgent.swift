@@ -175,7 +175,21 @@ public final class LocalAIAgent: NSObject, ObservableObject {
         params.allowLocalEndpointReuse = true
         params.includePeerToPeer = true
 
+        // Configure WebSocket options with client request handler
+        // Without this handler, NWListener rejects URLSession WebSocket clients
+        // with "client request doesn't match expected value" error
         let options = NWProtocolWebSocket.Options()
+        options.autoReplyPing = true
+        options.setClientRequestHandler(DispatchQueue.main) { subprotocols, _ in
+            // Accept all valid WebSocket upgrade requests
+            // Return the first requested subprotocol if any, otherwise accept with no subprotocol
+            let selectedSubprotocol = subprotocols.first
+            return NWProtocolWebSocket.Response(
+                status: .accept,
+                subprotocol: selectedSubprotocol,
+                additionalHeaders: nil
+            )
+        }
         params.defaultProtocolStack.applicationProtocols.insert(options, at: 0)
 
         listener = try NWListener(using: params, on: NWEndpoint.Port(integerLiteral: port))

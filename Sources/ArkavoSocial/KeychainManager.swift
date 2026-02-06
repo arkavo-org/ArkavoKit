@@ -363,7 +363,7 @@ public extension KeychainManager {
 
     // MARK: - DID Key Management
 
-    internal enum DIDKeyError: Error {
+    public enum DIDKeyError: Error {
         case accessControlCreationFailed
         case keyGenerationFailed(OSStatus)
         case invalidPublicKey
@@ -371,7 +371,7 @@ public extension KeychainManager {
         case keyNotFound
     }
 
-    internal static func generateAndSaveDIDKey() throws -> String {
+    public static func generateAndSaveDIDKey() throws -> String {
         // First check if key already exists
         if let (_, _, did) = try? getDIDKey() {
             return did
@@ -424,7 +424,7 @@ public extension KeychainManager {
         return "did:key:z" + publicKeyData.base58String
     }
 
-    internal static func getDIDKey() throws -> (privateKey: SecKey, publicKey: SecKey, did: String) {
+    public static func getDIDKey() throws -> (privateKey: SecKey, publicKey: SecKey, did: String) {
         let query: [String: Any] = [
             kSecClass as String: kSecClassKey,
             kSecAttrApplicationTag as String: didKeyTag.data(using: .utf8)!,
@@ -456,7 +456,7 @@ public extension KeychainManager {
         return (privateKey, publicKey, did)
     }
 
-    internal static func signWithDIDKey(message: Data) throws -> Data {
+    public static func signWithDIDKey(message: Data) throws -> Data {
         let (privateKey, _, _) = try getDIDKey()
 
         var error: Unmanaged<CFError>?

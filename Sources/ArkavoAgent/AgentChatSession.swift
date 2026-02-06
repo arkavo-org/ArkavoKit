@@ -164,16 +164,20 @@ public enum MessageDeltaContent: Codable, Sendable {
 
 /// Manager for chat sessions with A2A agents
 @MainActor
-public final class AgentChatSessionManager: ObservableObject {
+public final class AgentChatSessionManager: ObservableObject, AgentNotificationHandler, AgentConnectionDelegate {
     // MARK: - Published Properties
 
     @Published public private(set) var activeSessions: [String: ChatSession] = [:]
     @Published public private(set) var messageDeltas: [String: [MessageDelta]] = [:]
+    @Published public private(set) var connectionRecoveryInProgress: Set<String> = []
 
     // MARK: - Private Properties
 
     private let agentManager: AgentManager
     private var sessionAgentMap: [String: String] = [:] // session_id -> agent_id
+    private var agentSessionMap: [String: Set<String>] = [:] // agent_id -> session_ids
+    private var deltaCallbacks: [String: (MessageDelta) -> Void] = [:] // session_id -> callback
+    private var streamSubscriptionIds: [String: String] = [:] // session_id -> subscription_id
 
     // MARK: - Initialization
 
@@ -191,6 +195,20 @@ public final class AgentChatSessionManager: ObservableObject {
     ) async throws -> ChatSession {
         guard let connection = agentManager.getConnection(for: agentId) else {
             throw AgentError.notConnected
+        }
+
+        // Wait for connection to be fully ready with timeout
+        // This handles any race conditions between connection establishment
+        // and the transport reporting as connected
+        let maxRetries = 10
+        for attempt in 0..<maxRetries {
+            if await connection.isConnected() {
+                break
+            }
+            if attempt == maxRetries - 1 {
+                throw AgentError.notConnected
+            }
+            try await Task.sleep(nanoseconds: 50_000_000) // 50ms
         }
 
         let request = ChatOpenRequest(token: token, context: context)
@@ -214,6 +232,15 @@ public final class AgentChatSessionManager: ObservableObject {
         activeSessions[session.id] = session
         sessionAgentMap[session.id] = agentId
         messageDeltas[session.id] = []
+
+        // Track reverse mapping for session recovery
+        if agentSessionMap[agentId] == nil {
+            agentSessionMap[agentId] = []
+        }
+        agentSessionMap[agentId]?.insert(session.id)
+
+        // Set up connection delegate for session recovery
+        await connection.setConnectionDelegate(self)
 
         return session
     }
@@ -271,16 +298,112 @@ public final class AgentChatSessionManager: ObservableObject {
         print("[AgentChatSessionManager] Message sent successfully")
     }
 
+    /// Subscribe to the chat_stream to receive message deltas
+    /// This MUST be called after openSession and BEFORE sendMessage
+    public func subscribeToStream(
+        sessionId: String,
+        onDelta: @escaping (MessageDelta) -> Void
+    ) async throws {
+        print("[AgentChatSessionManager] Subscribing to chat_stream for session: \(sessionId)")
+
+        guard activeSessions[sessionId] != nil else {
+            print("[AgentChatSessionManager] ERROR: Session not found: \(sessionId)")
+            throw AgentError.invalidResponse("Session not found")
+        }
+
+        guard let agentId = sessionAgentMap[sessionId],
+              let connection = agentManager.getConnection(for: agentId) else {
+            print("[AgentChatSessionManager] ERROR: Not connected to agent for session: \(sessionId)")
+            throw AgentError.notConnected
+        }
+
+        // Store the callback for this session
+        deltaCallbacks[sessionId] = onDelta
+
+        // Set ourselves as the notification handler on the connection
+        await connection.setNotificationHandler(self)
+
+        // Subscribe to chat_stream via JSON-RPC subscription
+        // Note: jsonrpsee uses positional (array) params for subscriptions
+        let response = try await connection.call(
+            method: "chat_stream",
+            arrayParams: [sessionId]
+        )
+
+        switch response {
+        case .success(let id, _):
+            print("[AgentChatSessionManager] Successfully subscribed to chat_stream, subscription id: \(id)")
+            streamSubscriptionIds[sessionId] = id
+        case .error(_, let code, let message):
+            print("[AgentChatSessionManager] ERROR: Failed to subscribe: \(code) - \(message)")
+            throw AgentError.jsonRpcError(code: code, message: message)
+        }
+    }
+
+    /// Handle notifications from the agent (implements AgentNotificationHandler)
+    nonisolated public func handleNotification(method: String, params: AnyCodable) async {
+        // Only handle chat_stream notifications
+        guard method == "chat_stream" else {
+            return
+        }
+
+        do {
+            // jsonrpsee subscription format: {"subscription": <id>, "result": <MessageDelta>}
+            // Extract the "result" field which contains the actual MessageDelta
+            guard let paramsDict = params.value as? [String: Any],
+                  let resultValue = paramsDict["result"] else {
+                print("[AgentChatSessionManager] Invalid subscription params format")
+                return
+            }
+
+            let data = try JSONSerialization.data(withJSONObject: resultValue)
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let delta = try decoder.decode(MessageDelta.self, from: data)
+
+            // Dispatch to the registered callback on MainActor
+            await MainActor.run {
+                if let callback = deltaCallbacks[delta.sessionId] {
+                    callback(delta)
+                }
+                // Also store in messageDeltas array
+                if messageDeltas[delta.sessionId] != nil {
+                    messageDeltas[delta.sessionId]?.append(delta)
+                } else {
+                    messageDeltas[delta.sessionId] = [delta]
+                }
+            }
+        } catch {
+            print("[AgentChatSessionManager] Failed to decode chat_stream notification: \(error)")
+        }
+    }
+
     /// Close a chat session
     public func closeSession(sessionId: String) async {
         guard activeSessions.removeValue(forKey: sessionId) != nil else {
             return
         }
 
+        // Remove callbacks and subscription tracking
+        deltaCallbacks.removeValue(forKey: sessionId)
+        streamSubscriptionIds.removeValue(forKey: sessionId)
+
         guard let agentId = sessionAgentMap.removeValue(forKey: sessionId),
               let connection = agentManager.getConnection(for: agentId) else {
             return
         }
+
+        // Remove from reverse mapping
+        agentSessionMap[agentId]?.remove(sessionId)
+        if agentSessionMap[agentId]?.isEmpty == true {
+            agentSessionMap.removeValue(forKey: agentId)
+        }
+
+        // Unsubscribe from chat_stream first
+        _ = try? await connection.call(
+            method: "chat_stream_unsubscribe",
+            params: ["session_id": sessionId]
+        )
 
         _ = try? await connection.call(
             method: "chat_close",
@@ -288,6 +411,84 @@ public final class AgentChatSessionManager: ObservableObject {
         )
 
         messageDeltas.removeValue(forKey: sessionId)
+    }
+
+    // MARK: - AgentConnectionDelegate
+
+    nonisolated public func connectionDidReconnect(agentId: String) async {
+        await handleConnectionReconnect(agentId: agentId)
+    }
+
+    nonisolated public func connectionDidDisconnect(agentId: String, error: Error?) async {
+        await handleConnectionDisconnect(agentId: agentId, error: error)
+    }
+
+    private func handleConnectionReconnect(agentId: String) async {
+        print("[AgentChatSessionManager] Connection restored for agent: \(agentId)")
+
+        guard let sessionIds = agentSessionMap[agentId], !sessionIds.isEmpty else {
+            print("[AgentChatSessionManager] No active sessions to recover for agent: \(agentId)")
+            return
+        }
+
+        connectionRecoveryInProgress.insert(agentId)
+
+        // Re-subscribe to chat_stream for all active sessions
+        for sessionId in sessionIds {
+            guard activeSessions[sessionId] != nil else { continue }
+            guard let callback = deltaCallbacks[sessionId] else { continue }
+
+            print("[AgentChatSessionManager] Recovering session: \(sessionId)")
+
+            do {
+                // Re-subscribe to chat_stream
+                try await resubscribeToStream(sessionId: sessionId, callback: callback)
+                print("[AgentChatSessionManager] Session recovered: \(sessionId)")
+            } catch {
+                print("[AgentChatSessionManager] Failed to recover session \(sessionId): \(error)")
+            }
+        }
+
+        connectionRecoveryInProgress.remove(agentId)
+        print("[AgentChatSessionManager] Session recovery complete for agent: \(agentId)")
+    }
+
+    private func handleConnectionDisconnect(agentId: String, error: Error?) async {
+        print("[AgentChatSessionManager] Connection lost for agent: \(agentId), error: \(error?.localizedDescription ?? "none")")
+
+        // Clear subscription IDs since they're no longer valid
+        if let sessionIds = agentSessionMap[agentId] {
+            for sessionId in sessionIds {
+                streamSubscriptionIds.removeValue(forKey: sessionId)
+            }
+        }
+    }
+
+    private func resubscribeToStream(sessionId: String, callback: @escaping (MessageDelta) -> Void) async throws {
+        guard let agentId = sessionAgentMap[sessionId],
+              let connection = agentManager.getConnection(for: agentId) else {
+            throw AgentError.notConnected
+        }
+
+        // Store the callback
+        deltaCallbacks[sessionId] = callback
+
+        // Set ourselves as the notification handler
+        await connection.setNotificationHandler(self)
+
+        // Re-subscribe to chat_stream
+        let response = try await connection.call(
+            method: "chat_stream",
+            arrayParams: [sessionId]
+        )
+
+        switch response {
+        case .success(let id, _):
+            print("[AgentChatSessionManager] Re-subscribed to chat_stream: \(id)")
+            streamSubscriptionIds[sessionId] = id
+        case .error(_, let code, let message):
+            throw AgentError.jsonRpcError(code: code, message: message)
+        }
     }
 
     // MARK: - Private Helpers

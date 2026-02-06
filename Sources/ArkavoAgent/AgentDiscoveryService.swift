@@ -119,11 +119,8 @@ public final class AgentDiscoveryService: NSObject, ObservableObject {
         }
 
         // Create agent endpoint
-        // Note: LocalAIAgent uses NW WebSocket (no path routing), arkavo-edge uses /ws path
-        // Check if this is a LocalAIAgent by looking for "local" in agent_id or purpose
-        let isLocalAgent = agentId.lowercased().contains("local") ||
-                          (metadata["purpose"] ?? "").lowercased().contains("local")
-        let wsPath = isLocalAgent ? "" : "/ws"
+        // Note: jsonrpsee servers use root path for WebSocket, not /ws
+        let wsPath = ""
 
         let endpoint = AgentEndpoint(
             id: agentId,

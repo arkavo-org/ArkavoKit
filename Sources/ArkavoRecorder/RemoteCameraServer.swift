@@ -222,18 +222,14 @@ public final class RemoteCameraServer: NSObject, @unchecked Sendable {
                 guard let event = message.metadata else { return }
                 state.sourceID = event.sourceID
                 updateSources(adding: event.sourceID)
-                print("📊 [RemoteCameraServer] Received metadata from \(event.sourceID)")
-                if case .arFace(let faceMetadata) = event.metadata {
-                    print("   └─ Face metadata: \(faceMetadata.blendShapes.count) blend shapes")
-                    // Log first few blend shapes as a sample
-                    let sampleShapes = faceMetadata.blendShapes.prefix(3)
-                    for (name, value) in sampleShapes {
-                        print("      └─ \(name): \(String(format: "%.3f", value))")
-                    }
-                }
+                // Verbose logging disabled - uncomment to debug metadata flow
+                // print("📊 [RemoteCameraServer] Received metadata from \(event.sourceID)")
+                // if case .arFace(let faceMetadata) = event.metadata {
+                //     print("   └─ Face metadata: \(faceMetadata.blendShapes.count) blend shapes")
+                // }
                 Task { @MainActor [weak self] in
                     guard let self else { return }
-                    print("📤 [RemoteCameraServer] Forwarding metadata to delegate")
+                    // print("📤 [RemoteCameraServer] Forwarding metadata to delegate")
                     self.delegate?.remoteCameraServer(self, didReceive: event)
                 }
             case .audio:

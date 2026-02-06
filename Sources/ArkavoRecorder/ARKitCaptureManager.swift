@@ -100,12 +100,14 @@ public final class ARKitCaptureManager: NSObject {
             let faceConfig = ARFaceTrackingConfiguration()
             faceConfig.isWorldTrackingEnabled = false
             faceConfig.providesAudioData = true  // Enable microphone for remote streaming
+            print("📷 [ARKitCapture] Face mode uses FRONT camera (selfie camera)")
             configuration = faceConfig
         case .body:
             if #available(iOS 13.0, *) {
                 let bodyConfig = ARBodyTrackingConfiguration()
                 bodyConfig.isAutoFocusEnabled = true
                 bodyConfig.frameSemantics = [.bodyDetection]
+                print("📷 [ARKitCapture] Body mode uses BACK camera - point device toward yourself")
                 configuration = bodyConfig
             } else {
                 throw CaptureError.unsupported
