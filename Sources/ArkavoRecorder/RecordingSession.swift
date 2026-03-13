@@ -76,6 +76,7 @@ public final class RecordingSession: Sendable {
     private var remoteCameraIdentifiers: Set<String> = []
     public private(set) var remoteCameraServer: RemoteCameraServer?
     nonisolated(unsafe) private let audioRouter: AudioRouter
+    nonisolated(unsafe) private let audioMixer: AudioMixer
     nonisolated(unsafe) private let compositor: CompositorManager
     nonisolated(unsafe) private let encoder: VideoEncoder
 
@@ -157,6 +158,14 @@ public final class RecordingSession: Sendable {
     /// Provider for VRM avatar texture frames (set by AvatarViewModel when avatar mode is active)
     nonisolated(unsafe) public var avatarTextureProvider: (@Sendable () -> CVPixelBuffer?)?
 
+    /// Provider for Muse AI avatar texture frames (for dual avatar mode)
+    nonisolated(unsafe) public var museTextureProvider: (@Sendable () -> CVPixelBuffer?)?
+
+    /// Register a Muse TTS audio source for mixing into the stream
+    public func addMuseAudioSource(_ source: AudioSource) {
+        audioRouter.addSource(source)
+    }
+
     /// Timer for driving frame capture in non-desktop modes
     nonisolated(unsafe) private var cameraFrameTimer: Timer?
 
@@ -182,6 +191,7 @@ public final class RecordingSession: Sendable {
         self.screenCapture = ScreenCaptureManager()
         self.cameraCaptures = [:]
         self.audioRouter = AudioRouter()
+        self.audioMixer = AudioMixer()
         self.compositor = try CompositorManager()
         self.encoder = VideoEncoder()
 
@@ -200,12 +210,16 @@ public final class RecordingSession: Sendable {
             }
         }
 
-        // Wire up audio router
+        // Wire up audio router through mixer for multi-source mixing (mic + TTS)
         audioRouter.onConvertedSample = { @Sendable [weak self] audioSample, sourceID in
-            // Process asynchronously to handle encoding
-            // Note: CMSampleBuffer is not Sendable, but we process it immediately without retaining
+            guard let self else { return }
+            self.audioMixer.addSample(audioSample, from: sourceID)
+        }
+
+        // Wire mixer output to encoder
+        audioMixer.onMixedSample = { @Sendable [weak self] mixedSample in
             Task {
-                await self?.processAudioSampleSync(audioSample, sourceID: sourceID)
+                await self?.processAudioSampleSync(mixedSample, sourceID: "mixed")
             }
         }
     }
@@ -452,11 +466,12 @@ public final class RecordingSession: Sendable {
         guard mode.needsDesktop else { return }
 
         // Capture state on MainActor to ensure thread safety
-        let (cameraLayers, isAvatarEnabled, provider, isCameraEnabled) = await MainActor.run {
+        let (cameraLayers, isAvatarEnabled, provider, museProvider, isCameraEnabled) = await MainActor.run {
             (
                 self.cameraLayersForComposition(),
                 self.enableAvatar,
                 self.avatarTextureProvider,
+                self.museTextureProvider,
                 self.enableCamera
             )
         }
@@ -469,6 +484,9 @@ public final class RecordingSession: Sendable {
             avatarTexture = nil
         }
 
+        // Get muse texture if muse mode is enabled
+        let museTexture: CVPixelBuffer? = museProvider?()
+
         // Log once per second to avoid spam
         let now = Date()
         if lastDebugLogTime == nil || now.timeIntervalSince(lastDebugLogTime!) >= 1.0 {
@@ -480,7 +498,8 @@ public final class RecordingSession: Sendable {
         guard let composited = compositor.composite(
             screen: screenBuffer,
             cameraLayers: cameraLayers,
-            avatarTexture: avatarTexture
+            avatarTexture: avatarTexture,
+            museTexture: museTexture
         ) else {
             return
         }

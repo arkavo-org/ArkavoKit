@@ -1,24 +1,31 @@
+#if canImport(C2paOpenTDF)
+import C2paOpenTDF
+#endif
 import Foundation
 
-/// Signs content with C2PA manifests
-///
-/// NOTE: Currently uses c2patool CLI as a temporary implementation.
-/// This will be replaced with native c2pa-opentdf-rs integration:
-/// https://github.com/arkavo-org/c2pa-opentdf-rs/issues
+/// How to provide signing credentials
+public enum SigningMode: Sendable {
+    /// Auto-generate a self-signed certificate chain (dev/testing)
+    case selfSigned
+    /// Explicit PEM-encoded certificate chain and private key
+    case pemFiles(certPEM: String, keyPEM: String)
+}
+
+/// Signs content with C2PA manifests using the c2pa-opentdf-rs native library
 public actor C2PASigner {
-    private let c2patoolPath: String
+    private let certPEM: String
+    private let keyPEM: String
 
     public enum SigningError: Error, LocalizedError {
-        case c2patoolNotFound
         case manifestCreationFailed
         case signingFailed(String)
         case invalidInput
         case missingSigningCertificate
+        case sdkError(String)
+        case frameworkNotAvailable
 
         public var errorDescription: String? {
             switch self {
-            case .c2patoolNotFound:
-                return "c2patool not found in PATH. Please install c2pa-tool."
             case .manifestCreationFailed:
                 return "Failed to create manifest JSON"
             case .signingFailed(let message):
@@ -27,176 +34,154 @@ public actor C2PASigner {
                 return "Invalid input file"
             case .missingSigningCertificate:
                 return "Signing certificate not configured"
+            case .sdkError(let message):
+                return "C2PA SDK error: \(message)"
+            case .frameworkNotAvailable:
+                return "C2paOpenTDF framework not available — build with the xcframework to enable C2PA signing"
             }
         }
     }
 
-    public init(c2patoolPath: String = "/opt/homebrew/bin/c2patool") throws {
-        // Verify c2patool exists
-        guard FileManager.default.fileExists(atPath: c2patoolPath) else {
-            // Try to find it in PATH
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/which")
-            process.arguments = ["c2patool"]
-
-            let pipe = Pipe()
-            process.standardOutput = pipe
-
-            try process.run()
-            process.waitUntilExit()
-
-            if process.terminationStatus == 0 {
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                if let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-                   !path.isEmpty {
-                    self.c2patoolPath = path
-                    return
-                }
-            }
-
-            throw SigningError.c2patoolNotFound
+    public init(signingMode: SigningMode = .selfSigned) throws {
+        switch signingMode {
+        case .pemFiles(let certPEM, let keyPEM):
+            self.certPEM = certPEM
+            self.keyPEM = keyPEM
+        case .selfSigned:
+            throw SigningError.missingSigningCertificate
         }
-
-        self.c2patoolPath = c2patoolPath
     }
 
-    /// Signs a video file with a C2PA manifest
+    /// Signs a media file with a C2PA manifest
     public func sign(
         inputFile: URL,
         outputFile: URL,
-        manifest: C2PAManifest,
-        signingCert: URL? = nil,
-        privateKey: URL? = nil
+        manifest: C2PAManifest
     ) async throws {
-        // Validate input
-        guard FileManager.default.fileExists(atPath: inputFile.path) else {
-            throw SigningError.invalidInput
-        }
-
-        // Create manifest JSON
+        #if canImport(C2paOpenTDF)
         let manifestData = try JSONEncoder().encode(manifest)
-        let manifestFile = FileManager.default.temporaryDirectory
-            .appendingPathComponent("manifest_\(UUID().uuidString).json")
-
-        try manifestData.write(to: manifestFile)
-        defer {
-            try? FileManager.default.removeItem(at: manifestFile)
+        guard let manifestJSON = String(data: manifestData, encoding: .utf8) else {
+            throw SigningError.manifestCreationFailed
         }
 
-        // Build c2patool command
-        var arguments = [
-            inputFile.path,
-            "--manifest", manifestFile.path,
-            "--output", outputFile.path,
-            "--force"
-        ]
+        let inputPath = inputFile.path
+        let outputPath = outputFile.path
+        let cert = certPEM
+        let key = keyPEM
 
-        // Add signing certificate if provided
-        if let _ = signingCert, let _ = privateKey {
-            // Note: c2patool uses cert+key in manifest, not CLI args
-            // For now, we'll use unsigned manifests (sidecar mode)
-            arguments.append("--sidecar")
+        let (resultCode, errorPtr) = Self.callSign(
+            inputPath: inputPath, outputPath: outputPath,
+            manifestJSON: manifestJSON, cert: cert, key: key
+        )
+
+        let errorMessage = consumeFFIString(errorPtr)
+        guard resultCode == SUCCESS else {
+            throw SigningError.signingFailed(errorMessage ?? "unknown error")
         }
-
-        // Execute c2patool
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: c2patoolPath)
-        process.arguments = arguments
-
-        let outputPipe = Pipe()
-        let errorPipe = Pipe()
-        process.standardOutput = outputPipe
-        process.standardError = errorPipe
-
-        try process.run()
-        process.waitUntilExit()
-
-        // Check result
-        if process.terminationStatus != 0 {
-            let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-            let errorMessage = String(data: errorData, encoding: .utf8) ?? "Unknown error"
-            throw SigningError.signingFailed(errorMessage)
-        }
-
-        // Validate output file was created and is valid
-        guard FileManager.default.fileExists(atPath: outputFile.path) else {
-            throw SigningError.signingFailed("Output file was not created by c2patool")
-        }
-
-        // Check file size is reasonable (should be similar to or larger than input)
-        let inputAttributes = try FileManager.default.attributesOfItem(atPath: inputFile.path)
-        let outputAttributes = try FileManager.default.attributesOfItem(atPath: outputFile.path)
-
-        guard let inputSize = inputAttributes[.size] as? Int64,
-              let outputSize = outputAttributes[.size] as? Int64 else {
-            throw SigningError.signingFailed("Unable to verify file sizes")
-        }
-
-        // Output should be at least 80% of input size (sanity check for corruption)
-        // C2PA adds metadata but shouldn't significantly reduce file size
-        if outputSize < Int64(Double(inputSize) * 0.8) {
-            throw SigningError.signingFailed("Output file size unexpectedly small - possible corruption")
-        }
+        #else
+        throw SigningError.frameworkNotAvailable
+        #endif
     }
+
+    #if canImport(C2paOpenTDF)
+    private nonisolated static func callSign(
+        inputPath: String, outputPath: String,
+        manifestJSON: String, cert: String, key: String
+    ) -> (C2paResultCode, UnsafeMutablePointer<CChar>?) {
+        var errorPtr: UnsafeMutablePointer<CChar>?
+        let result = c2pa_sign_file(
+            inputPath, outputPath, manifestJSON, cert, key, &errorPtr
+        )
+        return (result, errorPtr)
+    }
+    #endif
 
     /// Verifies a C2PA manifest in a file
     public func verify(file: URL) async throws -> C2PAValidationResult {
-        guard FileManager.default.fileExists(atPath: file.path) else {
-            throw SigningError.invalidInput
+        #if canImport(C2paOpenTDF)
+        let filePath = file.path
+
+        let (resultCode, resultPtr, errorPtr) = Self.callVerify(filePath: filePath)
+
+        let errorMessage = consumeFFIString(errorPtr)
+        guard resultCode == SUCCESS else {
+            throw SigningError.sdkError(errorMessage ?? "unknown error")
         }
 
-        // Execute c2patool with detailed flag
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: c2patoolPath)
-        process.arguments = [file.path, "--detailed"]
+        guard let resultJSON = consumeFFIString(resultPtr) else {
+            throw SigningError.sdkError("verify returned no result")
+        }
 
-        let outputPipe = Pipe()
-        let errorPipe = Pipe()
-        process.standardOutput = outputPipe
-        process.standardError = errorPipe
+        guard let data = resultJSON.data(using: .utf8),
+              let dict = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            throw SigningError.sdkError("failed to parse verify result JSON")
+        }
 
-        try process.run()
-        process.waitUntilExit()
-
-        let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-        let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-
-        let output = String(data: outputData, encoding: .utf8) ?? ""
-        let error = String(data: errorData, encoding: .utf8) ?? ""
-
-        // Parse output (simplified - full implementation would parse JSON)
-        let hasManifest = !output.isEmpty && !output.contains("No claim found")
-        let isValid = process.terminationStatus == 0 && hasManifest
+        let isValid = dict["is_valid"] as? Bool ?? false
+        let hasManifest = dict["has_manifest"] as? Bool ?? false
+        let manifestJSON = dict["manifest_json"] as? String ?? ""
 
         return C2PAValidationResult(
             isValid: isValid,
             hasManifest: hasManifest,
-            manifestJSON: output,
-            error: error.isEmpty ? nil : error
+            manifestJSON: manifestJSON,
+            error: nil
         )
+        #else
+        throw SigningError.frameworkNotAvailable
+        #endif
     }
+
+    #if canImport(C2paOpenTDF)
+    private nonisolated static func callVerify(
+        filePath: String
+    ) -> (C2paResultCode, UnsafeMutablePointer<CChar>?, UnsafeMutablePointer<CChar>?) {
+        var resultPtr: UnsafeMutablePointer<CChar>?
+        var errorPtr: UnsafeMutablePointer<CChar>?
+        let result = c2pa_verify_file(filePath, &resultPtr, &errorPtr)
+        return (result, resultPtr, errorPtr)
+    }
+    #endif
 
     /// Extracts manifest information without full validation
     public func info(file: URL) async throws -> C2PAInfo {
-        guard FileManager.default.fileExists(atPath: file.path) else {
-            throw SigningError.invalidInput
+        #if canImport(C2paOpenTDF)
+        let filePath = file.path
+
+        let (resultCode, infoPtr, errorPtr) = Self.callInfo(filePath: filePath)
+
+        let errorMessage = consumeFFIString(errorPtr)
+        guard resultCode == SUCCESS else {
+            throw SigningError.sdkError(errorMessage ?? "unknown error")
         }
 
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: c2patoolPath)
-        process.arguments = [file.path, "--info"]
-
-        let outputPipe = Pipe()
-        process.standardOutput = outputPipe
-
-        try process.run()
-        process.waitUntilExit()
-
-        let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-        let output = String(data: outputData, encoding: .utf8) ?? ""
-
-        return C2PAInfo(rawOutput: output)
+        let infoJSON = consumeFFIString(infoPtr) ?? ""
+        return C2PAInfo(rawOutput: infoJSON)
+        #else
+        throw SigningError.frameworkNotAvailable
+        #endif
     }
+
+    #if canImport(C2paOpenTDF)
+    private nonisolated static func callInfo(
+        filePath: String
+    ) -> (C2paResultCode, UnsafeMutablePointer<CChar>?, UnsafeMutablePointer<CChar>?) {
+        var infoPtr: UnsafeMutablePointer<CChar>?
+        var errorPtr: UnsafeMutablePointer<CChar>?
+        let result = c2pa_info_file(filePath, &infoPtr, &errorPtr)
+        return (result, infoPtr, errorPtr)
+    }
+
+    // MARK: - Private
+
+    private func consumeFFIString(_ ptr: UnsafeMutablePointer<CChar>?) -> String? {
+        guard let ptr else { return nil }
+        let str = String(cString: ptr)
+        c2pa_string_free(ptr)
+        return str
+    }
+    #endif
 }
 
 // MARK: - Validation Result
@@ -225,22 +210,6 @@ public struct C2PAInfo: Sendable {
     }
 
     public var hasManifest: Bool {
-        !rawOutput.contains("No claim found") && !rawOutput.isEmpty
-    }
-
-    public var manifestSize: Int? {
-        // Parse manifest size from output (simplified)
-        let components = rawOutput.components(separatedBy: "\n")
-        for line in components {
-            if line.contains("Manifest size:") {
-                let parts = line.components(separatedBy: ":")
-                if parts.count > 1,
-                   let sizeStr = parts[1].trimmingCharacters(in: .whitespaces).components(separatedBy: " ").first,
-                   let size = Int(sizeStr) {
-                    return size
-                }
-            }
-        }
-        return nil
+        !rawOutput.isEmpty
     }
 }

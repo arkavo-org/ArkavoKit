@@ -40,6 +40,10 @@ let package = Package(
             name: "tdf-fetch",
             targets: ["TDFFetchCLI"]
         ),
+        .executable(
+            name: "c2pa-test",
+            targets: ["C2PATestCLI"]
+        ),
     ],
     dependencies: [
         .package(url: "https://github.com/arkavo-org/OpenTDFKit", revision: "d8ffeff"),
@@ -140,6 +144,14 @@ let package = Package(
                 .product(name: "IrohSwift", package: "iroh-swift"),
             ],
             swiftSettings: sharedSwiftSettings
+        ),
+        .executableTarget(
+            name: "C2PATestCLI",
+            dependencies: ["ArkavoC2PA"],
+            swiftSettings: sharedSwiftSettings,
+            linkerSettings: [
+                .linkedFramework("SystemConfiguration"),
+            ]
         ),
     ]
 )

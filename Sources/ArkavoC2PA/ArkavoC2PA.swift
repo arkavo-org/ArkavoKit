@@ -8,7 +8,7 @@
 //
 // - `C2PAManifest`: Structured manifest for provenance metadata
 // - `C2PAManifestBuilder`: Fluent API for building manifests
-// - `C2PASigner`: Signs content using c2pa-opentdf-rs native library
+// - `C2PASigner`: Signs content (pending native implementation)
 // - `C2PAValidationResult`: Verification results
 //
 // ## Usage
@@ -22,7 +22,7 @@
 // let manifest = builder.build()
 //
 // // Sign content
-// let signer = try C2PASigner()
+// let signer = try C2PASigner(signingMode: .selfSigned)
 // try await signer.sign(
 //     inputFile: videoURL,
 //     outputFile: signedURL,
@@ -40,8 +40,8 @@
 // https://github.com/arkavo-org/c2pa-opentdf-rs
 //
 // The Rust library provides:
-// - Native C2PA manifest creation and signing (no external tools required)
+// - Native C2PA manifest creation and signing via c2pa-rs
 // - OpenTDF integration for content encryption
-// - Works seamlessly in sandboxed macOS apps
+// - Works in sandboxed macOS/iOS apps via XCFramework + Swift FFI
 
 import Foundation

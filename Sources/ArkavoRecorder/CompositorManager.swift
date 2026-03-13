@@ -68,7 +68,8 @@ public final class CompositorManager: Sendable {
     public func composite(
         screen screenBuffer: CMSampleBuffer,
         cameraLayers: [CameraLayer],
-        avatarTexture: CVPixelBuffer? = nil
+        avatarTexture: CVPixelBuffer? = nil,
+        museTexture: CVPixelBuffer? = nil
     ) -> CVPixelBuffer? {
         // Get screen image buffer
         guard let screenPixelBuffer = CMSampleBufferGetImageBuffer(screenBuffer) else {
@@ -86,7 +87,8 @@ public final class CompositorManager: Sendable {
             baseImage: screenImage,
             screenSize: screenSize,
             cameraLayers: cameraLayers,
-            avatarTexture: avatarTexture
+            avatarTexture: avatarTexture,
+            museTexture: museTexture
         )
     }
 
@@ -134,7 +136,8 @@ public final class CompositorManager: Sendable {
         baseImage: CIImage,
         screenSize: CGSize,
         cameraLayers: [CameraLayer],
-        avatarTexture: CVPixelBuffer? = nil
+        avatarTexture: CVPixelBuffer? = nil,
+        museTexture: CVPixelBuffer? = nil
     ) -> CVPixelBuffer? {
         var composited = baseImage
 
@@ -185,6 +188,46 @@ public final class CompositorManager: Sendable {
             let positionedAvatar = avatarWithEffects.transformed(by: CGAffineTransform(translationX: position.x, y: position.y))
 
             composited = positionedAvatar.composited(over: composited)
+        }
+
+        // Add Muse AI avatar as additional PiP overlay (for dual avatar mode)
+        if let museBuffer = museTexture {
+            let museImage = CIImage(cvPixelBuffer: museBuffer)
+
+            guard museImage.extent.width > 0 && museImage.extent.height > 0 else {
+                // Skip invalid muse texture
+                return compositeWithBase(baseImage: baseImage, screenSize: screenSize, cameraLayers: cameraLayers, avatarTexture: avatarTexture, museTexture: nil)
+            }
+
+            let totalOverlays = cameraLayers.count + (avatarTexture != nil ? 2 : 1)
+            let musePipSize = pipSize(for: screenSize, cameraCount: totalOverlays)
+
+            let museAspect = museImage.extent.width / museImage.extent.height
+            let pipAspect = musePipSize.width / musePipSize.height
+
+            var scaledMuseSize = musePipSize
+            if museAspect > pipAspect {
+                scaledMuseSize.height = musePipSize.width / museAspect
+            } else {
+                scaledMuseSize.width = musePipSize.height * museAspect
+            }
+
+            let scaleX = scaledMuseSize.width / museImage.extent.width
+            let scaleY = scaledMuseSize.height / museImage.extent.height
+            let scaledMuse = museImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+
+            let museWithEffects = addPiPEffects(to: scaledMuse, size: scaledMuseSize)
+
+            // Position muse opposite to the mocap avatar
+            let musePosition: PiPPosition = (pipPosition == .bottomRight) ? .bottomLeft : .bottomRight
+            let position = calculatePiPPosition(
+                screenSize: screenSize,
+                pipSize: scaledMuseSize,
+                position: musePosition
+            )
+
+            let positionedMuse = museWithEffects.transformed(by: CGAffineTransform(translationX: position.x, y: position.y))
+            composited = positionedMuse.composited(over: composited)
         }
 
         for (index, layer) in cameraLayers.enumerated() {
