@@ -1,5 +1,6 @@
 import CoreGraphics
 import Foundation
+import os
 
 #if os(macOS)
 @preconcurrency import AVFoundation
@@ -83,6 +84,7 @@ public final class RecordingSession: Sendable {
     // Recording state tracked locally for synchronous access
     // This is updated when recording starts/stops
     nonisolated(unsafe) private var _isRecording: Bool = false
+    private let _streamingActive = OSAllocatedUnfairLock(initialState: false)
     nonisolated(unsafe) private var recordingStartTime: Date?
     private let previewCIContext = CIContext()
 
@@ -284,11 +286,21 @@ public final class RecordingSession: Sendable {
             print("⚠️ [RecordingSession] Avatar enabled but no texture provider set!")
         }
 
-        // STEP 2: Add microphone to audio router (but don't start yet)
+        // STEP 2: Add audio sources to audio router (but don't start yet)
         if mode.needsMicrophone {
             print("🎙️ RecordingSession: Adding microphone to audio router")
             let micSource = await audioRouter.addMicrophone()
+            micSource.onLevelUpdate = { @Sendable [weak self] level in
+                self?.audioLevel = level
+            }
             print("🎙️ RecordingSession: Microphone source created: \(micSource.sourceID)")
+        }
+
+        // Add desktop/screen audio if enabled
+        if enableScreenAudio {
+            print("🔊 RecordingSession: Adding screen audio to audio router")
+            let _ = await audioRouter.addScreenAudio()
+            print("🔊 RecordingSession: Screen audio source created")
         }
 
         // STEP 3: Start encoder FIRST with pre-created audio tracks for all sources
@@ -450,15 +462,15 @@ public final class RecordingSession: Sendable {
             }
         }
 
-        // If preview-only mode, don't process for recording
-        guard !isScreenPreviewOnly else { return }
+        // If preview-only mode (no recording or streaming), don't process for encoding
+        guard !isScreenPreviewOnly || _streamingActive.withLock({ $0 }) else { return }
 
-        // Continue with recording if active
+        // Continue with recording/streaming if active
         await processFrameSync(screen: screenBuffer)
     }
 
     private nonisolated func processFrameSync(screen screenBuffer: CMSampleBuffer) async {
-        guard _isRecording else { return }
+        guard _isRecording || _streamingActive.withLock({ $0 }) else { return }
 
         let mode = await MainActor.run { self.inputMode }
 
@@ -515,7 +527,7 @@ public final class RecordingSession: Sendable {
 
     /// Processes a frame for camera-only or avatar-only modes (called by timer)
     private nonisolated func processCameraOrAvatarFrame() async {
-        guard _isRecording else { return }
+        guard _isRecording || _streamingActive.withLock({ $0 }) else { return }
 
         let mode = await MainActor.run { self.inputMode }
         let canvasSize = standardCanvasSize
@@ -583,8 +595,7 @@ public final class RecordingSession: Sendable {
     }
 
     private nonisolated func processAudioSampleSync(_ audioSample: CMSampleBuffer, sourceID: String) async {
-        guard _isRecording else {
-            print("⚠️ RecordingSession: Audio sample from [\(sourceID)] dropped - not recording")
+        guard _isRecording || _streamingActive.withLock({ $0 }) else {
             return
         }
 
@@ -611,20 +622,18 @@ public final class RecordingSession: Sendable {
 
     // MARK: - Audio Source Management
 
-    /// Enable screen audio capture (macOS only)
-    public var enableScreenAudio: Bool = false {
-        didSet {
-            if enableScreenAudio && !oldValue {
-                Task { @MainActor in
-                    let _ = await audioRouter.addScreenAudio()
-                }
-            }
-        }
-    }
+    /// Enable screen audio capture (macOS only).
+    /// Set before calling startRecording() or startStreaming().
+    nonisolated(unsafe) public var enableScreenAudio: Bool = false
 
     /// Get audio router for advanced audio source management
     public var audioSourceRouter: AudioRouter {
         audioRouter
+    }
+
+    /// Set volume gain for an audio source (0.0 = silent, 1.0 = full)
+    public nonisolated func setAudioGain(_ gain: Float, for sourceID: String) {
+        audioMixer.setGain(gain, for: sourceID)
     }
 
     /// Get camera preview session (first active camera if available)
@@ -656,11 +665,46 @@ public final class RecordingSession: Sendable {
         screenCapture.stopCapture()
     }
 
+    /// Start frame generation for streaming-only mode (no recording to file).
+    /// In camera/avatar modes, starts the 30fps frame driver timer.
+    /// In desktop modes, screen capture is already running from preview — frames will now
+    /// pass through processFrameSync since streaming is active.
+    /// Also starts audio routing so mic audio reaches the encoder.
+    private func startStreamingFrameGeneration() {
+        let mode = inputMode
+
+        // Start camera/avatar frame driver if not using desktop capture
+        if !mode.needsDesktop && mode.needsVideo {
+            startCameraFrameDriver()
+        }
+
+        // Add audio sources if not already added (streaming without recording)
+        Task { @MainActor in
+            if mode.needsMicrophone && !audioRouter.allSourceIDs.contains("microphone") {
+                let micSource = audioRouter.addMicrophone()
+                micSource.onLevelUpdate = { @Sendable [weak self] level in
+                    self?.audioLevel = level
+                }
+            }
+            if enableScreenAudio && !audioRouter.allSourceIDs.contains("screen") {
+                let _ = audioRouter.addScreenAudio()
+            }
+            try? await audioRouter.startAll()
+        }
+
+        print("📡 Started frame generation for streaming (mode: \(mode))")
+    }
+
     // MARK: - Streaming
 
     /// Start streaming to RTMP destination
     public func startStreaming(to destination: RTMPPublisher.Destination, streamKey: String) async throws {
         try await encoder.startStreaming(to: destination, streamKey: streamKey)
+        _streamingActive.withLock { $0 = true }
+        // Start frame generation if not already recording
+        if !_isRecording {
+            startStreamingFrameGeneration()
+        }
     }
 
     /// Start NTDF-encrypted streaming to Arkavo
@@ -670,10 +714,16 @@ public final class RecordingSession: Sendable {
     ///   - streamKey: Stream key (e.g., live/test)
     public func startNTDFStreaming(kasURL: URL, rtmpURL: String, streamKey: String) async throws {
         try await encoder.startNTDFStreaming(kasURL: kasURL, rtmpURL: rtmpURL, streamKey: streamKey)
+        _streamingActive.withLock { $0 = true }
+        // Start frame generation if not already recording
+        if !_isRecording {
+            startStreamingFrameGeneration()
+        }
     }
 
     /// Stop streaming
     public func stopStreaming() async {
+        _streamingActive.withLock { $0 = false }
         await encoder.stopStreaming()
         await encoder.stopNTDFStreaming()
     }
@@ -804,7 +854,6 @@ public final class RecordingSession: Sendable {
     }
 
     // Debug throttle for floating head logging
-    nonisolated(unsafe) private static var lastFloatingHeadLogTime: Date?
 
     private func dispatchPreview(for identifier: String, buffer: CMSampleBuffer) {
         guard let handler = previewHandler,
@@ -816,24 +865,12 @@ public final class RecordingSession: Sendable {
         var cgImage: CGImage?
         let isFloatingHead = compositor.floatingHeadEnabled
 
-        // Debug logging (throttled to once per second)
-        let now = Date()
-        if Self.lastFloatingHeadLogTime == nil || now.timeIntervalSince(Self.lastFloatingHeadLogTime!) >= 1.0 {
-            Self.lastFloatingHeadLogTime = now
-            print("🎭 [Preview] floatingHeadEnabled=\(isFloatingHead)")
-        }
-
         // Apply person segmentation for floating head preview
         // Skip during recording to avoid running segmentation twice (compositor handles it)
         if isFloatingHead && !_isRecording {
             let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
             if let segmentedImage = compositor.applyFloatingHeadSegmentation(to: ciImage, pixelBuffer: pixelBuffer) {
                 cgImage = previewCIContext.createCGImage(segmentedImage, from: segmentedImage.extent)
-                if Self.lastFloatingHeadLogTime == now {
-                    print("🎭 [Preview] Segmentation applied successfully")
-                }
-            } else if Self.lastFloatingHeadLogTime == now {
-                print("🎭 [Preview] Segmentation returned nil")
             }
         }
 

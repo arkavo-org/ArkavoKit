@@ -34,7 +34,6 @@ public final class MicrophoneAudioSource: NSObject, AudioSource, Sendable {
     private let outputQueue = DispatchQueue(label: "com.arkavo.microphone.\(UUID().uuidString)")
 
     nonisolated(unsafe) public var onLevelUpdate: (@Sendable (Float) -> Void)?
-    nonisolated(unsafe) private var levelTimer: Timer?
 
     private let deviceID: String?
 
@@ -125,9 +124,6 @@ public final class MicrophoneAudioSource: NSObject, AudioSource, Sendable {
         // Start the session
         captureSession.startRunning()
 
-        // Start monitoring audio levels
-        startLevelMonitoring()
-
         print("🎤 MicrophoneAudioSource [\(sourceID)] started: \(sourceName)")
         #else
         throw RecorderError.microphoneUnavailable
@@ -143,8 +139,6 @@ public final class MicrophoneAudioSource: NSObject, AudioSource, Sendable {
             audioInput = nil
         }
         captureSession.commitConfiguration()
-
-        stopLevelMonitoring()
 
         print("🎤 MicrophoneAudioSource [\(sourceID)] stopped")
     }
@@ -191,31 +185,6 @@ public final class MicrophoneAudioSource: NSObject, AudioSource, Sendable {
         #endif
     }
 
-    // MARK: - Level Monitoring
-
-    private func startLevelMonitoring() {
-        levelTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
-            Task { @MainActor in
-                // Get current audio level from the input device
-                if let audioInput = self.audioInput {
-                    let level = self.getCurrentAudioLevel(from: audioInput.device)
-                    self.onLevelUpdate?(level)
-                }
-            }
-        }
-    }
-
-    private func stopLevelMonitoring() {
-        levelTimer?.invalidate()
-        levelTimer = nil
-    }
-
-    private func getCurrentAudioLevel(from device: AVCaptureDevice) -> Float {
-        // This is a simplified implementation
-        // In production, you'd want to calculate this from the actual audio samples
-        return 0.0
-    }
 }
 
 // MARK: - AVCaptureAudioDataOutputSampleBufferDelegate

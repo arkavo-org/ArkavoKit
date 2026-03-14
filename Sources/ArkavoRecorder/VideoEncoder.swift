@@ -37,6 +37,10 @@ public actor VideoEncoder {
     private var ntdfStreamingManager: NTDFStreamingManager?
     private var isStreaming: Bool = false
     private var isNTDFStreaming: Bool = false
+
+    /// Whether any streaming (regular RTMP or NTDF) is active — used by RecordingSession
+    /// to gate frame generation when streaming without recording
+    public var isStreamingActive: Bool { isStreaming || isNTDFStreaming }
     private var videoFormatDescription: CMFormatDescription?
     private var audioFormatDescription: CMFormatDescription?
     private var sentVideoSequenceHeader: Bool = false

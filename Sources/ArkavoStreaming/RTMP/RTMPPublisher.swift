@@ -622,7 +622,19 @@ public actor RTMPPublisher {
 
         // Create RTMP connect command (transaction ID 1)
         transactionId += 1  // = 1
-        let tcUrl = "rtmp://\(destination.url.split(separator: "/").prefix(3).joined(separator: "/"))"
+        // tcUrl is the connection URL without the stream key path
+        // For "rtmp://live.twitch.tv/app", tcUrl should be "rtmp://live.twitch.tv/app"
+        let tcUrl: String
+        if let parsed = URL(string: destination.url) {
+            var components = URLComponents()
+            components.scheme = parsed.scheme ?? "rtmp"
+            components.host = parsed.host
+            if let port = parsed.port { components.port = port }
+            components.path = "/\(app)"
+            tcUrl = components.string ?? destination.url
+        } else {
+            tcUrl = destination.url
+        }
         let connectCommand = AMF0.createConnectCommand(
             app: app,
             tcUrl: tcUrl
@@ -785,118 +797,12 @@ public actor RTMPPublisher {
         bytesReceived += UInt64(publishStatusBytes)
         print("✅ Received publish status")
 
-        // Start background task to read server messages (acknowledgements, bandwidth notifications, pings, etc.)
-        print("🚀 Starting background server message handler task...")
-        serverMessageTask = Task {
-            await handleServerMessages()
-        }
-        print("✅ Background server message handler task started")
+        // NOTE: No background read task. OBS Studio's architecture shows that during RTMP
+        // publishing, the server half-closes its send direction after onStatus. Reading
+        // server messages is unnecessary — Twitch won't send pings or control messages
+        // during publishing. Any remaining reads would just hit a TCP half-close (FIN).
 
         print("✅ App connection complete, ready to stream")
-    }
-
-    /// Handle incoming server messages during streaming
-    private func handleServerMessages() async {
-        print("📥 Background message handler STARTED - will listen for server messages (pings, acks, etc.)")
-        var iterationCount = 0
-
-        while state == .publishing {
-            iterationCount += 1
-
-            // Log every 50 iterations (~5 seconds) to show handler is alive
-            if iterationCount % 50 == 0 {
-                print("📥 Background handler alive: iteration \(iterationCount), state=\(state), bytesReceived=\(bytesReceived)")
-            }
-
-            do {
-                // Try to receive a message (non-blocking - returns nil if no data available)
-                if let (messageType, messageData, messageBytes) = try await receiveRTMPMessageNonBlocking() {
-                    // Got a message! Process it
-                    bytesReceived += UInt64(messageBytes)
-
-                    print("📥 Server message: type=\(messageType) payloadLen=\(messageData.count) totalBytes=\(messageBytes) totalReceived=\(bytesReceived)")
-
-                    // Handle specific message types
-                    switch messageType {
-                    case 1: // Set Chunk Size
-                        if messageData.count >= 4 {
-                            let chunkSize = UInt32(messageData[0]) << 24 | UInt32(messageData[1]) << 16 |
-                                           UInt32(messageData[2]) << 8 | UInt32(messageData[3])
-                            receiveChunkSize = Int(chunkSize)
-                            print("📥 Server Set Chunk Size: \(chunkSize) - Updated receive chunk size")
-                        }
-
-                    case 3: // Acknowledgement
-                        print("📥 Server sent Acknowledgement")
-
-                    case 4: // User Control Message (ping, pong, stream begin, etc.)
-                        try await handleUserControlMessage(messageData)
-
-                    case 5: // Window Acknowledgement Size
-                        if messageData.count >= 4 {
-                            serverWindowAckSize = UInt32(messageData[0]) << 24 | UInt32(messageData[1]) << 16 |
-                                                 UInt32(messageData[2]) << 8 | UInt32(messageData[3])
-                            print("📥 Server Window Ack Size: \(serverWindowAckSize) - This is the window we should use for sending acks")
-                        }
-
-                    case 6: // Set Peer Bandwidth
-                        if messageData.count >= 5 {
-                            let bandwidth = UInt32(messageData[0]) << 24 | UInt32(messageData[1]) << 16 |
-                                           UInt32(messageData[2]) << 8 | UInt32(messageData[3])
-                            let limitType = messageData[4]  // 0=Hard, 1=Soft, 2=Dynamic
-                            print("📥 Server Set Peer Bandwidth: \(bandwidth) (type: \(limitType))")
-
-                            // Respond with our Window Acknowledgement Size
-                            var windowAckData = Data()
-                            windowAckData.append(contentsOf: windowAckSize.bigEndianBytes)
-                            try await sendRTMPMessage(
-                                chunkStreamId: 2,
-                                messageTypeId: 5,  // Window Acknowledgement Size
-                                messageStreamId: 0,
-                                payload: windowAckData
-                            )
-                            print("📤 Sent Window Ack Size response: \(windowAckSize)")
-                        }
-
-                    case 20: // AMF0 Command (onStatus, etc.)
-                        handleAMFCommand(messageData)
-
-                    default:
-                        print("📥 Unhandled message type: \(messageType)")
-                    }
-
-                    // Send acknowledgement if we've received enough data
-                    // OBS sends every window_size/10 bytes (not every full window)
-                    let ackThreshold = UInt64(serverWindowAckSize) / 10
-                    if bytesReceived - lastAckSent >= ackThreshold {
-                        try await sendWindowAcknowledgement(bytesReceived: UInt32(bytesReceived))
-                        lastAckSent = bytesReceived
-                        print("✅ Sent Acknowledgement: \(bytesReceived) bytes (threshold: \(ackThreshold), window: \(serverWindowAckSize))")
-                    }
-                }
-                // If no message was available, that's normal - we'll check again after sleeping
-
-            } catch {
-                // If we get an error, the connection might be closed
-                let errorMsg = error.localizedDescription
-                print("📥 ❌ Error reading server message: \(errorMsg)")
-
-                if errorMsg.contains("Connection closed") ||
-                   errorMsg.contains("Connection reset") ||
-                   errorMsg.contains("No message available") {
-                    print("⚠️ Server connection closed, exiting background handler")
-                    break
-                }
-                // For other errors, log but continue (will retry after sleep)
-                print("📥 Non-fatal error, will retry after sleep")
-            }
-
-            // Always yield control and sleep between iterations
-            // This prevents busy-waiting and gives other tasks a chance to run
-            try? await Task.sleep(nanoseconds: 100_000_000) // 100ms between polls
-        }
-
-        print("📥 Background message handler STOPPED (final state=\(state), iterations=\(iterationCount))")
     }
 
     /// Handle AMF0 command messages (onStatus, etc.)
@@ -1248,92 +1154,14 @@ public actor RTMPPublisher {
         return (lastReceivedMessageType, payload, totalBytes)
     }
 
-    /// Non-blocking variant of receiveRTMPMessage that returns nil if no data is available
-    /// Used by background message handler to avoid blocking when server isn't sending messages
-    private func receiveRTMPMessageNonBlocking() async throws -> (UInt8, Data, Int)? {
-        // Try to peek if any data is available (just 1 byte to check)
-        guard let peekData = try await receiveDataNonBlocking(length: 1), peekData.count > 0 else {
-            // No data available - return nil (not an error)
-            return nil
-        }
-
-        // Data is available! Now parse the full chunk
-        // IMPORTANT: Pass the peeked byte to receiveRTMPChunk so it doesn't re-read it (which would cause sync issues)
-        let (payload, totalBytes) = try await receiveRTMPChunk(preReadBasicHeader: peekData[0])
-        return (lastReceivedMessageType, payload, totalBytes)
-    }
-
-    /// Process all pending server messages without blocking
-    /// Called before sending each frame to handle control messages immediately (like OBS)
+    /// Server messages are handled by the background handler (handleServerMessages).
+    /// This method is kept for the CMSampleBuffer API (publishVideo/publishAudio) but is
+    /// now a no-op since the background handler processes all server messages.
     private func processAllPendingServerMessages() async throws {
-        var messagesProcessed = 0
-
-        // Drain all available messages from the server
-        while let (messageType, messageData, messageBytes) = try await receiveRTMPMessageNonBlocking() {
-            messagesProcessed += 1
-            bytesReceived += UInt64(messageBytes)
-
-            // Handle control messages inline
-            switch messageType {
-            case 1: // Set Chunk Size
-                if messageData.count >= 4 {
-                    let chunkSize = UInt32(messageData[0]) << 24 | UInt32(messageData[1]) << 16 |
-                                   UInt32(messageData[2]) << 8 | UInt32(messageData[3])
-                    receiveChunkSize = Int(chunkSize)
-                    print("📥 [Inline] Server Set Chunk Size: \(chunkSize)")
-                }
-
-            case 3: // Acknowledgement from server
-                print("📥 [Inline] Server sent Acknowledgement")
-
-            case 4: // User Control Message (ping, stream begin, etc.)
-                try await handleUserControlMessage(messageData)
-
-            case 5: // Window Acknowledgement Size
-                if messageData.count >= 4 {
-                    serverWindowAckSize = UInt32(messageData[0]) << 24 | UInt32(messageData[1]) << 16 |
-                                         UInt32(messageData[2]) << 8 | UInt32(messageData[3])
-                    print("📥 [Inline] Server Window Ack Size: \(serverWindowAckSize)")
-                }
-
-            case 6: // Set Peer Bandwidth
-                if messageData.count >= 5 {
-                    let bandwidth = UInt32(messageData[0]) << 24 | UInt32(messageData[1]) << 16 |
-                                   UInt32(messageData[2]) << 8 | UInt32(messageData[3])
-                    let limitType = messageData[4]
-                    print("📥 [Inline] Server Set Peer Bandwidth: \(bandwidth) (type: \(limitType))")
-
-                    // Respond with our Window Acknowledgement Size
-                    var windowAckData = Data()
-                    windowAckData.append(contentsOf: windowAckSize.bigEndianBytes)
-                    try await sendRTMPMessage(
-                        chunkStreamId: 2,
-                        messageTypeId: 5,
-                        messageStreamId: 0,
-                        payload: windowAckData
-                    )
-                    print("📤 [Inline] Sent Window Ack Size response: \(windowAckSize)")
-                }
-
-            case 20: // AMF0 Command
-                handleAMFCommand(messageData)
-
-            default:
-                print("📥 [Inline] Unhandled message type: \(messageType)")
-            }
-
-            // Send acknowledgement IMMEDIATELY if threshold reached (like OBS)
-            let ackThreshold = UInt64(serverWindowAckSize) / 10
-            if bytesReceived - lastAckSent >= ackThreshold {
-                try await sendWindowAcknowledgement(bytesReceived: UInt32(bytesReceived))
-                lastAckSent = bytesReceived
-                print("✅ [Inline] Sent ACK: \(bytesReceived) bytes (threshold: \(ackThreshold))")
-            }
-        }
-
-        if messagesProcessed > 0 {
-            print("📥 [Inline] Processed \(messagesProcessed) server messages before frame send")
-        }
+        // No-op: background handler processes server messages via blocking receive.
+        // Using minimumIncompleteLength: 0 for non-blocking reads poisons NWConnection's
+        // read queue ("already delivered final read"), so all reads go through the
+        // background handler's blocking receiveRTMPChunk() instead.
     }
 
     /// Receive and parse an RTMP chunk from the server
@@ -1648,40 +1476,9 @@ public actor RTMPPublisher {
         }
     }
 
-    /// Non-blocking variant of receiveData that returns immediately if no data is available
-    /// Uses minimumIncompleteLength: 0 to allow immediate return
-    private func receiveDataNonBlocking(length: Int) async throws -> Data? {
-        guard let connection = connection else {
-            throw RTMPError.notConnected
-        }
-
-        return try await withCheckedThrowingContinuation { continuation in
-            var resumed = false
-
-            // Use minimumIncompleteLength: 0 to return IMMEDIATELY if no data is ready
-            // This prevents blocking when server isn't sending anything
-            connection.receive(minimumIncompleteLength: 0, maximumLength: length) { data, _, isComplete, error in
-                guard !resumed else { return }
-                resumed = true
-
-                if let error = error {
-                    continuation.resume(throwing: RTMPError.connectionFailed(error.localizedDescription))
-                    return
-                }
-
-                if let data = data, data.count > 0 {
-                    // Got some data - return it
-                    continuation.resume(returning: data)
-                } else if isComplete {
-                    // Connection closed
-                    continuation.resume(throwing: RTMPError.connectionFailed("Connection closed"))
-                } else {
-                    // No data available right now - return nil (not an error)
-                    continuation.resume(returning: nil)
-                }
-            }
-        }
-    }
+    // receiveDataNonBlocking removed — minimumIncompleteLength: 0 poisons NWConnection's
+    // read queue by delivering a "final read". All server message reading now goes through
+    // the background handler using blocking receiveRTMPChunk() (minimumIncompleteLength: 1).
 
     private func updateBytesSent(_ bytes: UInt64) {
         bytesSent += bytes
