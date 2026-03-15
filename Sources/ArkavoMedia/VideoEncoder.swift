@@ -184,13 +184,15 @@ public final class VideoEncoder: Sendable {
         // Disable B-frames for RTMP compatibility
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
 
-        // Set quality - balanced for real-time streaming
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_Quality, value: 0.5 as CFNumber)
-
         // Enable hardware acceleration
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, value: kCFBooleanTrue)
 
-        print("   DataRateLimits: \(bytesPerSecond/1000)KB/s in 1-second windows")
+        // Use constant bitrate mode for consistent streaming
+        // AverageBitRate + DataRateLimits together enforce CBR-like behavior.
+        // Do NOT set Quality — it overrides bitrate targets and reduces output.
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ConstantBitRate, value: bitrate as CFNumber)
+
+        print("   DataRateLimits: \(bytesPerSecond/1000)KB/s in 1-second windows, CBR target: \(bitrate/1000)kbps")
     }
 
     private let compressionOutputCallback: VTCompressionOutputCallback = { (
@@ -254,17 +256,6 @@ public final class VideoEncoder: Sendable {
         )
 
         onFrame?(frame)
-
-        // Log frames for debugging
-        if isKeyframe {
-            print("🎥 Encoded keyframe: \(h264Data.count) bytes at \(timestamp.seconds)s")
-        } else {
-            // Log P-frames occasionally using static counter
-            let count = Self.incrementFrameCount()
-            if count % 30 == 0 {
-                print("🎥 Encoded P-frame #\(count): \(h264Data.count) bytes at \(timestamp.seconds)s")
-            }
-        }
     }
 
     // Static counter for P-frame logging (thread-safe via lock)

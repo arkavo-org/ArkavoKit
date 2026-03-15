@@ -479,9 +479,6 @@ public actor VideoEncoder {
             do {
                 try encoder.encode(pixelBuffer, timestamp: adjustedTimestamp)
                 streamFrameCount += 1
-                if streamFrameCount % 30 == 0 {
-                    print("📊 Fed frame #\(streamFrameCount) to stream encoder at \(adjustedTimestamp.seconds)s")
-                }
             } catch {
                 print("❌ Stream video encoder failed: \(error)")
             }
@@ -578,8 +575,8 @@ public actor VideoEncoder {
             }
         }
 
-        // Stream the first audio track for RTMP (typically microphone)
-        if (isStreaming || isNTDFStreaming), let encoder = streamAudioEncoder, sourceID == "microphone" {
+        // Stream audio for RTMP — accept mixed output (from AudioMixer) or direct microphone
+        if (isStreaming || isNTDFStreaming), let encoder = streamAudioEncoder, (sourceID == "mixed" || sourceID == "microphone") {
             // Feed PCM audio to encoder for AAC conversion
             encoder.feed(sampleBuffer)
         }
@@ -643,12 +640,13 @@ public actor VideoEncoder {
         try await publisher.connect(to: destination, streamKey: streamKey)
 
         // Send stream metadata (@setDataFrame onMetaData) immediately after connect
+        // sendMetadata/FLVMuxer expect values in bits/sec and convert to kbps internally
         try await publisher.sendMetadata(
             width: videoWidth,
             height: videoHeight,
             framerate: Double(frameRate),
-            videoBitrate: Double(videoBitrate) / 1000.0,  // Convert to kbps
-            audioBitrate: 128.0  // 128 kbps
+            videoBitrate: Double(videoBitrate),
+            audioBitrate: 128_000
         )
 
         // Create video encoder
@@ -1154,8 +1152,6 @@ public actor VideoEncoder {
 
         // Trim output data to actual size
         outputData = outputData.prefix(Int(outputDataSize))
-
-        print("🎵 Converted PCM (\(length) bytes) → AAC (\(outputData.count) bytes)")
 
         // Create CMSampleBuffer with AAC data
         var blockBuffer: CMBlockBuffer?

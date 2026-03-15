@@ -36,6 +36,13 @@ public final class CompositorManager: Sendable {
     public nonisolated(unsafe) var watermarkPosition: WatermarkPosition = .bottomCenter
     public nonisolated(unsafe) var watermarkOpacity: Float = 0.6 // 60% opacity
 
+    // Scene overlay configuration (e.g. "Starting Soon...", "Be Right Back")
+    public nonisolated(unsafe) var sceneOverlayText: String? = nil
+    public nonisolated(unsafe) var sceneOverlayIcon: String? = nil  // SF Symbol name
+    public nonisolated(unsafe) var sceneOverlayGradientColors: (start: CGColor, end: CGColor)? = nil
+    private nonisolated(unsafe) var cachedSceneOverlay: CIImage?
+    private nonisolated(unsafe) var cachedSceneOverlayKey: String?
+
     // Floating head (person segmentation) configuration
     public nonisolated(unsafe) var floatingHeadEnabled: Bool = false
     private let segmentationProcessor = PersonSegmentationProcessor()
@@ -299,6 +306,13 @@ public final class CompositorManager: Sendable {
             composited = addWatermark(to: composited, screenSize: screenSize)
         }
 
+        // Add scene overlay if active (Starting Soon, BRB, Ending)
+        #if os(macOS)
+        if let overlayText = sceneOverlayText, !overlayText.isEmpty {
+            composited = addSceneOverlay(to: composited, screenSize: screenSize, text: overlayText)
+        }
+        #endif
+
         // Scale to output resolution if different from source
         let finalImage: CIImage
         if screenSize != outputSize {
@@ -496,6 +510,117 @@ public final class CompositorManager: Sendable {
     }
 
     /// Adds watermark to the composited image
+    #if os(macOS)
+    /// Renders a full-screen scene overlay (gradient background + icon + centered text)
+    private func addSceneOverlay(to image: CIImage, screenSize: CGSize, text: String) -> CIImage {
+        let cacheKey = "\(text)|\(sceneOverlayIcon ?? "")"
+        if cacheKey == cachedSceneOverlayKey, let cached = cachedSceneOverlay,
+           cached.extent.size == screenSize {
+            return cached.composited(over: image)
+        }
+
+        let width = Int(screenSize.width)
+        let height = Int(screenSize.height)
+
+        // Create bitmap context for the overlay
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+        ) else {
+            return image
+        }
+
+        // Draw gradient background
+        let startColor = sceneOverlayGradientColors?.start ?? CGColor(red: 0.2, green: 0.2, blue: 0.6, alpha: 0.85)
+        let endColor = sceneOverlayGradientColors?.end ?? CGColor(red: 0.4, green: 0.1, blue: 0.5, alpha: 0.85)
+
+        if let gradient = CGGradient(
+            colorsSpace: colorSpace,
+            colors: [startColor, endColor] as CFArray,
+            locations: [0.0, 1.0]
+        ) {
+            ctx.drawLinearGradient(
+                gradient,
+                start: CGPoint(x: 0, y: CGFloat(height)),
+                end: CGPoint(x: CGFloat(width), y: 0),
+                options: []
+            )
+        }
+
+        // Use NSGraphicsContext for drawing both icon and text
+        ctx.saveGState()
+        ctx.textMatrix = .identity
+        let nsContext = NSGraphicsContext(cgContext: ctx, flipped: false)
+        NSGraphicsContext.current = nsContext
+
+        // Measure text
+        let fontSize: CGFloat = CGFloat(height) / 14.0
+        let textAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: fontSize, weight: .bold),
+            .foregroundColor: NSColor.white,
+        ]
+        let attrString = NSAttributedString(string: text, attributes: textAttributes)
+        let textSize = attrString.size()
+
+        // Measure icon
+        let iconSize: CGFloat = CGFloat(height) / 10.0
+        let spacing: CGFloat = CGFloat(height) / 40.0
+        var iconImage: NSImage?
+        var iconRect = CGRect.zero
+
+        if let iconName = sceneOverlayIcon {
+            let config = NSImage.SymbolConfiguration(pointSize: iconSize, weight: .regular)
+            if let symbol = NSImage(systemSymbolName: iconName, accessibilityDescription: nil)?.withSymbolConfiguration(config) {
+                iconImage = symbol
+                iconRect.size = symbol.size
+            }
+        }
+
+        // Calculate total content height (icon + spacing + text)
+        let totalHeight = iconRect.height + (iconImage != nil ? spacing : 0) + textSize.height
+        let centerY = (CGFloat(height) - totalHeight) / 2
+
+        // Draw icon centered above text
+        if let icon = iconImage {
+            let iconOrigin = CGPoint(
+                x: (CGFloat(width) - iconRect.width) / 2,
+                y: centerY + textSize.height + spacing
+            )
+            // Tint the icon white by drawing it with a color
+            icon.lockFocus()
+            NSColor.white.withAlphaComponent(0.9).set()
+            let imageRect = NSRect(origin: .zero, size: icon.size)
+            imageRect.fill(using: .sourceAtop)
+            icon.unlockFocus()
+            icon.draw(in: NSRect(origin: iconOrigin, size: iconRect.size))
+        }
+
+        // Draw text centered below icon
+        let textOrigin = CGPoint(
+            x: (CGFloat(width) - textSize.width) / 2,
+            y: centerY
+        )
+        attrString.draw(at: textOrigin)
+
+        NSGraphicsContext.current = nil
+        ctx.restoreGState()
+
+        guard let cgImage = ctx.makeImage() else { return image }
+
+        let overlayImage = CIImage(cgImage: cgImage)
+        cachedSceneOverlay = overlayImage
+        cachedSceneOverlayKey = cacheKey
+
+        return overlayImage.composited(over: image)
+    }
+    #endif
+
     private func addWatermark(to image: CIImage, screenSize: CGSize) -> CIImage {
         guard let watermark = watermarkImage else {
             return image

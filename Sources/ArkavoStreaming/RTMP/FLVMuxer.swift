@@ -527,7 +527,7 @@ public struct FLVMuxer: Sendable {
         metadata.append(onMetaData.data(using: .utf8)!)
 
         // ECMA Array marker (0x08) + approximate count
-        let basePropertyCount: UInt32 = 10
+        let basePropertyCount: UInt32 = 11  // 10 standard + encoder
         let customFieldCount = UInt32(customFields?.count ?? 0)
         metadata.append(0x08)  // AMF0 ECMA Array marker
         metadata.append(contentsOf: (basePropertyCount + customFieldCount).bigEndianBytes)  // Property count
@@ -566,6 +566,7 @@ public struct FLVMuxer: Sendable {
         addBooleanProperty(name: "stereo", value: true)
         addStringProperty(name: "videocodecid", value: "avc1")  // H.264
         addStringProperty(name: "audiocodecid", value: "mp4a")  // AAC
+        addStringProperty(name: "encoder", value: "Arkavo Creator")
 
         // Add custom fields (e.g., ntdf_header for NanoTDF encryption)
         if let customFields {

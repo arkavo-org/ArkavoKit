@@ -129,8 +129,8 @@ public actor RTMPPublisher {
     /// Log streaming summary every 5 seconds
     private func logStreamingSummary() {
         let now = Date()
-        if let lastTime = lastSummaryTime, now.timeIntervalSince(lastTime) < 5.0 {
-            return  // Don't log more than once per 5 seconds
+        if let lastTime = lastSummaryTime, now.timeIntervalSince(lastTime) < 30.0 {
+            return  // Don't log more than once per 30 seconds
         }
 
         lastSummaryTime = now
@@ -342,10 +342,6 @@ public actor RTMPPublisher {
         framesSent += 1
         bytesSent += UInt64(payload.count)
 
-        // Log P-frames occasionally to verify they're being sent
-        if !frame.isKeyframe && framesSent % 30 == 0 {
-            print("📹 Sent P-frame #\(framesSent): \(payload.count) bytes at \(timestampMs)ms")
-        }
     }
 
     /// Send encoded audio frame
@@ -674,8 +670,14 @@ public actor RTMPPublisher {
                 }
             case 6:  // Set Peer Bandwidth
                 print("📥 Server Set Peer Bandwidth")
-            case 20:  // AMF0 Command - could be _result
+            case 20:  // AMF0 Command - could be _result or _error
                 print("📥 Received AMF0 command during connect")
+                // Check for _error response from server
+                let errorReason = parseAMFError(messageData)
+                if let errorReason {
+                    print("❌ RTMP connect rejected: \(errorReason)")
+                    throw RTMPError.connectionFailed(errorReason)
+                }
                 receivedConnectResult = true
             default:
                 print("📥 Connect phase: received message type \(messageType)")
@@ -790,12 +792,51 @@ public actor RTMPPublisher {
             payload: publishCommand
         )
 
-        print("✅ Publish command sent (txnId=\(transactionId)), stream is now live!")
+        print("✅ Publish command sent (txnId=\(transactionId)), waiting for publish status...")
 
-        // Wait for publish success status (NetStream.Publish.Start)
-        let (publishStatusData, publishStatusBytes) = try await receiveRTMPChunk()
-        bytesReceived += UInt64(publishStatusBytes)
-        print("✅ Received publish status")
+        // Wait for publish success status (NetStream.Publish.Start) or error
+        // May receive control messages before the onStatus response
+        var receivedPublishStatus = false
+        for _ in 0..<10 {
+            let (messageType, messageData, messageBytes) = try await receiveRTMPMessage()
+            bytesReceived += UInt64(messageBytes)
+
+            switch messageType {
+            case 1:  // Set Chunk Size
+                if messageData.count >= 4 {
+                    let chunkSize = UInt32(messageData[0]) << 24 | UInt32(messageData[1]) << 16 |
+                                   UInt32(messageData[2]) << 8 | UInt32(messageData[3])
+                    receiveChunkSize = Int(chunkSize)
+                    print("📥 Server Set Chunk Size: \(chunkSize) (during publish wait)")
+                }
+            case 4:  // User Control
+                try await handleUserControlMessage(messageData)
+            case 5:  // Window Acknowledgement Size
+                if messageData.count >= 4 {
+                    serverWindowAckSize = UInt32(messageData[0]) << 24 | UInt32(messageData[1]) << 16 |
+                                         UInt32(messageData[2]) << 8 | UInt32(messageData[3])
+                }
+            case 6:  // Set Peer Bandwidth
+                print("📥 Server Set Peer Bandwidth (during publish wait)")
+            case 20:  // AMF0 Command — onStatus
+                // Parse for error/denied status
+                let statusInfo = parsePublishStatus(messageData)
+                if let denied = statusInfo.error {
+                    print("❌ Publish denied: \(denied)")
+                    throw RTMPError.publishFailed(denied)
+                }
+                print("✅ Publish status: \(statusInfo.status ?? "ok")")
+                receivedPublishStatus = true
+            default:
+                print("📥 Publish phase: received message type \(messageType)")
+            }
+
+            if receivedPublishStatus { break }
+        }
+
+        if !receivedPublishStatus {
+            print("⚠️ Did not receive explicit publish status, proceeding cautiously")
+        }
 
         // NOTE: No background read task. OBS Studio's architecture shows that during RTMP
         // publishing, the server half-closes its send direction after onStatus. Reading
@@ -873,6 +914,68 @@ public actor RTMPPublisher {
             if combinedStr.contains("NetConnection.Connect.Success") {
                 print("✅ NetConnection.Connect.Success - Connection accepted")
             }
+        }
+    }
+
+    /// Parse an AMF0 response for _error command. Returns an error reason string if found.
+    private func parseAMFError(_ data: Data) -> String? {
+        var parser = AMF0Parser(data: data)
+        do {
+            let values = try parser.readAllValues()
+            var strings: [String] = []
+            for value in values {
+                extractStrings(from: value, into: &strings)
+            }
+            // Check if this is an _error response
+            if strings.contains("_error") {
+                // Look for a description or reason
+                let description = strings.first(where: {
+                    $0 != "_error" && $0 != "error" && $0.count > 3
+                    && !$0.hasPrefix("NetConnection") && $0 != "status"
+                    && $0 != "code" && $0 != "level" && $0 != "description"
+                })
+                let code = strings.first(where: { $0.hasPrefix("NetConnection.Connect.") && $0 != "NetConnection.Connect.Success" })
+                return code ?? description ?? "Connection rejected by server"
+            }
+        } catch {
+            // If parsing fails, not an error response
+        }
+        return nil
+    }
+
+    /// Parse a publish onStatus response. Returns error reason if denied, or status string if success.
+    private func parsePublishStatus(_ data: Data) -> (status: String?, error: String?) {
+        var parser = AMF0Parser(data: data)
+        do {
+            let values = try parser.readAllValues()
+            var strings: [String] = []
+            for value in values {
+                extractStrings(from: value, into: &strings)
+            }
+            let combined = strings.joined(separator: " ")
+
+            // Check for explicit denial/error
+            if combined.contains("NetStream.Publish.Denied") {
+                let reason = strings.first(where: { $0.contains("not eligible") || $0.contains("denied") || ($0.count > 10 && !$0.hasPrefix("NetStream")) })
+                return (nil, reason ?? "Stream publishing denied. Your account may not meet the platform's streaming requirements (e.g., Twitch Affiliate/Partner status).")
+            }
+            if combined.contains("NetStream.Failed") || combined.contains("NetStream.Publish.BadName") {
+                let reason = strings.first(where: { $0.count > 10 && !$0.hasPrefix("NetStream") && $0 != "onStatus" })
+                return (nil, reason ?? "Stream key is invalid or stream publishing failed.")
+            }
+            if strings.contains("error") && strings.contains("onStatus") {
+                let reason = strings.first(where: { $0.count > 10 && !$0.hasPrefix("NetStream") && $0 != "onStatus" && $0 != "error" })
+                return (nil, reason ?? "Stream rejected by server.")
+            }
+
+            // Success
+            if combined.contains("NetStream.Publish.Start") {
+                return ("NetStream.Publish.Start", nil)
+            }
+
+            return (strings.first(where: { $0.hasPrefix("NetStream.") }), nil)
+        } catch {
+            return (nil, nil)
         }
     }
 
@@ -1087,9 +1190,9 @@ public actor RTMPPublisher {
 
     /// Send video data as RTMP message (type 9)
     private func sendRTMPVideoMessage(data: Data, timestamp: UInt32) async throws {
-        // Log first 10 video messages and every 100th after
-        if framesSent <= 10 || framesSent % 100 == 0 {
-            print("📤 [RTMPPub] Sending video msg #\(framesSent): \(data.count) bytes at ts=\(timestamp)")
+        // Log first frame and every 900th (~30 seconds at 30fps)
+        if framesSent == 0 || framesSent % 900 == 0 {
+            print("📤 [RTMPPub] video #\(framesSent): \(data.count)B ts=\(timestamp)")
         }
         try await sendRTMPMessage(
             chunkStreamId: 6,  // Video chunk stream (must be different from audio)

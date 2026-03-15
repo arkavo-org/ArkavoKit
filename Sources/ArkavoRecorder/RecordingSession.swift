@@ -129,6 +129,24 @@ public final class RecordingSession: Sendable {
         set { compositor.floatingHeadEnabled = newValue }
     }
 
+    /// Scene overlay text (e.g. "Starting Soon...", "Be Right Back"). Set nil to clear.
+    public var sceneOverlayText: String? {
+        get { compositor.sceneOverlayText }
+        set { compositor.sceneOverlayText = newValue }
+    }
+
+    /// Scene overlay SF Symbol icon name. Set nil for no icon.
+    public var sceneOverlayIcon: String? {
+        get { compositor.sceneOverlayIcon }
+        set { compositor.sceneOverlayIcon = newValue }
+    }
+
+    /// Scene overlay gradient colors. Set nil for default blue-purple gradient.
+    public var sceneOverlayGradientColors: (start: CGColor, end: CGColor)? {
+        get { compositor.sceneOverlayGradientColors }
+        set { compositor.sceneOverlayGradientColors = newValue }
+    }
+
     nonisolated(unsafe) public var enableCamera: Bool = true
     nonisolated(unsafe) public var enableMicrophone: Bool = true
     nonisolated(unsafe) public var enableDesktop: Bool = true
@@ -478,7 +496,7 @@ public final class RecordingSession: Sendable {
         guard mode.needsDesktop else { return }
 
         // Capture state on MainActor to ensure thread safety
-        let (cameraLayers, isAvatarEnabled, provider, museProvider, isCameraEnabled) = await MainActor.run {
+        let (cameraLayers, isAvatarEnabled, provider, museProvider, _) = await MainActor.run {
             (
                 self.cameraLayersForComposition(),
                 self.enableAvatar,
@@ -498,14 +516,6 @@ public final class RecordingSession: Sendable {
 
         // Get muse texture if muse mode is enabled
         let museTexture: CVPixelBuffer? = museProvider?()
-
-        // Log once per second to avoid spam
-        let now = Date()
-        if lastDebugLogTime == nil || now.timeIntervalSince(lastDebugLogTime!) >= 1.0 {
-            lastDebugLogTime = now
-            let avatarSize = avatarTexture.map { "\(CVPixelBufferGetWidth($0))x\(CVPixelBufferGetHeight($0))" } ?? "nil"
-            print("🎥 [Composition] camera=\(isCameraEnabled), layers=\(cameraLayers.count), avatar=\(isAvatarEnabled), avatarTex=\(avatarSize)")
-        }
 
         guard let composited = compositor.composite(
             screen: screenBuffer,
