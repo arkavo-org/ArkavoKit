@@ -1,4 +1,4 @@
-// swift-tools-version:6.2
+// swift-tools-version:6.3
 import PackageDescription
 
 // Shared Swift settings for all targets - enables unused code warnings

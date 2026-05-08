@@ -707,11 +707,19 @@ public final class RecordingSession: Sendable {
 
     // MARK: - Streaming
 
-    /// Start streaming to RTMP destination
+    /// Start streaming to a single RTMP destination
     public func startStreaming(to destination: RTMPPublisher.Destination, streamKey: String) async throws {
         try await encoder.startStreaming(to: destination, streamKey: streamKey)
         _streamingActive.withLock { $0 = true }
-        // Start frame generation if not already recording
+        if !_isRecording {
+            startStreamingFrameGeneration()
+        }
+    }
+
+    /// Start streaming to multiple RTMP destinations simultaneously (simulcast)
+    public func startStreaming(destinations: [(id: String, destination: RTMPPublisher.Destination, streamKey: String)]) async throws {
+        try await encoder.startStreaming(to: destinations)
+        _streamingActive.withLock { $0 = true }
         if !_isRecording {
             startStreamingFrameGeneration()
         }
@@ -731,11 +739,20 @@ public final class RecordingSession: Sendable {
         }
     }
 
-    /// Stop streaming
+    /// Stop streaming to all destinations
     public func stopStreaming() async {
         _streamingActive.withLock { $0 = false }
         await encoder.stopStreaming()
         await encoder.stopNTDFStreaming()
+    }
+
+    /// Stop streaming to a single destination (others continue)
+    public func stopStreaming(id: String) async {
+        await encoder.stopStreaming(id: id)
+        // If no destinations remain, deactivate streaming
+        if await encoder.activeDestinationIds.isEmpty {
+            _streamingActive.withLock { $0 = false }
+        }
     }
 
     /// Get streaming statistics

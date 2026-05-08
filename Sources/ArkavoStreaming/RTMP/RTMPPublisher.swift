@@ -210,6 +210,12 @@ public actor RTMPPublisher {
         state = .publishing
         startTime = Date()
 
+        // Start the background server-message handler. The loop reads from the
+        // socket and accepts both .publishing and .connected as live states, so
+        // server messages issued in the brief window around the state flip
+        // can't be missed.
+        startServerMessageHandler()
+
         print("✅ RTMP publishing started")
     }
 
@@ -1257,14 +1263,81 @@ public actor RTMPPublisher {
         return (lastReceivedMessageType, payload, totalBytes)
     }
 
-    /// Server messages are handled by the background handler (handleServerMessages).
+    /// Start background task to read and handle server messages during streaming
+    /// (ping requests, ack requests, user control messages, etc.)
+    private func startServerMessageHandler() {
+        serverMessageTask = Task { [weak self] in
+            guard let self = self else { return }
+            print("📡 Server message handler started")
+            while !Task.isCancelled {
+                do {
+                    let connState = await self.state
+                    guard connState == .publishing || connState == .connected else { break }
+                    let (messageType, messageData, messageBytes) = try await self.receiveRTMPMessage()
+                    await self.addBytesReceived(UInt64(messageBytes))
+
+                    switch messageType {
+                    case 1: // Set Chunk Size
+                        if messageData.count >= 4 {
+                            let chunkSize = UInt32(messageData[0]) << 24 | UInt32(messageData[1]) << 16 |
+                                           UInt32(messageData[2]) << 8 | UInt32(messageData[3])
+                            await self.setReceiveChunkSize(Int(chunkSize))
+                            print("📥 [BG] Server Set Chunk Size: \(chunkSize)")
+                        }
+                    case 3: // Acknowledgement
+                        print("📥 [BG] Server Acknowledgement")
+                    case 4: // User Control (includes ping)
+                        try await self.handleUserControlMessage(messageData)
+                    case 5: // Window Acknowledgement Size
+                        if messageData.count >= 4 {
+                            let size = UInt32(messageData[0]) << 24 | UInt32(messageData[1]) << 16 |
+                                      UInt32(messageData[2]) << 8 | UInt32(messageData[3])
+                            await self.setServerWindowAckSize(size)
+                            print("📥 [BG] Server Window Ack Size: \(size)")
+                        }
+                    case 6: // Set Peer Bandwidth
+                        print("📥 [BG] Server Set Peer Bandwidth")
+                    case 20: // AMF0 Command
+                        print("📥 [BG] Server AMF0 command (ignored during streaming)")
+                    default:
+                        print("📥 [BG] Server message type \(messageType) (\(messageData.count) bytes)")
+                    }
+
+                    // Send acknowledgement if we've received enough bytes
+                    let received = await self.getBytesReceived()
+                    let ackSize = await self.getServerWindowAckSize()
+                    let lastAck = await self.getLastAckSent()
+                    if received - lastAck >= UInt64(ackSize) {
+                        try await self.sendWindowAcknowledgement(bytesReceived: UInt32(received & 0xFFFFFFFF))
+                        await self.setLastAckSent(received)
+                    }
+                } catch is CancellationError {
+                    break
+                } catch {
+                    if !Task.isCancelled {
+                        print("⚠️ [BG] Server message handler error: \(error.localizedDescription)")
+                    }
+                    break
+                }
+            }
+            print("📡 Server message handler stopped")
+        }
+    }
+
+    // Actor-isolated accessors for server message handler
+    private func addBytesReceived(_ bytes: UInt64) { bytesReceived += bytes }
+    private func getBytesReceived() -> UInt64 { bytesReceived }
+    private func getServerWindowAckSize() -> UInt32 { serverWindowAckSize }
+    private func setServerWindowAckSize(_ size: UInt32) { serverWindowAckSize = size }
+    private func getLastAckSent() -> UInt64 { lastAckSent }
+    private func setLastAckSent(_ value: UInt64) { lastAckSent = value }
+    private func setReceiveChunkSize(_ size: Int) { receiveChunkSize = size }
+
+    /// Server messages are handled by the background handler (startServerMessageHandler).
     /// This method is kept for the CMSampleBuffer API (publishVideo/publishAudio) but is
     /// now a no-op since the background handler processes all server messages.
     private func processAllPendingServerMessages() async throws {
         // No-op: background handler processes server messages via blocking receive.
-        // Using minimumIncompleteLength: 0 for non-blocking reads poisons NWConnection's
-        // read queue ("already delivered final read"), so all reads go through the
-        // background handler's blocking receiveRTMPChunk() instead.
     }
 
     /// Receive and parse an RTMP chunk from the server

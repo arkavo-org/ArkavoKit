@@ -1,10 +1,16 @@
 import AVFoundation
 import CoreMedia
 import AudioToolbox
+import Synchronization
 
 /// Hardware-accelerated AAC audio encoder for streaming
-/// Buffers incoming PCM samples and outputs AAC frames
-public final class AudioEncoder: Sendable {
+/// Buffers incoming PCM samples and outputs AAC frames.
+///
+/// Thread safety: all `feed(...)` calls and `onFrame` access are serialized through
+/// an internal Mutex. Multiple producers (e.g. real microphone audio + a silent-audio
+/// fallback task) may call `feed` concurrently and the AAC output stream remains
+/// well-ordered for a single bitstream.
+public final class AudioEncoder: @unchecked Sendable {
     // MARK: - Types
 
     public enum EncoderError: Error {
@@ -14,21 +20,32 @@ public final class AudioEncoder: Sendable {
         case invalidInput
     }
 
-    // MARK: - Properties
+    // MARK: - Internal State (all access goes through `state` Mutex)
 
-    nonisolated(unsafe) private let converter: AVAudioConverter
-    nonisolated(unsafe) private let pcmFormat: AVAudioFormat
-    nonisolated(unsafe) private let aacFormat: AVAudioFormat
-    nonisolated(unsafe) private var inputBuffer: AVAudioPCMBuffer
-    nonisolated(unsafe) private var inputBufferFrameCount: AVAudioFrameCount = 0
+    private struct State: ~Copyable {
+        var inputBufferFrameCount: AVAudioFrameCount = 0
+        var onFrame: (@Sendable (EncodedAudioFrame) -> Void)?
+    }
+
+    private let state = Mutex(State())
+
+    // Set in init, immutable thereafter — safe to read without locking.
+    private let converter: AVAudioConverter
+    private let pcmFormat: AVAudioFormat
+    private let aacFormat: AVAudioFormat
+    private let inputBuffer: AVAudioPCMBuffer
 
     private let targetFrameCount: AVAudioFrameCount = 1024  // AAC frame size
     private let sampleRate: Double = 48000
     private let channelCount: AVAudioChannelCount = 2
     private let bitrate: Int
 
-    /// Callback invoked when an AAC frame is ready
-    nonisolated(unsafe) public var onFrame: (@Sendable (EncodedAudioFrame) -> Void)?
+    /// Callback invoked when an AAC frame is ready. Setter and getter are
+    /// serialized through the internal Mutex.
+    public var onFrame: (@Sendable (EncodedAudioFrame) -> Void)? {
+        get { state.withLock { $0.onFrame } }
+        set { state.withLock { $0.onFrame = newValue } }
+    }
 
     // MARK: - Initialization
 
@@ -82,10 +99,10 @@ public final class AudioEncoder: Sendable {
 
     // MARK: - Public Methods
 
-    /// Feed PCM audio samples for encoding
+    /// Feed PCM audio samples for encoding.
+    /// Concurrent calls from multiple tasks are safe; they serialize through an internal lock.
     /// - Parameters:
     ///   - sampleBuffer: PCM audio sample buffer
-    ///   - timestamp: Presentation timestamp
     public func feed(_ sampleBuffer: CMSampleBuffer) {
         // Extract PCM data from CMSampleBuffer
         guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else {
@@ -114,41 +131,56 @@ public final class AudioEncoder: Sendable {
         let bytesPerFrame = Int(pcmFormat.streamDescription.pointee.mBytesPerFrame)
         let frameCount = AVAudioFrameCount(length / bytesPerFrame)
 
-        // Append to input buffer
-        appendToBuffer(pcmData: pcmData, frameCount: frameCount, timestamp: timestamp)
+        // Append to input buffer + encode under the lock so concurrent feeds can't
+        // corrupt the input PCM buffer or the AVAudioConverter's internal state.
+        let frame: EncodedAudioFrame? = state.withLock { state in
+            self.appendAndMaybeEncode(
+                state: &state,
+                pcmData: pcmData,
+                frameCount: frameCount,
+                timestamp: timestamp
+            )
+        }
+        if let frame, let cb = state.withLock({ $0.onFrame }) {
+            cb(frame)
+        }
     }
 
     // MARK: - Private Methods
 
-    private func appendToBuffer(pcmData: UnsafeMutablePointer<Int8>, frameCount: AVAudioFrameCount, timestamp: CMTime) {
-        // Check if we have space in the buffer
-        let availableSpace = inputBuffer.frameCapacity - inputBufferFrameCount
-
+    /// Append PCM into the input buffer; if we have enough frames, run the converter
+    /// and return the resulting AAC frame. Caller must hold the state lock.
+    private func appendAndMaybeEncode(
+        state: inout State,
+        pcmData: UnsafeMutablePointer<Int8>,
+        frameCount: AVAudioFrameCount,
+        timestamp: CMTime
+    ) -> EncodedAudioFrame? {
+        let availableSpace = inputBuffer.frameCapacity - state.inputBufferFrameCount
         guard availableSpace >= frameCount else {
             print("⚠️ AudioEncoder: Buffer full, dropping \(frameCount) frames")
-            return
+            return nil
         }
 
         // Copy PCM data into buffer
         let channelData = inputBuffer.int16ChannelData!
-        let destPointer = channelData[0].advanced(by: Int(inputBufferFrameCount) * Int(channelCount))
+        let destPointer = channelData[0].advanced(by: Int(state.inputBufferFrameCount) * Int(channelCount))
         let bytesToCopy = Int(frameCount) * Int(pcmFormat.streamDescription.pointee.mBytesPerFrame)
 
         pcmData.withMemoryRebound(to: Int16.self, capacity: bytesToCopy / 2) { srcPointer in
             destPointer.update(from: srcPointer, count: bytesToCopy / 2)
         }
 
-        inputBufferFrameCount += frameCount
+        state.inputBufferFrameCount += frameCount
 
-        // If we have enough frames, encode
-        if inputBufferFrameCount >= targetFrameCount {
-            encodeAccumulatedFrames(timestamp: timestamp)
-        }
+        guard state.inputBufferFrameCount >= targetFrameCount else { return nil }
+
+        return encodeAccumulatedFrames(state: &state, timestamp: timestamp)
     }
 
-    private func encodeAccumulatedFrames(timestamp: CMTime) {
+    private func encodeAccumulatedFrames(state: inout State, timestamp: CMTime) -> EncodedAudioFrame? {
         // Update buffer frame length to actual accumulated count
-        inputBuffer.frameLength = inputBufferFrameCount
+        inputBuffer.frameLength = state.inputBufferFrameCount
 
         // Create output buffer for AAC
         let outputBuffer = AVAudioCompressedBuffer(
@@ -159,43 +191,44 @@ public final class AudioEncoder: Sendable {
 
         // Convert PCM → AAC
         var error: NSError?
-        let inputBlock: AVAudioConverterInputBlock = { inNumPackets, outStatus in
+        let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
             outStatus.pointee = .haveData
             return self.inputBuffer
         }
 
         let status = converter.convert(to: outputBuffer, error: &error, withInputFrom: inputBlock)
 
+        // Always reset accumulated frames before returning so we don't loop on the same data.
+        defer {
+            state.inputBufferFrameCount = 0
+            inputBuffer.frameLength = 0
+        }
+
         guard status != .error, error == nil else {
             print("❌ AudioEncoder: Conversion failed: \(error?.localizedDescription ?? "unknown")")
-            return
+            return nil
         }
 
         // Extract AAC data
-        if let packetDescriptions = outputBuffer.packetDescriptions,
-           outputBuffer.packetCount > 0 {
-            let packetDesc = packetDescriptions[0]
-            let aacData = Data(bytes: outputBuffer.data.advanced(by: Int(packetDesc.mStartOffset)),
-                              count: Int(packetDesc.mDataByteSize))
-
-            // Create format description for AAC
-            let formatDesc = createAACFormatDescription()
-
-            // Emit encoded frame
-            let frame = EncodedAudioFrame(
-                data: aacData,
-                pts: timestamp,
-                formatDescription: formatDesc
-            )
-
-            onFrame?(frame)
-
-            // Removed excessive logging - frame encoding is normal operation
+        guard let packetDescriptions = outputBuffer.packetDescriptions,
+              outputBuffer.packetCount > 0 else {
+            return nil
         }
 
-        // Reset buffer for next accumulation
-        inputBufferFrameCount = 0
-        inputBuffer.frameLength = 0
+        let packetDesc = packetDescriptions[0]
+        let aacData = Data(
+            bytes: outputBuffer.data.advanced(by: Int(packetDesc.mStartOffset)),
+            count: Int(packetDesc.mDataByteSize)
+        )
+
+        // Create format description for AAC
+        let formatDesc = createAACFormatDescription()
+
+        return EncodedAudioFrame(
+            data: aacData,
+            pts: timestamp,
+            formatDescription: formatDesc
+        )
     }
 
     private func createAACFormatDescription() -> CMAudioFormatDescription? {
