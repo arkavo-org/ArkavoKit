@@ -1,6 +1,15 @@
 {
-  "originHash" : "112607cbf6d7704cd8f0ce48b7ac4e5aaf140153c415898318789db3b88ad23f",
+  "originHash" : "bdc813a8c86d6303930828b524380068de885e5d2c6a914404ad3e500f5e3198",
   "pins" : [
+    {
+      "identity" : "arkavomediakit",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/arkavo-org/ArkavoMediaKit",
+      "state" : {
+        "revision" : "5abc03d923ada26cffe6c3344f88c3f49006b8b5",
+        "version" : "0.1.0"
+      }
+    },
     {
       "identity" : "cryptoswift",
       "kind" : "remoteSourceControl",
