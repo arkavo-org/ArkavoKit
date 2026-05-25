@@ -623,9 +623,9 @@ public final class ArkavoClient: NSObject {
             throw ArkavoError.authenticationFailed("Invalid response from server")
         }
 
-        // Parse token from response body
+        // Parse token from response body (server returns CWT under "token")
         guard let json = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any],
-              let token = json["ntdf_token"] as? String
+              let token = json["token"] as? String
         else {
             throw ArkavoError.authenticationFailed("No authentication token received")
         }
@@ -1052,12 +1052,9 @@ public final class ArkavoClient: NSObject {
             throw ArkavoError.authenticationFailed("No authentication token received")
         }
 
-        // Verify token format
-        if !token.starts(with: "eyJ") {
-            throw ArkavoError.authenticationFailed("Invalid token format")
-        }
-
-        return token
+        // Token is a base64url-encoded CWT (CBOR tag 61 wrapping COSE_Sign1).
+        // No client-side format gate — server is the authority. Trim padding/whitespace just in case.
+        return token.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     public func encryptRemotePolicy(
@@ -1125,6 +1122,80 @@ public final class ArkavoClient: NSObject {
 
         return nanoTDF.toData()
     }
+
+    // MARK: - Apple identity linking
+    //
+    // Two-step contract against the identity server:
+    //   1. GET  /oauth/apple/nonce  — server issues a fresh nonce, stores
+    //      it against the session cookie (10-min TTL, single-use).
+    //   2. POST /oauth/apple/link   — client posts the verified Apple
+    //      id_token; server validates and binds (apple, sub) → user_id.
+    //
+    // Both calls go through URLSession.shared so the session cookie set
+    // in step 1 is automatically replayed in step 2.
+
+    /// Fetches a fresh server-issued Apple nonce for the SiwA flow.
+    /// The raw value must be SHA-256 hashed (hex) before being set as
+    /// `ASAuthorizationAppleIDRequest.nonce`.
+    func fetchAppleNonce() async throws -> String {
+        let url = authURL.appendingPathComponent("oauth/apple/nonce")
+        let (data, response) = try await URLSession.shared.data(from: url)
+
+        guard let http = response as? HTTPURLResponse else {
+            throw AppleLinkError.invalidResponse
+        }
+        guard (200 ... 299).contains(http.statusCode) else {
+            throw AppleLinkError.serverError(http.statusCode, String(data: data, encoding: .utf8))
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let nonce = json["nonce"] as? String
+        else {
+            throw AppleLinkError.invalidResponse
+        }
+        return nonce
+    }
+
+    /// Posts the verified Apple id_token to `/oauth/apple/link`. Binds the
+    /// Apple `sub` claim to the currently-authenticated arkavo account
+    /// (identified by the CWT in the shared keychain).
+    ///
+    /// Throws [`AppleLinkError.conflict`] if this Apple identity is already
+    /// linked to a different arkavo account.
+    func linkAppleIdentity(idToken: String) async throws {
+        guard let cwt = KeychainManager.getAuthenticationToken() else {
+            throw AppleLinkError.missingAuthToken
+        }
+
+        var request = URLRequest(url: authURL.appendingPathComponent("oauth/apple/link"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(cwt, forHTTPHeaderField: "X-Auth-Token")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["id_token": idToken])
+
+        let (data, response): (Data, URLResponse)
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch {
+            throw AppleLinkError.networkError(error)
+        }
+
+        guard let http = response as? HTTPURLResponse else {
+            throw AppleLinkError.invalidResponse
+        }
+
+        switch http.statusCode {
+        case 200 ... 299:
+            return
+        case 400:
+            throw AppleLinkError.sessionExpired
+        case 401:
+            throw AppleLinkError.unauthorized
+        case 409:
+            throw AppleLinkError.conflict
+        default:
+            throw AppleLinkError.serverError(http.statusCode, String(data: data, encoding: .utf8))
+        }
+    }
 }
 
 // MARK: - ASAuthorizationControllerPresentationContextProviding
@@ -1167,7 +1238,7 @@ public extension ArkavoClient {
 public extension ArkavoClient {
     /// Links a Patreon account using an OAuth authorization code.
     /// The backend exchanges the code for tokens, fetches the user's tier,
-    /// and returns an updated NTDF token with the SubscriptionTier attribute.
+    /// and returns an updated CWT with the SubscriptionTier attribute.
     ///
     /// - Parameter authorizationCode: The OAuth authorization code from Patreon
     /// - Throws: ArkavoError if linking fails
@@ -1199,9 +1270,9 @@ public extension ArkavoClient {
             throw ArkavoError.authenticationFailed("Patreon linking failed: \(errorMessage)")
         }
 
-        // Parse response and save updated NTDF token
+        // Parse response and save updated CWT
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let newToken = json["ntdf_token"] as? String
+              let newToken = json["token"] as? String
         else {
             throw ArkavoError.authenticationFailed("No updated token received")
         }
