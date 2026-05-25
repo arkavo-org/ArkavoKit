@@ -1166,17 +1166,24 @@ public final class ArkavoClient: NSObject {
     /// `ASAuthorizationAppleIDRequest.nonce`.
     public func fetchAppleNonce() async throws -> String {
         let url = authURL.appendingPathComponent("oauth/apple/nonce")
+        print("ArkavoClient.fetchAppleNonce: GET \(url.absoluteString)")
         let (data, response) = try await URLSession.shared.data(from: url)
 
         guard let http = response as? HTTPURLResponse else {
+            print("ArkavoClient.fetchAppleNonce: non-HTTP response")
             throw AppleLinkError.invalidResponse
         }
+        print("ArkavoClient.fetchAppleNonce: status=\(http.statusCode) bodyLen=\(data.count)")
         guard (200 ... 299).contains(http.statusCode) else {
-            throw AppleLinkError.serverError(http.statusCode, String(data: data, encoding: .utf8))
+            let body = String(data: data, encoding: .utf8) ?? "<non-utf8>"
+            print("ArkavoClient.fetchAppleNonce: server error body=\(body.prefix(500))")
+            throw AppleLinkError.serverError(http.statusCode, body)
         }
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let nonce = json["nonce"] as? String
         else {
+            let body = String(data: data, encoding: .utf8) ?? "<non-utf8>"
+            print("ArkavoClient.fetchAppleNonce: invalid response body=\(body.prefix(500))")
             throw AppleLinkError.invalidResponse
         }
         return nonce
@@ -1190,10 +1197,13 @@ public final class ArkavoClient: NSObject {
     /// linked to a different arkavo account.
     public func linkAppleIdentity(idToken: String) async throws {
         guard let cwt = KeychainManager.getAuthenticationToken() else {
+            print("ArkavoClient.linkAppleIdentity: no CWT in keychain (missingAuthToken)")
             throw AppleLinkError.missingAuthToken
         }
 
-        var request = URLRequest(url: authURL.appendingPathComponent("oauth/apple/link"))
+        let url = authURL.appendingPathComponent("oauth/apple/link")
+        print("ArkavoClient.linkAppleIdentity: POST \(url.absoluteString) cwtLen=\(cwt.count) idTokenLen=\(idToken.count)")
+        var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(cwt, forHTTPHeaderField: "X-Auth-Token")
@@ -1203,12 +1213,17 @@ public final class ArkavoClient: NSObject {
         do {
             (data, response) = try await URLSession.shared.data(for: request)
         } catch {
+            print("ArkavoClient.linkAppleIdentity: network error \(error)")
             throw AppleLinkError.networkError(error)
         }
 
         guard let http = response as? HTTPURLResponse else {
+            print("ArkavoClient.linkAppleIdentity: non-HTTP response")
             throw AppleLinkError.invalidResponse
         }
+
+        let body = String(data: data, encoding: .utf8) ?? "<non-utf8>"
+        print("ArkavoClient.linkAppleIdentity: status=\(http.statusCode) bodyLen=\(data.count) body=\(body.prefix(500))")
 
         switch http.statusCode {
         case 200 ... 299:
@@ -1220,7 +1235,7 @@ public final class ArkavoClient: NSObject {
         case 409:
             throw AppleLinkError.conflict
         default:
-            throw AppleLinkError.serverError(http.statusCode, String(data: data, encoding: .utf8))
+            throw AppleLinkError.serverError(http.statusCode, body)
         }
     }
 }
