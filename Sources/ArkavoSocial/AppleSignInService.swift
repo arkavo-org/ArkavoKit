@@ -270,8 +270,12 @@ public enum AppleLinkError: Error, LocalizedError {
     /// (10-minute TTL) or was already consumed. Caller should retry the
     /// whole flow from `fetchAppleNonce`.
     case sessionExpired
-    /// Server returned HTTP 401 — the inbound `X-Auth-Token` CWT failed to
-    /// verify. Caller should sign back in to Arkavo.
+    /// Server returned HTTP 401. Most commonly the inbound `X-Auth-Token` CWT
+    /// failed to verify (caller should sign back in to Arkavo), but the auth
+    /// server also wraps server-internal failures (e.g. a missing DB table for
+    /// the link store) as 401 — so a fresh sign-in won't always help. The
+    /// `print()` logging in `linkAppleIdentity` captures the response body so
+    /// the actual cause can be distinguished from the console.
     case unauthorized
     /// Server returned HTTP 409 — this Apple `sub` is already bound to a
     /// **different** arkavo account. The conflicting user_id is not
