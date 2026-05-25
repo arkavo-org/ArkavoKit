@@ -1164,7 +1164,7 @@ public final class ArkavoClient: NSObject {
     /// Fetches a fresh server-issued Apple nonce for the SiwA flow.
     /// The raw value must be SHA-256 hashed (hex) before being set as
     /// `ASAuthorizationAppleIDRequest.nonce`.
-    func fetchAppleNonce() async throws -> String {
+    public func fetchAppleNonce() async throws -> String {
         let url = authURL.appendingPathComponent("oauth/apple/nonce")
         let (data, response) = try await URLSession.shared.data(from: url)
 
@@ -1188,7 +1188,7 @@ public final class ArkavoClient: NSObject {
     ///
     /// Throws [`AppleLinkError.conflict`] if this Apple identity is already
     /// linked to a different arkavo account.
-    func linkAppleIdentity(idToken: String) async throws {
+    public func linkAppleIdentity(idToken: String) async throws {
         guard let cwt = KeychainManager.getAuthenticationToken() else {
             throw AppleLinkError.missingAuthToken
         }
