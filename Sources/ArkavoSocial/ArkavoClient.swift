@@ -191,9 +191,14 @@ public final class ArkavoClient: NSObject {
             } catch {
                 print("ArkavoClient: cached token rejected (\(error)); falling back to passkey ceremony")
                 KeychainManager.deleteAuthenticationToken()
-                // Reset state machine and tear down the half-open WebSocket so
-                // the ceremony branch enters from a clean state.
-                await disconnect()
+                // Tear down the half-open WebSocket inline so the ceremony branch
+                // enters from a clean state. We can't use disconnect() here: its
+                // guard requires currentState == .connected, so it's a no-op when
+                // the fast-path failed mid-handshake (state is .connecting/.error).
+                webSocket?.cancel()
+                webSocket = nil
+                session = nil
+                currentState = .disconnected
             }
         }
 
