@@ -175,6 +175,28 @@ public final class ArkavoClient: NSObject {
             throw ArkavoError.invalidState
         }
 
+        // Fast path: try the cached CWT before running the passkey ceremony.
+        // Server is authoritative — if the handshake succeeds, we skip the
+        // WebAuthn ceremony entirely. If it fails for any reason (expired,
+        // revoked, network), we drop the cached token and fall through to the
+        // ceremony branch below.
+        if KeychainManager.getAuthenticationToken() != nil {
+            do {
+                currentState = .connecting
+                try await setupWebSocketConnection()
+                try await waitForConnection()
+                try await sendInitialMessages()
+                try? KeychainManager.saveArkavoHandle(accountName)
+                return
+            } catch {
+                print("ArkavoClient: cached token rejected (\(error)); falling back to passkey ceremony")
+                KeychainManager.deleteAuthenticationToken()
+                // Reset state machine and tear down the half-open WebSocket so
+                // the ceremony branch enters from a clean state.
+                await disconnect()
+            }
+        }
+
         do {
             // First authenticate
             currentState = .authenticating
