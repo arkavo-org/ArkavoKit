@@ -89,6 +89,32 @@ public actor ContentTicketCache {
         cache.values.filter { $0.creatorPublicID == creatorPublicID }
     }
 
+    /// Seed the cache from a fetched creator profile's content catalog.
+    ///
+    /// This is the cold-start discovery path: a consumer who has just
+    /// resolved a `CreatorProfile` can hydrate the catalog without any
+    /// out-of-band ticket sharing. Entries already cached at the same or
+    /// newer version are kept — a stale profile must not roll back
+    /// fresher tickets.
+    /// - Parameter profile: The fetched creator profile
+    /// - Returns: Number of tickets newly cached or updated
+    @discardableResult
+    public func seed(from profile: CreatorProfile) -> Int {
+        var updated = 0
+        for ticket in profile.contentCatalog ?? [] {
+            let key = ticket.contentID.hexString
+            if let existing = cache[key], existing.version >= ticket.version {
+                continue
+            }
+            cache[key] = ticket
+            updated += 1
+        }
+        if cache.count > maxEntries {
+            evictOldest()
+        }
+        return updated
+    }
+
     // MARK: - Persistence
 
     /// Save cache to UserDefaults
