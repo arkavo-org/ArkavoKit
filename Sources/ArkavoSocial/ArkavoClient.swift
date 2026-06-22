@@ -79,6 +79,10 @@ public final class ArkavoClient: NSObject {
     /// advertises `alt-svc: h3=":443"`. URLSession falls back to HTTP/2 when a
     /// server is not h3-capable. Calls stay on `URLSession.shared` so the Apple-link
     /// nonce→link session cookie (HTTPCookieStorage.shared) is replayed unchanged.
+    ///
+    /// Used for every identity REST call site, which spans `identity.arkavo.net`
+    /// (WebAuthn/OAuth) and `xrpc.arkavo.net` (profile fetches). The flag is safe
+    /// on hosts that do not advertise h3: URLSession simply uses HTTP/2.
     private static func http3Data(for request: URLRequest) async throws -> (Data, URLResponse) {
         var request = request
         request.assumesHTTP3Capable = true
@@ -642,18 +646,23 @@ public final class ArkavoClient: NSObject {
 
         completeRequest.httpBody = try JSONSerialization.data(withJSONObject: parameters)
 
+        // Headers/parameters/body carry auth tokens and credentials — debug builds only.
+        #if DEBUG
         print("\n=== Authentication Completion Request ===")
         print("URL: \(completeRequest.url?.absoluteString ?? "none")")
         print("Headers: \(completeRequest.allHTTPHeaderFields ?? [:])")
         print("Parameters: \(parameters)")
+        #endif
 
         let (responseData, completionResponse) = try await Self.http3Data(for: completeRequest)
 
+        #if DEBUG
         print("\nServer Response:")
         print("Status Code: \((completionResponse as? HTTPURLResponse)?.statusCode ?? -1)")
         print("Response Headers: \((completionResponse as? HTTPURLResponse)?.allHeaderFields ?? [:])")
         print("Response Body: \(String(data: responseData, encoding: .utf8) ?? "none")")
         print("=== End Authentication Completion ===\n")
+        #endif
 
         guard let completionHttpResponse = completionResponse as? HTTPURLResponse,
               (200 ... 299).contains(completionHttpResponse.statusCode)

@@ -18,7 +18,7 @@ public struct ArkavoConfiguration: Sendable {
     public let apiURL = URL(string: "https://platform.arkavo.net")!
 
     /// Domains for certificate pinning
-    public let pinnedDomains: Set<String> = ["identity.arkavo.net", "kas.arkavo.net", "app.arkavo.com"]
+    public let pinnedDomains: Set<String> = ["identity.arkavo.net", "platform.arkavo.net", "kas.arkavo.net", "app.arkavo.com"]
 
     private init() { /* Singleton: prevents external instantiation */ }
 
