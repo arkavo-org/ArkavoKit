@@ -72,6 +72,27 @@ public final class ArkavoClient: NSObject {
     private var messageHandlers: [UInt8: CheckedContinuation<Data, Error>] = [:]
     private let profileCache = ProfileCache(capacity: 100)
 
+    /// Performs a request that opts into HTTP/3 on the first hop.
+    ///
+    /// `URLRequest.assumesHTTP3Capable` lets the first request negotiate HTTP/3
+    /// without waiting for an `Alt-Svc` advertisement — `identity.arkavo.net`
+    /// advertises `alt-svc: h3=":443"`. URLSession falls back to HTTP/2 when a
+    /// server is not h3-capable. Calls stay on `URLSession.shared` so the Apple-link
+    /// nonce→link session cookie (HTTPCookieStorage.shared) is replayed unchanged.
+    ///
+    /// Used for every identity REST call site, which spans `identity.arkavo.net`
+    /// (WebAuthn/OAuth) and `xrpc.arkavo.net` (profile fetches). The flag is safe
+    /// on hosts that do not advertise h3: URLSession simply uses HTTP/2.
+    private static func http3Data(for request: URLRequest) async throws -> (Data, URLResponse) {
+        var request = request
+        request.assumesHTTP3Capable = true
+        return try await URLSession.shared.data(for: request)
+    }
+
+    private static func http3Data(from url: URL) async throws -> (Data, URLResponse) {
+        try await http3Data(for: URLRequest(url: url))
+    }
+
     public var currentState: ArkavoClientState = .disconnected {
         didSet {
             delegate?.clientDidChangeState(self, state: currentState)
@@ -280,7 +301,7 @@ public final class ArkavoClient: NSObject {
         request.setValue(token, forHTTPHeaderField: "X-Auth-Token")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await Self.http3Data(for: request)
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw ArkavoError.invalidResponse
@@ -576,7 +597,7 @@ public final class ArkavoClient: NSObject {
             throw ArkavoError.invalidURL
         }
 
-        let (data, response) = try await URLSession.shared.data(from: url)
+        let (data, response) = try await Self.http3Data(from: url)
 
         guard let httpResponse = response as? HTTPURLResponse,
               (200 ... 299).contains(httpResponse.statusCode)
@@ -625,18 +646,23 @@ public final class ArkavoClient: NSObject {
 
         completeRequest.httpBody = try JSONSerialization.data(withJSONObject: parameters)
 
+        // Headers/parameters/body carry auth tokens and credentials — debug builds only.
+        #if DEBUG
         print("\n=== Authentication Completion Request ===")
         print("URL: \(completeRequest.url?.absoluteString ?? "none")")
         print("Headers: \(completeRequest.allHTTPHeaderFields ?? [:])")
         print("Parameters: \(parameters)")
+        #endif
 
-        let (responseData, completionResponse) = try await URLSession.shared.data(for: completeRequest)
+        let (responseData, completionResponse) = try await Self.http3Data(for: completeRequest)
 
+        #if DEBUG
         print("\nServer Response:")
         print("Status Code: \((completionResponse as? HTTPURLResponse)?.statusCode ?? -1)")
         print("Response Headers: \((completionResponse as? HTTPURLResponse)?.allHeaderFields ?? [:])")
         print("Response Body: \(String(data: responseData, encoding: .utf8) ?? "none")")
         print("=== End Authentication Completion ===\n")
+        #endif
 
         guard let completionHttpResponse = completionResponse as? HTTPURLResponse,
               (200 ... 299).contains(completionHttpResponse.statusCode)
@@ -836,7 +862,7 @@ public final class ArkavoClient: NSObject {
             throw ArkavoError.invalidURL
         }
 
-        let (data, response) = try await URLSession.shared.data(from: url)
+        let (data, response) = try await Self.http3Data(from: url)
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw ArkavoError.invalidResponse
@@ -867,7 +893,7 @@ public final class ArkavoClient: NSObject {
             throw ArkavoError.invalidURL
         }
 
-        let (data, response) = try await URLSession.shared.data(from: url)
+        let (data, response) = try await Self.http3Data(from: url)
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw ArkavoError.invalidResponse
@@ -978,7 +1004,7 @@ public final class ArkavoClient: NSObject {
             throw ArkavoError.invalidURL
         }
 
-        let (data, response) = try await URLSession.shared.data(from: url)
+        let (data, response) = try await Self.http3Data(from: url)
 
         guard let httpResponse = response as? HTTPURLResponse,
               (200 ... 299).contains(httpResponse.statusCode)
@@ -1065,7 +1091,7 @@ public final class ArkavoClient: NSObject {
 
         request.httpBody = try JSONSerialization.data(withJSONObject: parameters)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await Self.http3Data(for: request)
 
         guard let httpResponse = response as? HTTPURLResponse,
               let token = httpResponse.allHeaderFields["x-auth-token"] as? String
@@ -1167,7 +1193,7 @@ public final class ArkavoClient: NSObject {
     public func fetchAppleNonce() async throws -> String {
         let url = authURL.appendingPathComponent("oauth/apple/nonce")
         print("ArkavoClient.fetchAppleNonce: GET \(url.absoluteString)")
-        let (data, response) = try await URLSession.shared.data(from: url)
+        let (data, response) = try await Self.http3Data(from: url)
 
         guard let http = response as? HTTPURLResponse else {
             print("ArkavoClient.fetchAppleNonce: non-HTTP response")
@@ -1211,7 +1237,7 @@ public final class ArkavoClient: NSObject {
 
         let (data, response): (Data, URLResponse)
         do {
-            (data, response) = try await URLSession.shared.data(for: request)
+            (data, response) = try await Self.http3Data(for: request)
         } catch {
             print("ArkavoClient.linkAppleIdentity: network error \(error)")
             throw AppleLinkError.networkError(error)
@@ -1301,7 +1327,7 @@ public extension ArkavoClient {
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await Self.http3Data(for: request)
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw ArkavoError.invalidResponse
