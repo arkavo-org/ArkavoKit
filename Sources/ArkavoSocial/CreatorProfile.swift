@@ -32,6 +32,13 @@ public struct CreatorProfile: Codable, Identifiable, Sendable, Hashable {
     public var patronTiers: [PatronTier]
     /// publicIDs of featured content
     public var featuredContentIDs: [Data]
+    /// Published content catalog: tickets for this creator's discoverable
+    /// content, embedded so a cold-start consumer can hydrate the catalog
+    /// from the profile alone (see issue #1). Entries are public metadata
+    /// by design — access is gated at KAS rewrap, not at discovery.
+    /// Optional so profiles published before this field existed keep
+    /// decoding (missing key → nil).
+    public var contentCatalog: [ContentTicket]?
 
     // MARK: - Metadata
 
@@ -63,6 +70,7 @@ public struct CreatorProfile: Codable, Identifiable, Sendable, Hashable {
         streamingSchedule = nil
         patronTiers = []
         featuredContentIDs = []
+        contentCatalog = nil
         createdAt = Date()
         updatedAt = Date()
         version = 1
