@@ -1,6 +1,6 @@
 import XCTest
 import Network
-@testable import ArkavoAgent
+@testable import ArkavoA2A
 
 /// Tests for LocalAIAgent WebSocket server accepting URLSession client connections
 final class LocalAIAgentWebSocketTests: XCTestCase {

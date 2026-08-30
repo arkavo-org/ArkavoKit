@@ -55,7 +55,7 @@ let package = Package(
         .target(
             name: "ArkavoKit",
             dependencies: [
-                "ArkavoAgent",
+                "ArkavoA2A",
                 "ArkavoSocial",
                 "ArkavoContent",
                 "ArkavoMedia",
@@ -64,8 +64,10 @@ let package = Package(
             ],
             swiftSettings: sharedSwiftSettings
         ),
+        // Named ArkavoA2A so the target does not collide with
+        // arkavo-ai/arkavo-agent's ArkavoAgent module (Gemma inference).
         .target(
-            name: "ArkavoAgent",
+            name: "ArkavoA2A",
             dependencies: ["ArkavoSocial"],
             swiftSettings: sharedSwiftSettings
         ),
@@ -103,6 +105,7 @@ let package = Package(
             name: "ArkavoKitTests",
             dependencies: [
                 "ArkavoKit",
+                "ArkavoA2A",
                 "ArkavoRecorder",
                 "ArkavoStreaming",
                 "ArkavoMedia",
