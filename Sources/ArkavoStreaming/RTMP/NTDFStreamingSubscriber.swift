@@ -567,14 +567,7 @@ actor StreamingCollectionDecryptor {
         )
 
         do {
-            // Use OpenTDFKit's KASRewrapClient for proper request/response handling
-            let kasRewrapURL: URL
-            if kasURL.path.hasSuffix("/kas") || kasURL.path.contains("/kas/") {
-                kasRewrapURL = kasURL
-            } else {
-                kasRewrapURL = kasURL.appendingPathComponent("kas")
-            }
-            let kasClient = KASRewrapClient(kasURL: kasRewrapURL, oauthToken: ntdfToken)
+            let kasClient = try KASRewrapClientFactory.make(kasURL: kasURL, oauthToken: ntdfToken)
 
             let (wrappedKey, sessionPublicKey) = try await kasClient.rewrapNanoTDF(
                 header: headerBytes,
@@ -702,16 +695,7 @@ actor StreamingCollectionDecryptor {
         let parser = BinaryParser(data: newHeaderBytes)
         let newHeader = try parser.parseHeader()
 
-        // Perform KAS rewrap for the new header
-        // Note: KASRewrapClient appends "v2/rewrap", so we need "/kas" in the path
-        // Only append "/kas" if it's not already there
-        let kasRewrapURL: URL
-        if kasURL.path.hasSuffix("/kas") || kasURL.path.contains("/kas/") {
-            kasRewrapURL = kasURL
-        } else {
-            kasRewrapURL = kasURL.appendingPathComponent("kas")
-        }
-        let kasClient = KASRewrapClient(kasURL: kasRewrapURL, oauthToken: ntdfToken)
+        let kasClient = try KASRewrapClientFactory.make(kasURL: kasURL, oauthToken: ntdfToken)
         let (wrappedKey, sessionPublicKey) = try await kasClient.rewrapNanoTDF(
             header: newHeaderBytes,
             parsedHeader: newHeader,
