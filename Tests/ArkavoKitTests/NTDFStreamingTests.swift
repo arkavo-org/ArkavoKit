@@ -19,9 +19,10 @@ final class NTDFStreamingTests: XCTestCase {
 
     /// Skips the current test unless something accepts TCP connections at `rtmpURL`.
     ///
-    /// `RTMPPublisher.connect` never resumes while `NWConnection` sits in
-    /// `.waiting(Connection refused)`, so a test that dials an absent local RTMP
-    /// server hangs forever instead of failing. Probe first and skip cleanly.
+    /// The full-flow test needs a real RTMP server to talk to. Without one,
+    /// `RTMPPublisher.connect` now fails with `connectionTimedOut` after its
+    /// connect timeout rather than hanging, but that is still a failure, not a
+    /// meaningful result, so probe first and skip cleanly.
     private func skipUnlessRTMPServerIsListening() throws {
         guard let url = URL(string: rtmpURL), let host = url.host, let port = url.port,
               let nwPort = NWEndpoint.Port(rawValue: UInt16(port)) else {
