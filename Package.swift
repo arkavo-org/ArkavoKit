@@ -1,4 +1,4 @@
-// swift-tools-version:6.3
+// swift-tools-version:6.4
 import PackageDescription
 
 // Shared Swift settings for all targets - enables unused code warnings
@@ -13,7 +13,7 @@ let package = Package(
     name: "ArkavoKit",
     platforms: [
         .iOS(.v26),
-        .macOS(.v26)
+        .macOS(.v27)
     ],
     products: [
         .library(
@@ -47,9 +47,9 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/arkavo-org/OpenTDFKit", from: "4.0.1"),
-        .package(url: "https://github.com/arkavo-org/iroh-swift", from: "0.2.5"),
-        .package(url: "https://github.com/weichsel/ZIPFoundation", from: "0.9.19"),
-        .package(url: "https://github.com/arkavo-org/ArkavoMediaKit", from: "0.1.0")
+        .package(url: "https://github.com/arkavo-org/iroh-swift", from: "0.5.0"),
+        .package(url: "https://github.com/weichsel/ZIPFoundation", from: "0.9.20"),
+        .package(url: "https://github.com/arkavo-org/ArkavoMediaKit", from: "0.1.2")
     ],
     targets: [
         .target(

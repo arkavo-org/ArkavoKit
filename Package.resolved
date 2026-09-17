@@ -1,13 +1,13 @@
 {
-  "originHash" : "8934048db8886691b98f917ff8340b501aeeb90c527a00c45861c779ab5662bd",
+  "originHash" : "db2d33ce2ae5df2577aa07d3e22d00b773a85957f70a6e3a75b7421d58e906d2",
   "pins" : [
     {
       "identity" : "arkavomediakit",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/arkavo-org/ArkavoMediaKit",
       "state" : {
-        "revision" : "5abc03d923ada26cffe6c3344f88c3f49006b8b5",
-        "version" : "0.1.0"
+        "revision" : "e945588cde271a398d3242e96d1927884a7230f6",
+        "version" : "0.1.2"
       }
     },
     {
@@ -15,8 +15,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/krzyzanowskim/CryptoSwift",
       "state" : {
-        "revision" : "e45a26384239e028ec87fbcc788f513b67e10d8f",
-        "version" : "1.9.0"
+        "revision" : "f2a627b84c1ff96f21ac2fcb623ab36142dd5512",
+        "version" : "1.10.0"
       }
     },
     {
@@ -24,8 +24,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/arkavo-org/iroh-swift",
       "state" : {
-        "revision" : "4b3632cba5de6cb47d6c185ac9e569f1e271bd7c",
-        "version" : "0.3.0"
+        "revision" : "c1624b0d5823e548506134996030b633c9c12ca4",
+        "version" : "0.5.0"
       }
     },
     {
