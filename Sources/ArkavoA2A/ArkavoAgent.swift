@@ -1,6 +1,9 @@
 import Foundation
 
-/// ArkavoAgent - Swift library for A2A (Agent-to-Agent) protocol communication
+/// ArkavoA2A — A2A (Agent-to-Agent) protocol client used by ArkavoKit.
+///
+/// Module is named `ArkavoA2A` so it does not collide with
+/// `arkavo-ai/arkavo-agent`'s `ArkavoAgent` inference library.
 ///
 /// This library provides:
 /// - mDNS service discovery for local network agents

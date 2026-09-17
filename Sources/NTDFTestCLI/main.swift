@@ -491,9 +491,8 @@ extension NTDFTestCLI {
         let parser = BinaryParser(data: headerBytes)
         let parsedHeader = try parser.parseHeader()
 
-        // Do KAS rewrap (note: KASRewrapClient appends v2/rewrap, so we need /kas in the URL)
         let kasRewrapURL = URL(string: "https://100.arkavo.net/kas")!
-        let kasClient = KASRewrapClient(kasURL: kasRewrapURL, oauthToken: ntdfToken)
+        let kasClient = try KASRewrapClientFactory.make(kasURL: kasRewrapURL, oauthToken: ntdfToken)
         let (wrappedKey, sessionPublicKey) = try await kasClient.rewrapNanoTDF(
             header: headerBytes,
             parsedHeader: parsedHeader,
