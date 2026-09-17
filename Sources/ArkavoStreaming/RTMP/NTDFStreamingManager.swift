@@ -61,7 +61,7 @@ public actor NTDFStreamingManager {
     public var currentState: State { state }
 
     /// Initialize with KAS URL
-    /// - Parameter kasURL: The KAS server URL (e.g., https://100.arkavo.net)
+    /// - Parameter kasURL: The KAS server URL (e.g., https://platform.arkavo.net)
     public init(kasURL: URL) {
         self.kasService = KASPublicKeyService(kasURL: kasURL)
         self.rtmpPublisher = RTMPPublisher()
@@ -128,7 +128,7 @@ public actor NTDFStreamingManager {
 
     /// Connect to RTMP server and send metadata with ntdf_header
     /// - Parameters:
-    ///   - rtmpURL: RTMP server URL (e.g., rtmp://100.arkavo.net:1935)
+    ///   - rtmpURL: RTMP server URL (e.g., rtmp://platform.arkavo.net:1935)
     ///   - streamKey: Stream key (e.g., live/test)
     ///   - width: Video width in pixels
     ///   - height: Video height in pixels

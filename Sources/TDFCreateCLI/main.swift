@@ -13,12 +13,12 @@ import OpenTDFKit
 ///
 /// Examples:
 ///   tdf-create video.mov
-///   tdf-create video.mov --kas-url https://100.arkavo.net
+///   tdf-create video.mov --kas-url https://platform.arkavo.net
 ///   tdf-create video.mov --output protected.tdf
 
 @main
 struct TDFCreateCLI {
-    static let defaultKASURL = URL(string: "https://100.arkavo.net")!
+    static let defaultKASURL = URL(string: "https://platform.arkavo.net")!
 
     static func main() async {
         // Unbuffered output
@@ -363,7 +363,7 @@ struct TDFCreateCLI {
           tdf-create <input-file> [options]
 
         Options:
-          --kas-url URL     KAS server URL (default: https://100.arkavo.net)
+          --kas-url URL     KAS server URL (default: https://platform.arkavo.net)
           --output, -o FILE Output TDF file path (default: <input>.tdf)
           --hls             Package video as HLS for FairPlay DRM playback
           --no-publish      Don't publish to Iroh, only create local TDF file

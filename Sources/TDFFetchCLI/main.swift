@@ -16,7 +16,7 @@ import IrohSwift
 
 @main
 struct TDFFetchCLI {
-    static let defaultServerURL = URL(string: "https://100.arkavo.net")!
+    static let defaultServerURL = URL(string: "https://platform.arkavo.net")!
 
     static func main() async {
         // Unbuffered output
@@ -255,7 +255,7 @@ struct TDFFetchCLI {
 
         Options:
           --output, -o FILE  Save TDF archive to file
-          --server-url URL   Server URL for key validation (default: https://100.arkavo.net)
+          --server-url URL   Server URL for key validation (default: https://platform.arkavo.net)
           --validate-key     Validate FairPlay certificate and manifest format
           --payload          Treat ticket as direct payload ticket (not descriptor)
           --help, -h         Show this help message

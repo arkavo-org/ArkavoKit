@@ -11,7 +11,7 @@ public actor TDFProtectionService {
     private let kasURL: URL
 
     /// Initialize with KAS URL for key fetching
-    /// - Parameter kasURL: KAS server URL (e.g., https://100.arkavo.net)
+    /// - Parameter kasURL: KAS server URL (e.g., https://platform.arkavo.net)
     public init(kasURL: URL) {
         self.kasURL = kasURL
     }

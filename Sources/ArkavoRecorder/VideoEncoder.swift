@@ -971,8 +971,8 @@ public actor VideoEncoder {
 
     /// Start NTDF-encrypted streaming to Arkavo
     /// - Parameters:
-    ///   - kasURL: KAS URL for key access (e.g., https://100.arkavo.net)
-    ///   - rtmpURL: RTMP server URL (e.g., rtmp://100.arkavo.net:1935)
+    ///   - kasURL: KAS URL for key access (e.g., https://platform.arkavo.net)
+    ///   - rtmpURL: RTMP server URL (e.g., rtmp://platform.arkavo.net:1935)
     ///   - streamKey: Stream key (e.g., live/test)
     public func startNTDFStreaming(kasURL: URL, rtmpURL: String, streamKey: String) async throws {
         guard !isNTDFStreaming else {

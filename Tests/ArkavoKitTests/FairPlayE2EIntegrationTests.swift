@@ -4,14 +4,14 @@ import Testing
 @testable import ArkavoSocial
 @testable import ArkavoMediaKit
 
-/// End-to-end integration tests for FairPlay with the production server (https://100.arkavo.net)
+/// End-to-end integration tests for FairPlay with the production server (https://platform.arkavo.net)
 /// These tests verify the complete pipeline from content encryption through key delivery
 @Suite("FairPlay E2E Integration Tests")
 struct FairPlayE2EIntegrationTests {
 
     // MARK: - Configuration
 
-    let serverURL = URL(string: "https://100.arkavo.net")!
+    let serverURL = URL(string: "https://platform.arkavo.net")!
 
     // Test fixtures
     let testSPS = Data([0x67, 0x64, 0x00, 0x1F, 0xAC, 0xD9, 0x40, 0x50,
@@ -24,7 +24,7 @@ struct FairPlayE2EIntegrationTests {
 
     @Test("Server: KAS public key endpoint accessible")
     func kasPublicKeyEndpoint() async throws {
-        let url = URL(string: "https://100.arkavo.net/kas/v2/kas_public_key?algorithm=rsa:2048")!
+        let url = URL(string: "https://platform.arkavo.net/kas/v2/kas_public_key?algorithm=rsa:2048")!
         let (data, response) = try await URLSession.shared.data(from: url)
 
         guard let http = response as? HTTPURLResponse else {

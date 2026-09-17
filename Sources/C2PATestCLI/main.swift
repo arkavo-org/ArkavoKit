@@ -9,10 +9,10 @@ import Foundation
 ///
 /// Examples:
 ///   c2pa-test tests/data/logo.png tests/data/cert.pem tests/data/private.pem
-///   c2pa-test tests/data/logo.png tests/data/cert.pem tests/data/private.pem --server https://100.arkavo.net
+///   c2pa-test tests/data/logo.png tests/data/cert.pem tests/data/private.pem --server https://platform.arkavo.net
 @main
 struct C2PATestCLI {
-    static let defaultServerURL = URL(string: "https://100.arkavo.net")!
+    static let defaultServerURL = URL(string: "https://platform.arkavo.net")!
 
     static func main() async {
         setbuf(stdout, nil)
@@ -306,11 +306,11 @@ struct C2PATestCLI {
           c2pa-test <logo.png> <cert.pem> <key.pem> [--server URL]
 
         Options:
-          --server URL    C2PA server URL (default: https://100.arkavo.net)
+          --server URL    C2PA server URL (default: https://platform.arkavo.net)
 
         Examples:
           c2pa-test logo.png cert.pem private.pem
-          c2pa-test logo.png cert.pem private.pem --server https://100.arkavo.net
+          c2pa-test logo.png cert.pem private.pem --server https://platform.arkavo.net
         """)
     }
 
