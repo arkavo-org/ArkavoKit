@@ -16,9 +16,9 @@ struct NTDFTestCLI {
         setbuf(stdout, nil)
         setbuf(stderr, nil)
     }
-    static let kasURL = URL(string: "https://100.arkavo.net")!
+    static let kasURL = URL(string: "https://platform.arkavo.net")!
     static let rtmpURL = "rtmp://localhost:1935"
-    static let remoteRtmpURL = "rtmp://100.arkavo.net:1935"
+    static let remoteRtmpURL = "rtmp://platform.arkavo.net:1935"
     static let remoteStreamName = "live/creator"
 
     static func main() async {
@@ -491,7 +491,7 @@ extension NTDFTestCLI {
         let parser = BinaryParser(data: headerBytes)
         let parsedHeader = try parser.parseHeader()
 
-        let kasRewrapURL = URL(string: "https://100.arkavo.net/kas")!
+        let kasRewrapURL = URL(string: "https://platform.arkavo.net/kas")!
         let kasClient = try KASRewrapClientFactory.make(kasURL: kasRewrapURL, oauthToken: ntdfToken)
         let (wrappedKey, sessionPublicKey) = try await kasClient.rewrapNanoTDF(
             header: headerBytes,

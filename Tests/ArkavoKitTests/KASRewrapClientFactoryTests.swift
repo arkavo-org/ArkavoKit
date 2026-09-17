@@ -27,8 +27,8 @@ final class KASRewrapClientFactoryTests: XCTestCase {
     }
 
     func testConfigurationFromKasSuffixedURLMatchesOldAppendRewrap() {
-        let url = URL(string: "https://100.arkavo.net/kas")!
+        let url = URL(string: "https://platform.arkavo.net/kas")!
         let cfg = KASRewrapClientFactory.configuration(for: url)
-        XCTAssertEqual(cfg.kas?.rewrapURL, "https://100.arkavo.net/kas/v2/rewrap")
+        XCTAssertEqual(cfg.kas?.rewrapURL, "https://platform.arkavo.net/kas/v2/rewrap")
     }
 }

@@ -6,12 +6,12 @@ import OpenTDFKit
 @testable import ArkavoMedia
 
 /// Integration tests for NTDF-RTMP streaming
-/// Tests against production server at 100.arkavo.net
+/// Tests against production server at platform.arkavo.net
 final class NTDFStreamingTests: XCTestCase {
 
     // MARK: - Test Configuration
 
-    let kasURL = URL(string: "https://100.arkavo.net")!
+    let kasURL = URL(string: "https://platform.arkavo.net")!
     let rtmpURL = "rtmp://localhost:1935"
     let testStreamKey = "live/test-ntdf-\(UUID().uuidString.prefix(8))"
 
