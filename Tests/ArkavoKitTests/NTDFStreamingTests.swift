@@ -1,6 +1,8 @@
 import XCTest
 import Foundation
 import CoreMedia
+import Network
+import os
 import OpenTDFKit
 @testable import ArkavoStreaming
 @testable import ArkavoMedia
@@ -14,6 +16,45 @@ final class NTDFStreamingTests: XCTestCase {
     let kasURL = URL(string: "https://platform.arkavo.net")!
     let rtmpURL = "rtmp://localhost:1935"
     let testStreamKey = "live/test-ntdf-\(UUID().uuidString.prefix(8))"
+
+    /// Skips the current test unless something accepts TCP connections at `rtmpURL`.
+    ///
+    /// `RTMPPublisher.connect` never resumes while `NWConnection` sits in
+    /// `.waiting(Connection refused)`, so a test that dials an absent local RTMP
+    /// server hangs forever instead of failing. Probe first and skip cleanly.
+    private func skipUnlessRTMPServerIsListening() throws {
+        guard let url = URL(string: rtmpURL), let host = url.host, let port = url.port,
+              let nwPort = NWEndpoint.Port(rawValue: UInt16(port)) else {
+            XCTFail("Malformed rtmpURL: \(rtmpURL)")
+            return
+        }
+        guard Self.isTCPListening(host: host, port: nwPort, timeout: 2) else {
+            throw XCTSkip("no RTMP server on \(host):\(port)")
+        }
+    }
+
+    /// Bounded TCP reachability probe: true only if the connection reaches `.ready`
+    /// within `timeout`. Refused, unreachable, or timed-out all yield false.
+    private static func isTCPListening(host: String, port: NWEndpoint.Port, timeout: TimeInterval) -> Bool {
+        let connection = NWConnection(host: NWEndpoint.Host(host), port: port, using: .tcp)
+        let settled = DispatchSemaphore(value: 0)
+        let reachable = OSAllocatedUnfairLock(initialState: false)
+        connection.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                reachable.withLock { $0 = true }
+                settled.signal()
+            case .failed, .waiting, .cancelled:
+                settled.signal()
+            default:
+                break
+            }
+        }
+        connection.start(queue: .global(qos: .utility))
+        _ = settled.wait(timeout: .now() + timeout)
+        connection.cancel()
+        return reachable.withLock { $0 }
+    }
 
     // MARK: - KAS Public Key Tests
 
@@ -111,6 +152,8 @@ final class NTDFStreamingTests: XCTestCase {
     // MARK: - Full Streaming Flow Test
 
     func testFullStreamingFlow() async throws {
+        try skipUnlessRTMPServerIsListening()
+
         let manager = NTDFStreamingManager(kasURL: kasURL)
 
         // Initialize
