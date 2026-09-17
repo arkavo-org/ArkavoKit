@@ -36,6 +36,10 @@ public actor RTMPPublisher {
     public enum RTMPError: Error, LocalizedError {
         case invalidURL
         case connectionFailed(String)
+        /// The TCP connection did not become ready within `connectTimeout`.
+        /// `lastError` is the most recent error `NWConnection` reported while
+        /// `.waiting` (e.g. ECONNREFUSED), if it reported one.
+        case connectionTimedOut(seconds: TimeInterval, lastError: NWError?)
         case handshakeFailed
         case publishFailed(String)
         case notConnected
@@ -46,6 +50,12 @@ public actor RTMPPublisher {
                 return "Invalid RTMP URL"
             case .connectionFailed(let reason):
                 return "Connection failed: \(reason)"
+            case .connectionTimedOut(let seconds, let lastError):
+                let base = "Connection timed out after \(Int(seconds))s"
+                if let lastError {
+                    return "\(base) (last error: \(lastError))"
+                }
+                return base
             case .handshakeFailed:
                 return "RTMP handshake failed"
             case .publishFailed(let reason):
@@ -71,7 +81,18 @@ public actor RTMPPublisher {
     private var connection: NWConnection?
     private var state: State = .disconnected
     private var isHandshakeComplete = false
-    private var connectionContinuationResumed = false
+
+    /// How long `connect(to:streamKey:)` waits for the TCP connection to become
+    /// ready before giving up. `NWConnection` reports refused/unreachable hosts
+    /// as `.waiting(error)` and retries indefinitely, so this bounds the wait.
+    public let connectTimeout: TimeInterval
+
+    // Pending `connect` continuation. Held on the actor so every path that can
+    // settle the connect (.ready, .failed, .cancelled, timeout, disconnect)
+    // goes through `finishConnect`, which resumes it exactly once.
+    private var connectContinuation: CheckedContinuation<Void, Error>?
+    private var connectTimeoutTask: Task<Void, Never>?
+    private var lastWaitingError: NWError?
 
     // Stream configuration
     private var destination: Destination?
@@ -162,11 +183,23 @@ public actor RTMPPublisher {
 
     // MARK: - Initialization
 
-    public init() { /* Uses default property values */ }
+    /// - Parameter connectTimeout: Upper bound on how long `connect(to:streamKey:)`
+    ///   waits for the TCP connection to become ready. Defaults to 10 seconds.
+    public init(connectTimeout: TimeInterval = 10) {
+        self.connectTimeout = connectTimeout
+    }
 
     // MARK: - Public Methods
 
-    /// Connect to RTMP server and start publishing
+    /// Connect to RTMP server and start publishing.
+    ///
+    /// Returns once the TCP connection is up, the RTMP handshake is done and the
+    /// `connect`/`createStream`/`publish` exchange has completed. Throws
+    /// `RTMPError.connectionTimedOut` if the TCP connection has not become ready
+    /// within `connectTimeout` — for example when the host refuses the connection
+    /// (`NWConnection` keeps retrying in `.waiting` rather than failing) or is
+    /// unreachable — and `RTMPError.connectionFailed` if the connection fails
+    /// outright or is cancelled via `disconnect()`.
     public func connect(to destination: Destination, streamKey: String) async throws {
         self.destination = destination
         self.streamKey = streamKey
@@ -185,20 +218,34 @@ public actor RTMPPublisher {
         let host = NWEndpoint.Host(url.host)
         let port = NWEndpoint.Port(integerLiteral: UInt16(url.port))
 
-        connection = NWConnection(host: host, port: port, using: .tcp)
+        let newConnection = NWConnection(host: host, port: port, using: .tcp)
+        connection = newConnection
 
         state = .connecting
-        connectionContinuationResumed = false
+        lastWaitingError = nil
 
-        // Start connection
+        // Start connection. The continuation is settled exactly once by
+        // `finishConnect`, from whichever of these fires first: the connection
+        // reaching .ready / .failed / .cancelled, or the connect timeout.
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            connection?.stateUpdateHandler = { [weak self] newState in
+            connectContinuation = continuation
+
+            // Capture the connection so a late callback from a previous
+            // NWConnection can't settle a newer connect attempt.
+            newConnection.stateUpdateHandler = { [weak self, weak newConnection] newState in
                 Task { [weak self] in
-                    await self?.handleConnectionState(newState, continuation: continuation)
+                    await self?.handleConnectionState(newState, from: newConnection)
                 }
             }
 
-            connection?.start(queue: .global(qos: .userInitiated))
+            let timeout = connectTimeout
+            connectTimeoutTask = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(timeout))
+                guard !Task.isCancelled else { return }
+                await self?.connectTimedOut(host: url.host, port: url.port)
+            }
+
+            newConnection.start(queue: .global(qos: .userInitiated))
         }
 
         // Perform RTMP handshake
@@ -476,6 +523,10 @@ public actor RTMPPublisher {
             serverMessageTask = nil
         }
 
+        // If a connect is still pending, fail it before tearing the socket down
+        // so the awaiting caller returns instead of hanging.
+        finishConnect(.failure(RTMPError.connectionFailed("Cancelled")))
+
         // Close connection gracefully
         if let connection = connection {
             connection.cancel()
@@ -513,10 +564,41 @@ public actor RTMPPublisher {
         return RTMPURL(host: host, port: port, app: app)
     }
 
-    private func handleConnectionState(_ newState: NWConnection.State, continuation: CheckedContinuation<Void, Error>) {
-        // Only resume the continuation once
-        guard !connectionContinuationResumed else {
-            print("⚠️ Connection state changed to \(newState) but continuation already resumed")
+    /// Resumes the pending `connect` continuation exactly once and stops the
+    /// connect timeout. Later calls (a `.cancelled` callback after the timeout
+    /// already fired, a `.failed` after `disconnect()`, ...) are no-ops.
+    private func finishConnect(_ result: Result<Void, Error>) {
+        connectTimeoutTask?.cancel()
+        connectTimeoutTask = nil
+
+        guard let continuation = connectContinuation else { return }
+        connectContinuation = nil
+        continuation.resume(with: result)
+    }
+
+    /// Fired by the connect timeout task when the TCP connection has not become
+    /// ready within `connectTimeout`.
+    private func connectTimedOut(host: String, port: Int) {
+        guard connectContinuation != nil else { return }
+
+        let error = RTMPError.connectionTimedOut(seconds: connectTimeout, lastError: lastWaitingError)
+        print("❌ Connection to \(host):\(port) timed out after \(Int(connectTimeout))s (last error: \(lastWaitingError.map { "\($0)" } ?? "none"))")
+        state = .error(error.localizedDescription)
+
+        // Cancel the socket so NWConnection stops retrying. The resulting
+        // .cancelled callback is ignored: the continuation is already gone and
+        // `connection` no longer matches.
+        connection?.cancel()
+        connection = nil
+
+        finishConnect(.failure(error))
+    }
+
+    private func handleConnectionState(_ newState: NWConnection.State, from source: NWConnection?) {
+        // Ignore callbacks from a connection this publisher no longer owns
+        // (cancelled by the timeout, replaced by a newer connect, or torn down).
+        guard let source, source === connection else {
+            print("⚠️ Ignoring state \(newState) from a stale connection")
             return
         }
 
@@ -524,20 +606,26 @@ public actor RTMPPublisher {
         case .ready:
             print("✅ TCP connection established")
             state = .connected
-            connectionContinuationResumed = true
-            continuation.resume()
+            finishConnect(.success(()))
         case .failed(let error):
-            print("❌ Connection failed: \(error)")
-            let errorMsg = error.localizedDescription
+            // "\(error)" gives e.g. "POSIXErrorCode(rawValue: 61): Connection refused";
+            // NWError is not LocalizedError, so localizedDescription is generic.
+            let errorMsg = "\(error)"
+            print("❌ Connection failed: \(errorMsg)")
+            // As before, a failure after connect has settled is only logged;
+            // the publish methods surface it via their own connection checks.
+            guard connectContinuation != nil else { return }
             state = .error(errorMsg)
-            connectionContinuationResumed = true
-            continuation.resume(throwing: RTMPError.connectionFailed(errorMsg))
+            finishConnect(.failure(RTMPError.connectionFailed(errorMsg)))
         case .waiting(let error):
+            // NWConnection stays here and retries on ECONNREFUSED / no route.
+            // Remember the error so the connect timeout can report it.
             print("⏳ Connection waiting: \(error)")
+            lastWaitingError = error
         case .cancelled:
             print("🚫 Connection cancelled")
-            connectionContinuationResumed = true
-            continuation.resume(throwing: RTMPError.connectionFailed("Cancelled"))
+            guard connectContinuation != nil else { return }
+            finishConnect(.failure(RTMPError.connectionFailed("Cancelled")))
         default:
             break
         }
