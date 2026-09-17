@@ -9,6 +9,9 @@ public enum RecorderError: Error, Sendable {
     case recordingFailed
     case encodingFailed
     case permissionDenied
+    /// Every requested camera failed to start; per-source details were delivered through
+    /// `RecordingSession.cameraStartFailureHandler`.
+    case allCameraSourcesFailed
 }
 
 extension RecorderError: LocalizedError {
@@ -30,6 +33,8 @@ extension RecorderError: LocalizedError {
             return "Video encoding failed. The video file may be corrupted or the recording session was not properly initialized"
         case .permissionDenied:
             return "Required permissions were denied"
+        case .allCameraSourcesFailed:
+            return "No camera could be started"
         }
     }
 }
