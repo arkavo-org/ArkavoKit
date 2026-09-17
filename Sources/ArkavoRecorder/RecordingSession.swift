@@ -199,6 +199,11 @@ public final class RecordingSession: Sendable {
     public var cameraLayoutStrategy: MultiCameraLayout = .pictureInPicture
     public var metadataHandler: (@Sendable (CameraMetadataEvent) -> Void)?
     public var previewHandler: (@Sendable (CameraPreviewEvent) -> Void)?
+    /// Invoked once per camera source that fails to start (device missing, in use by another
+    /// app, not authorized, ...). Called on the main actor from `startCameraPreview(for:)`.
+    /// When every requested source fails, `startCameraPreview(for:)` additionally throws
+    /// `RecorderError.allCameraSourcesFailed`.
+    public var cameraStartFailureHandler: (@Sendable (CameraStartFailure) -> Void)?
     nonisolated(unsafe) public var screenPreviewHandler: (@Sendable (CGImage) -> Void)?
     public var remoteSourcesHandler: (@Sendable ([String]) -> Void)?
     /// Handler for monitor frames - receives the final composed frame before encoding
@@ -652,6 +657,10 @@ public final class RecordingSession: Sendable {
     }
 
     /// Starts camera capture purely for preview purposes (no recording).
+    ///
+    /// Each source that fails to start is reported through `cameraStartFailureHandler`.
+    /// Throws `RecorderError.allCameraSourcesFailed` when none of the requested sources
+    /// is running afterwards; if at least one is, this returns normally.
     public func startCameraPreview(for identifiers: [String]) throws {
         cameraSourceIdentifiers = Array(identifiers.prefix(MultiCameraLayout.maxSupportedSources))
         enableCamera = true
@@ -807,6 +816,7 @@ public final class RecordingSession: Sendable {
         }
 
         // Start only new cameras
+        var failures: [CameraStartFailure] = []
         for identifier in toStart {
             let manager = CameraManager()
             manager.onFrame = { [weak self] buffer in
@@ -816,12 +826,27 @@ public final class RecordingSession: Sendable {
                     self.dispatchPreview(for: identifier, buffer: buffer)
                 }
             }
-            cameraCaptures[identifier] = manager
             do {
                 try manager.startCapture(with: identifier)
+                cameraCaptures[identifier] = manager
             } catch {
-                print("⚠️ Failed to start camera \(identifier): \(error)")
+                // Don't keep a dead manager around: getCameraPreview() would hand out a
+                // non-running session and the next start would skip it as "unchanged".
+                manager.stopCapture()
+                let failure = CameraStartFailure(sourceID: identifier, error: error)
+                print("⚠️ [RecordingSession] Failed to start camera \(identifier): \(failure.message) (\(error))")
+                failures.append(failure)
             }
+        }
+
+        for failure in failures {
+            cameraStartFailureHandler?(failure)
+        }
+
+        // Cameras that were already running count as success, so check the requested set.
+        let anyRunning = requestedIDs.contains { cameraCaptures[$0] != nil }
+        if !failures.isEmpty && !anyRunning {
+            throw RecorderError.allCameraSourcesFailed
         }
     }
 
@@ -993,4 +1018,58 @@ public struct CameraPreviewEvent: Sendable {
         self.sourceID = sourceID
         self.image = image
     }
+}
+
+/// Describes a camera source that could not be started.
+public struct CameraStartFailure: Sendable {
+    /// The camera identifier that was requested (an `AVCaptureDevice.uniqueID`).
+    public let sourceID: String
+    /// The underlying error thrown by `CameraManager.startCapture(with:)`.
+    public let error: any Error
+    /// A short, user-facing explanation derived from `error`.
+    public let message: String
+
+    public init(sourceID: String, error: any Error) {
+        self.sourceID = sourceID
+        self.error = error
+        self.message = Self.message(for: error)
+    }
+
+    /// Maps a camera start error to a user-facing message. Distinguishes not authorized,
+    /// device unavailable/not found, in use / cannot add input; everything else falls back
+    /// to the error's own description.
+    public static func message(for error: any Error) -> String {
+        if let recorderError = error as? RecorderError {
+            switch recorderError {
+            case .permissionDenied:
+                return notAuthorizedMessage
+            case .cameraUnavailable:
+                return unavailableMessage
+            case .cannotAddInput:
+                return inUseMessage
+            default:
+                break
+            }
+        }
+
+        let nsError = error as NSError
+        if nsError.domain == AVFoundationErrorDomain {
+            switch AVError.Code(rawValue: nsError.code) {
+            case .applicationIsNotAuthorizedToUseDevice:
+                return notAuthorizedMessage
+            case .deviceNotConnected:
+                return unavailableMessage
+            case .deviceInUseByAnotherApplication, .deviceAlreadyUsedByAnotherSession:
+                return inUseMessage
+            default:
+                break
+            }
+        }
+
+        return "Camera could not be started: \(error.localizedDescription)"
+    }
+
+    private static let notAuthorizedMessage = "Camera access is not authorized. Allow camera access in System Settings > Privacy & Security > Camera."
+    private static let unavailableMessage = "Camera is unavailable. It may be disconnected or no longer present."
+    private static let inUseMessage = "Camera is in use by another app or could not be added to the capture session."
 }
