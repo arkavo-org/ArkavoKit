@@ -323,8 +323,8 @@ public actor PatreonClient: ObservableObject {
         }
     }
 
-    private func patronStatus(from status: String) -> Patron.PatronStatus {
-        switch status.lowercased() {
+    private func patronStatus(from status: String?) -> Patron.PatronStatus {
+        switch status?.lowercased() {
         case "active_patron": .active
         case "declined_patron", "former_patron": .inactive
         default: .new
@@ -1317,7 +1317,8 @@ extension PatreonClient {
             let fullName: String
             let lastChargeDate: String?
             let lifetimeSupportCents: Int
-            let patronStatus: String
+            /// Patreon sends `null` for members who never completed a pledge.
+            let patronStatus: String?
 
             enum CodingKeys: String, CodingKey {
                 case currentlyEntitledAmountCents = "currently_entitled_amount_cents"
