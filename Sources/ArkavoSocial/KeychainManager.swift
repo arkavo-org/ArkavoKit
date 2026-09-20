@@ -311,10 +311,12 @@ public class KeychainManager {
     // MARK: - App Attest key ID (shared across all Arkavo apps)
     //
     // DCAppAttestService mints a key once and it cannot be regenerated —
-    // attesting it a second time fails. This is stored under the same
-    // service as the auth token so the existing device-check/assert
-    // (login) flow reuses the exact key App Attest generated at
-    // registration instead of minting a fresh one per launch.
+    // attesting it a second time fails. The key_id is stored under the
+    // same service as the auth token so that any Arkavo app on the device
+    // can reuse the exact key App Attest generated at registration rather
+    // than mint a fresh one. No caller reads it back yet: the server
+    // exposes device-check/assert-challenge/:username and
+    // device-check/assert, but no client-side assertion flow exists.
 
     public static func saveDeviceAttestKeyID(_ keyID: String) throws {
         try save(keyID.data(using: .utf8)!,

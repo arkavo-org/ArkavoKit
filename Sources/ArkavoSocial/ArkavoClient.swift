@@ -1169,10 +1169,13 @@ public final class ArkavoClient: NSObject {
     //      session cookie the ticket will live in)
     //   2. Generate + attest a key locally (AppAttestPreflight)
     //   3. POST device-check/register-attest with the attestation
-    // On success the generated key_id is stashed in the Keychain so the
-    // existing device-check/assert (login) flow reuses the same key
-    // instead of minting a fresh one — App Attest keys are minted once
-    // and cannot be re-attested.
+    // On success the generated key_id is stashed in the Keychain because
+    // App Attest keys are minted once and cannot be re-attested: a later
+    // sign-in that asserts this device has to reuse this exact key rather
+    // than mint a fresh one. Nothing reads it back yet — the server
+    // exposes `device-check/assert-challenge/:username` and
+    // `device-check/assert`, but no client-side assertion flow calls
+    // them, so for now this persist only preserves the option.
     //
     // Like the Apple-link flow above, these calls stay on `Self.http3Data`
     // (URLSession.shared) so the session cookie set by step 1 is replayed
