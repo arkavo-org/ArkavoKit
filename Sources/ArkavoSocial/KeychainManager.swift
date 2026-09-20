@@ -307,6 +307,33 @@ public class KeychainManager {
                    account: "authentication_token",
                    accessGroup: sharedAccessGroup)
     }
+
+    // MARK: - App Attest key ID (shared across all Arkavo apps)
+    //
+    // DCAppAttestService mints a key once and it cannot be regenerated —
+    // attesting it a second time fails. This is stored under the same
+    // service as the auth token so the existing device-check/assert
+    // (login) flow reuses the exact key App Attest generated at
+    // registration instead of minting a fresh one per launch.
+
+    public static func saveDeviceAttestKeyID(_ keyID: String) throws {
+        try save(keyID.data(using: .utf8)!,
+                 service: "com.arkavo.webauthn",
+                 account: "device_attest_key_id",
+                 accessGroup: sharedAccessGroup)
+    }
+
+    public static func getDeviceAttestKeyID() -> String? {
+        getValue(service: "com.arkavo.webauthn",
+                  account: "device_attest_key_id",
+                  accessGroup: sharedAccessGroup)
+    }
+
+    public static func deleteDeviceAttestKeyID() {
+        try? delete(service: "com.arkavo.webauthn",
+                   account: "device_attest_key_id",
+                   accessGroup: sharedAccessGroup)
+    }
 }
 
 public extension KeychainManager {

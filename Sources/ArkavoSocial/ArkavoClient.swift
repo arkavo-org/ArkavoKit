@@ -917,6 +917,37 @@ public final class ArkavoClient: NSObject {
     /// Register a new user with WebAuthn
     public func registerUser(handle: String, did: String) async throws -> String {
         print("Initiating user registration with handle: \(handle)")
+
+        // Admission control: the server refuses registration without a
+        // ticket issued against a verified App Attest attestation.
+        try await performAttestationPreflight()
+
+        do {
+            return try await performRegistrationCeremony(handle: handle, did: did)
+        } catch is RegistrationTicketExpired {
+            // The App Attest ticket lives in the session and can expire
+            // between attest and finish. Re-attest once and repeat the
+            // *entire* ceremony (fresh options, fresh challenge) rather
+            // than reusing state from the expired attempt — a second
+            // expiry surfaces to the caller instead of retrying forever.
+            print("Registration ticket expired between attest and finish; retrying the ceremony once")
+            try await performAttestationPreflight()
+            do {
+                return try await performRegistrationCeremony(handle: handle, did: did)
+            } catch {
+                throw Self.mapDuplicatePasskeyError(error, relyingPartyID: relyingPartyID)
+            }
+        } catch {
+            throw Self.mapDuplicatePasskeyError(error, relyingPartyID: relyingPartyID)
+        }
+    }
+
+    /// The full WebAuthn registration ceremony: fetch options, create the
+    /// platform credential, and finish with the server. Pulled out of
+    /// `registerUser` so the ticket-expiry retry re-runs the whole thing —
+    /// including a fresh challenge — instead of replaying a credential
+    /// request built against options tied to the expired ticket.
+    private func performRegistrationCeremony(handle: String, did: String) async throws -> String {
         let provider = ASAuthorizationPlatformPublicKeyCredentialProvider(relyingPartyIdentifier: relyingPartyID)
 
         let registrationOptions = try await fetchRegistrationOptions(
@@ -942,51 +973,52 @@ public final class ArkavoClient: NSObject {
         )
 
         print("Credential request created, calling performRegistration")
-        do {
-            let credential = try await performRegistration(request: credentialRequest)
-            print("performRegistration succeeded, completing registration")
-            return try await completeRegistration(
-                credential: credential,
-                handle: handle,
-                did: did
-            )
-        } catch {
-            print("performRegistration threw error: \(error)")
-            let nsError = error as NSError
-            print("Error details: domain=\(nsError.domain) code=\(nsError.code) description=\(error.localizedDescription)")
+        let credential = try await performRegistration(request: credentialRequest)
+        print("performRegistration succeeded, completing registration")
+        return try await completeRegistration(
+            credential: credential,
+            handle: handle,
+            did: did
+        )
+    }
 
-            // Check if this is a duplicate passkey error
-            if nsError.code == -25300 {
-                print("Detected errSecDuplicateItem (-25300)")
-                throw NSError(
-                    domain: "ArkavoRegistration",
-                    code: -25300,
-                    userInfo: [
-                        NSLocalizedDescriptionKey: "A passkey already exists for this relying party",
-                        NSLocalizedRecoverySuggestionErrorKey: """
-                        A passkey for '\(relyingPartyID)' already exists on this device.
+    /// Recognizes the keychain's duplicate-passkey error (errSecDuplicateItem,
+    /// -25300) and rewrites it with recovery guidance a user can act on;
+    /// every other error passes through unchanged.
+    private static func mapDuplicatePasskeyError(_ error: Error, relyingPartyID: String) -> Error {
+        print("performRegistration threw error: \(error)")
+        let nsError = error as NSError
+        print("Error details: domain=\(nsError.domain) code=\(nsError.code) description=\(error.localizedDescription)")
 
-                        To register a new account:
-                        1. Open Settings → Passwords
-                        2. Search for '\(relyingPartyID)'
-                        3. Delete all existing passkeys
-                        4. Return to Arkavo and try again
-
-                        Or try using a different username.
-
-                        Technical details: The passkey system prevents duplicate credentials.
-                        Each device can have multiple passkeys for the same site, but they
-                        must have different user IDs. If you're seeing this error repeatedly,
-                        the server may be generating the same user ID for different usernames.
-                        """,
-                        NSLocalizedFailureReasonErrorKey: "errSecDuplicateItem: Duplicate passkey detected"
-                    ]
-                )
-            }
-
-            // Re-throw original error if not duplicate
-            throw error
+        guard nsError.code == -25300 else {
+            return error
         }
+
+        print("Detected errSecDuplicateItem (-25300)")
+        return NSError(
+            domain: "ArkavoRegistration",
+            code: -25300,
+            userInfo: [
+                NSLocalizedDescriptionKey: "A passkey already exists for this relying party",
+                NSLocalizedRecoverySuggestionErrorKey: """
+                A passkey for '\(relyingPartyID)' already exists on this device.
+
+                To register a new account:
+                1. Open Settings → Passwords
+                2. Search for '\(relyingPartyID)'
+                3. Delete all existing passkeys
+                4. Return to Arkavo and try again
+
+                Or try using a different username.
+
+                Technical details: The passkey system prevents duplicate credentials.
+                Each device can have multiple passkeys for the same site, but they
+                must have different user IDs. If you're seeing this error repeatedly,
+                the server may be generating the same user ID for different usernames.
+                """,
+                NSLocalizedFailureReasonErrorKey: "errSecDuplicateItem: Duplicate passkey detected"
+            ]
+        )
     }
 
     private func fetchRegistrationOptions(
@@ -1093,9 +1125,20 @@ public final class ArkavoClient: NSObject {
 
         let (data, response) = try await Self.http3Data(for: request)
 
-        guard let httpResponse = response as? HTTPURLResponse,
-              let token = httpResponse.allHeaderFields["x-auth-token"] as? String
-        else {
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw ArkavoError.authenticationFailed("No HTTP response received")
+        }
+
+        // The App Attest ticket backing this registration lives in the
+        // session and has a short TTL. A 403 here (distinct from the
+        // register-attest 403, which is a lifetime cap) means the ticket
+        // expired between attest and finish — the caller re-attests and
+        // retries the ceremony once.
+        if httpResponse.statusCode == 403 {
+            throw RegistrationTicketExpired()
+        }
+
+        guard let token = httpResponse.allHeaderFields["x-auth-token"] as? String else {
             // If we got an error response, try to parse it
             if let errorJson = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                let errorMessage = errorJson["error"] as? String
@@ -1108,6 +1151,107 @@ public final class ArkavoClient: NSObject {
         // Token is a base64url-encoded CWT (CBOR tag 61 wrapping COSE_Sign1).
         // No client-side format gate — server is the authority. Trim padding/whitespace just in case.
         return token.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Signals that the App Attest ticket backing this registration attempt
+    /// expired before `completeRegistration` could redeem it. Kept as its
+    /// own type (not folded into `ArkavoError`) so `registerUser` can catch
+    /// exactly this case to retry once, without also swallowing other
+    /// `authenticationFailed` failures that should not be retried.
+    private struct RegistrationTicketExpired: Error {}
+
+    // MARK: - App Attest registration gate
+    //
+    // The server refuses `register/:username` without a ticket issued
+    // against a verified App Attest attestation. This runs the full
+    // challenge -> attest -> verify round trip:
+    //   1. GET  device-check/register-challenge  (no auth; sets the
+    //      session cookie the ticket will live in)
+    //   2. Generate + attest a key locally (AppAttestPreflight)
+    //   3. POST device-check/register-attest with the attestation
+    // On success the generated key_id is stashed in the Keychain so the
+    // existing device-check/assert (login) flow reuses the same key
+    // instead of minting a fresh one — App Attest keys are minted once
+    // and cannot be re-attested.
+    //
+    // Like the Apple-link flow above, these calls stay on `Self.http3Data`
+    // (URLSession.shared) so the session cookie set by step 1 is replayed
+    // automatically in step 3 and in the `register/:username` calls that
+    // follow.
+
+    private func performAttestationPreflight() async throws {
+        let challenge = try await fetchDeviceAttestChallenge()
+
+        let result = try await AppAttestPreflight().keyAndAttestation(challenge: challenge)
+
+        try await submitAttestation(
+            keyID: result.keyID,
+            attestation: result.attestation,
+            clientDataHash: result.clientDataHash
+        )
+
+        // Persisted only after the server accepts the attestation — an
+        // earlier persist could stash a key_id the server never verified.
+        try KeychainManager.saveDeviceAttestKeyID(result.keyID)
+    }
+
+    private func fetchDeviceAttestChallenge() async throws -> String {
+        let url = authURL.appendingPathComponent("device-check/register-challenge")
+        let (data, response) = try await Self.http3Data(from: url)
+
+        guard let httpResponse = response as? HTTPURLResponse,
+              (200 ... 299).contains(httpResponse.statusCode)
+        else {
+            throw AppAttestError.attestationRejected(
+                "register-challenge failed: \(String(decoding: data, as: UTF8.self))"
+            )
+        }
+
+        let decoded = try JSONDecoder().decode(DeviceAttestChallengeResponse.self, from: data)
+        return decoded.challenge
+    }
+
+    private func submitAttestation(keyID: String, attestation: Data, clientDataHash: Data) async throws {
+        var request = URLRequest(url: authURL.appendingPathComponent("device-check/register-attest"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // Standard base64 (not base64url) per the device-check contract —
+        // distinct from the base64url WebAuthn payloads elsewhere in this file.
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "key_id": keyID,
+            "attestation_object": attestation.base64EncodedString(),
+            "client_data_hash": clientDataHash.base64EncodedString(),
+        ])
+
+        let (data, response) = try await Self.http3Data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw AppAttestError.attestationRejected("register-attest: no HTTP response received")
+        }
+
+        switch httpResponse.statusCode {
+        case 200 ... 299:
+            return
+        case 429:
+            // Temporary: this device's registration budget for the current
+            // rolling window is spent. Without a usable Retry-After we
+            // cannot promise a wait will ever clear it, so that case falls
+            // through to a plain rejection rather than a bare guess.
+            if let retryAfterValue = httpResponse.value(forHTTPHeaderField: "Retry-After"),
+               let retryAfter = TimeInterval(retryAfterValue)
+            {
+                throw AppAttestError.rateLimited(retryAfter: retryAfter)
+            }
+            throw AppAttestError.attestationRejected(
+                "register-attest returned 429 without a usable Retry-After header"
+            )
+        case 403:
+            // Permanent: the device hit its lifetime registration cap.
+            throw AppAttestError.registrationCapExceeded
+        default:
+            let message = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"] as? String
+            throw AppAttestError.attestationRejected(message ?? String(decoding: data, as: UTF8.self))
+        }
     }
 
     public func encryptRemotePolicy(
@@ -1427,6 +1571,12 @@ private final class WebSocketDelegate: NSObject, URLSessionWebSocketDelegate, @u
             }
         }
     }
+}
+
+// MARK: - App Attest Response Models
+
+private struct DeviceAttestChallengeResponse: Decodable {
+    let challenge: String
 }
 
 // MARK: - WebAuthn Response Models
