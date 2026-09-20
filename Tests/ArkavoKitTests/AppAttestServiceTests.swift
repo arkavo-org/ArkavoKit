@@ -99,38 +99,55 @@ final class AppAttestServiceTests: XCTestCase {
         XCTAssertEqual(result.keyID, "recorded-key-id")
     }
 
-    // MARK: - register-attest 403 discrimination
+    // MARK: - register-attest error discrimination
     //
-    // A 403 carries two very different meanings and only one of them is
-    // permanent. `registrationCapExceeded` tells a user this device can
-    // never register again, so it must not be inferred from the status
-    // code alone — a generic forbidden, or the server failing closed on an
-    // unset APP_ATTEST_APP_ID, would be reported as a permanent refusal.
+    // Per authnz-rs docs/app-attest-preflight-contract.md, the client branches
+    // on the stable `error` token and never on the status alone.
+    // `attest_registration_cap` is the only permanent refusal: it tells a user
+    // this device can never register again. Everything else — including the
+    // 503 `app_id_not_configured` a fail-closed server returns for every user
+    // at once — must stay retryable.
 
-    func testLifetimeCapIsRecognizedFromTheErrorBody() {
-        XCTAssertTrue(ArkavoClient.isLifetimeCapRefusal("lifetime_cap"))
-        XCTAssertTrue(ArkavoClient.isLifetimeCapRefusal("AttestLifetimeCapExceeded"))
-        XCTAssertTrue(ArkavoClient.isLifetimeCapRefusal("device lifetime registration cap reached"))
+    func testOnlyTheLifetimeCapTokenIsPermanent() {
+        XCTAssertTrue(ArkavoClient.isPermanentRefusal("attest_registration_cap"))
     }
 
-    func testOtherForbiddenReasonsAreNotTreatedAsPermanent() {
-        XCTAssertFalse(ArkavoClient.isLifetimeCapRefusal(nil), "a bodyless 403 must not become a permanent refusal")
-        XCTAssertFalse(ArkavoClient.isLifetimeCapRefusal(""))
-        XCTAssertFalse(ArkavoClient.isLifetimeCapRefusal("forbidden"))
+    func testEveryOtherContractCodeIsRetryable() {
+        for code in [
+            "attest_rate_limited",
+            "app_id_mismatch",
+            "app_id_not_configured",
+            "attestation_invalid",
+            "session_invalid",
+            "attest_unavailable",
+        ] {
+            XCTAssertFalse(
+                ArkavoClient.isPermanentRefusal(code),
+                "\(code) must not be treated as a permanent refusal"
+            )
+        }
+    }
+
+    func testUnknownAndMissingCodesStayRetryable() {
+        XCTAssertFalse(ArkavoClient.isPermanentRefusal(nil), "a bodyless refusal must not become permanent")
+        XCTAssertFalse(ArkavoClient.isPermanentRefusal(""))
+        XCTAssertFalse(ArkavoClient.isPermanentRefusal("some_future_code"))
         XCTAssertFalse(
-            ArkavoClient.isLifetimeCapRefusal("APP_ATTEST_APP_ID is not configured"),
-            "a server misconfiguration must stay retryable, not tell the user their device is barred forever"
+            ArkavoClient.isPermanentRefusal("ATTEST_REGISTRATION_CAP"),
+            "the token is exact; a near-miss must not reach the permanent verdict"
         )
     }
 
-    func testErrorMessageIsExtractedFromTheServerEnvelope() {
-        let body = Data(#"{"error":"lifetime_cap"}"#.utf8)
-        XCTAssertEqual(ArkavoClient.errorMessage(from: body), "lifetime_cap")
+    func testErrorTokenAndDescriptionAreReadFromTheContractEnvelope() {
+        let body = Data(#"{"error":"attest_registration_cap","error_description":"lifetime cap reached"}"#.utf8)
+        XCTAssertEqual(ArkavoClient.errorCode(from: body), "attest_registration_cap")
+        XCTAssertEqual(ArkavoClient.errorDescription(from: body), "lifetime cap reached")
     }
 
-    func testErrorMessageIsNilForBodiesThatAreNotTheErrorEnvelope() {
-        XCTAssertNil(ArkavoClient.errorMessage(from: Data("not json".utf8)))
-        XCTAssertNil(ArkavoClient.errorMessage(from: Data(#"{"detail":"nope"}"#.utf8)))
-        XCTAssertNil(ArkavoClient.errorMessage(from: Data()))
+    func testPlainTextBodiesYieldNoTokenSoNothingIsPermanent() {
+        // Task 5 has not landed; DeviceCheckError still renders plain text.
+        let body = Data("Forbidden".utf8)
+        XCTAssertNil(ArkavoClient.errorCode(from: body))
+        XCTAssertFalse(ArkavoClient.isPermanentRefusal(ArkavoClient.errorCode(from: body)))
     }
 }

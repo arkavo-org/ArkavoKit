@@ -1242,62 +1242,65 @@ public final class ArkavoClient: NSObject {
             throw AppAttestError.attestationRejected("register-attest: no HTTP response received")
         }
 
-        switch httpResponse.statusCode {
-        case 200 ... 299:
-            return
-        case 429:
-            // Temporary: this device's registration budget for the current
-            // rolling window is spent. Without a usable Retry-After we
-            // cannot promise a wait will ever clear it, so that case falls
-            // through to a plain rejection rather than a bare guess.
-            if let retryAfterValue = httpResponse.value(forHTTPHeaderField: "Retry-After"),
-               let retryAfter = TimeInterval(retryAfterValue)
-            {
-                throw AppAttestError.rateLimited(retryAfter: retryAfter)
-            }
-            throw AppAttestError.attestationRejected(
-                "register-attest returned 429 without a usable Retry-After header"
-            )
-        case 403:
-            // A 403 *may* be the lifetime cap, but the status alone is not
-            // enough evidence for a permanent verdict: `registrationCapExceeded`
-            // tells the user this device can never register again, and a
-            // generic 403 — an auth middleware refusal, or the server failing
-            // closed because APP_ATTEST_APP_ID is unset — would be reported as
-            // that. Require the body to say so; anything else is a plain
-            // rejection the caller can retry.
-            let message = Self.errorMessage(from: data)
-            guard Self.isLifetimeCapRefusal(message) else {
-                throw AppAttestError.attestationRejected(
-                    message ?? "register-attest returned 403 without a recognized reason"
-                )
-            }
+        guard !(200 ... 299).contains(httpResponse.statusCode) else { return }
+
+        // Branch on the error token, never on the status alone. The contract
+        // (authnz-rs docs/app-attest-preflight-contract.md) makes
+        // `attest_registration_cap` the *only* permanent refusal, and puts the
+        // server-misconfiguration case on 503 `app_id_not_configured`
+        // specifically so a fail-closed deploy cannot be mistaken for a barred
+        // device. An unrecognized or missing token is therefore retryable:
+        // without the token there is not enough evidence for a verdict the
+        // user can never recover from.
+        let code = Self.errorCode(from: data)
+        let detail = Self.errorDescription(from: data)
+            ?? code
+            ?? String(decoding: data, as: UTF8.self)
+
+        if Self.isPermanentRefusal(code) {
             throw AppAttestError.registrationCapExceeded
-        default:
-            throw AppAttestError.attestationRejected(
-                Self.errorMessage(from: data) ?? String(decoding: data, as: UTF8.self)
-            )
         }
+
+        // Retry-After is read only for the rate-limit code, and only as a
+        // fallback on a bare 429. Both paths are retryable, so leaning on the
+        // status here cannot produce a permanent verdict — the one outcome
+        // the status alone must never reach.
+        if code == Self.errorCodeRateLimited || (code == nil && httpResponse.statusCode == 429),
+           let retryAfterValue = httpResponse.value(forHTTPHeaderField: "Retry-After"),
+           let retryAfter = TimeInterval(retryAfterValue)
+        {
+            throw AppAttestError.rateLimited(retryAfter: retryAfter)
+        }
+
+        throw AppAttestError.attestationRejected(detail)
     }
 
-    /// Pulls the server's `{"error": "..."}` message out of a response body,
-    /// or nil when the body isn't that shape.
-    nonisolated static func errorMessage(from data: Data) -> String? {
+    /// The one refusal from `register-attest` that can never clear: this
+    /// `key_id` has spent its lifetime registration budget.
+    nonisolated static let errorCodePermanentCap = "attest_registration_cap"
+    /// The per-key rolling-window refusal. Temporary; carries `Retry-After`.
+    nonisolated static let errorCodeRateLimited = "attest_rate_limited"
+
+    /// Pulls the server's stable `{"error": "<code>"}` token out of a response
+    /// body, or nil when the body isn't that shape. Task 5 emits JSON on these
+    /// routes; until it lands the body is plain text and this is nil, which
+    /// keeps every refusal retryable by default.
+    nonisolated static func errorCode(from data: Data) -> String? {
         (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"] as? String
     }
 
-    /// Whether a 403 from `register-attest` is the lifetime-cap refusal
-    /// rather than some other forbidden.
-    ///
-    /// The server's refusal is `AttestLifetimeCapExceeded` (authnz-rs#66);
-    /// its wire spelling is not pinned yet because `register-attest` does not
-    /// exist, so this matches the distinguishing word rather than an exact
-    /// token. **Tighten to an exact match when Task 5 lands** — matching
-    /// loosely is the safe direction only because the fallback (a retryable
-    /// rejection) is the lesser error of the two.
-    nonisolated static func isLifetimeCapRefusal(_ message: String?) -> Bool {
-        guard let message else { return false }
-        return message.lowercased().contains("lifetime")
+    /// The human-readable companion to `errorCode`. For logs and display only
+    /// — the contract states it may change, so nothing branches on it.
+    nonisolated static func errorDescription(from data: Data) -> String? {
+        (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error_description"] as? String
+    }
+
+    /// Whether a refusal is the permanent one. Exact-match on the contract's
+    /// token: anything else — including an unrecognized code, a bodyless
+    /// response, or the 503 `app_id_not_configured` that a fail-closed server
+    /// returns — stays retryable.
+    nonisolated static func isPermanentRefusal(_ code: String?) -> Bool {
+        code == errorCodePermanentCap
     }
 
     public func encryptRemotePolicy(
