@@ -1195,7 +1195,17 @@ public final class ArkavoClient: NSObject {
 
         // Persisted only after the server accepts the attestation — an
         // earlier persist could stash a key_id the server never verified.
-        try KeychainManager.saveDeviceAttestKeyID(result.keyID)
+        //
+        // Best-effort on purpose. The server has already admitted this
+        // registration by the time we get here, so throwing would fail a
+        // registration the server accepted — and for a value nothing reads
+        // back yet (there is no client-side assertion flow). A Keychain
+        // failure is worth a log, not a lost registration.
+        do {
+            try KeychainManager.saveDeviceAttestKeyID(result.keyID)
+        } catch {
+            print("Failed to persist device attest key_id (registration continues): \(error)")
+        }
     }
 
     private func fetchDeviceAttestChallenge() async throws -> String {
@@ -1249,12 +1259,45 @@ public final class ArkavoClient: NSObject {
                 "register-attest returned 429 without a usable Retry-After header"
             )
         case 403:
-            // Permanent: the device hit its lifetime registration cap.
+            // A 403 *may* be the lifetime cap, but the status alone is not
+            // enough evidence for a permanent verdict: `registrationCapExceeded`
+            // tells the user this device can never register again, and a
+            // generic 403 — an auth middleware refusal, or the server failing
+            // closed because APP_ATTEST_APP_ID is unset — would be reported as
+            // that. Require the body to say so; anything else is a plain
+            // rejection the caller can retry.
+            let message = Self.errorMessage(from: data)
+            guard Self.isLifetimeCapRefusal(message) else {
+                throw AppAttestError.attestationRejected(
+                    message ?? "register-attest returned 403 without a recognized reason"
+                )
+            }
             throw AppAttestError.registrationCapExceeded
         default:
-            let message = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"] as? String
-            throw AppAttestError.attestationRejected(message ?? String(decoding: data, as: UTF8.self))
+            throw AppAttestError.attestationRejected(
+                Self.errorMessage(from: data) ?? String(decoding: data, as: UTF8.self)
+            )
         }
+    }
+
+    /// Pulls the server's `{"error": "..."}` message out of a response body,
+    /// or nil when the body isn't that shape.
+    nonisolated static func errorMessage(from data: Data) -> String? {
+        (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"] as? String
+    }
+
+    /// Whether a 403 from `register-attest` is the lifetime-cap refusal
+    /// rather than some other forbidden.
+    ///
+    /// The server's refusal is `AttestLifetimeCapExceeded` (authnz-rs#66);
+    /// its wire spelling is not pinned yet because `register-attest` does not
+    /// exist, so this matches the distinguishing word rather than an exact
+    /// token. **Tighten to an exact match when Task 5 lands** — matching
+    /// loosely is the safe direction only because the fallback (a retryable
+    /// rejection) is the lesser error of the two.
+    nonisolated static func isLifetimeCapRefusal(_ message: String?) -> Bool {
+        guard let message else { return false }
+        return message.lowercased().contains("lifetime")
     }
 
     public func encryptRemotePolicy(

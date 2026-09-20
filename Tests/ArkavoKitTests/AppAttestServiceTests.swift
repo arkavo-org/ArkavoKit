@@ -98,4 +98,39 @@ final class AppAttestServiceTests: XCTestCase {
         )
         XCTAssertEqual(result.keyID, "recorded-key-id")
     }
+
+    // MARK: - register-attest 403 discrimination
+    //
+    // A 403 carries two very different meanings and only one of them is
+    // permanent. `registrationCapExceeded` tells a user this device can
+    // never register again, so it must not be inferred from the status
+    // code alone — a generic forbidden, or the server failing closed on an
+    // unset APP_ATTEST_APP_ID, would be reported as a permanent refusal.
+
+    func testLifetimeCapIsRecognizedFromTheErrorBody() {
+        XCTAssertTrue(ArkavoClient.isLifetimeCapRefusal("lifetime_cap"))
+        XCTAssertTrue(ArkavoClient.isLifetimeCapRefusal("AttestLifetimeCapExceeded"))
+        XCTAssertTrue(ArkavoClient.isLifetimeCapRefusal("device lifetime registration cap reached"))
+    }
+
+    func testOtherForbiddenReasonsAreNotTreatedAsPermanent() {
+        XCTAssertFalse(ArkavoClient.isLifetimeCapRefusal(nil), "a bodyless 403 must not become a permanent refusal")
+        XCTAssertFalse(ArkavoClient.isLifetimeCapRefusal(""))
+        XCTAssertFalse(ArkavoClient.isLifetimeCapRefusal("forbidden"))
+        XCTAssertFalse(
+            ArkavoClient.isLifetimeCapRefusal("APP_ATTEST_APP_ID is not configured"),
+            "a server misconfiguration must stay retryable, not tell the user their device is barred forever"
+        )
+    }
+
+    func testErrorMessageIsExtractedFromTheServerEnvelope() {
+        let body = Data(#"{"error":"lifetime_cap"}"#.utf8)
+        XCTAssertEqual(ArkavoClient.errorMessage(from: body), "lifetime_cap")
+    }
+
+    func testErrorMessageIsNilForBodiesThatAreNotTheErrorEnvelope() {
+        XCTAssertNil(ArkavoClient.errorMessage(from: Data("not json".utf8)))
+        XCTAssertNil(ArkavoClient.errorMessage(from: Data(#"{"detail":"nope"}"#.utf8)))
+        XCTAssertNil(ArkavoClient.errorMessage(from: Data()))
+    }
 }
