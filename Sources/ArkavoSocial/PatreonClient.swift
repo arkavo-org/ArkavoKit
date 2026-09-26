@@ -35,6 +35,13 @@ public actor PatreonClient: ObservableObject {
     let clientSecret: String
     public var config: PatreonConfig = .init()
     public static var redirectURI: String { ArkavoConfiguration.shared.oauthRedirectURL(for: "patreon") }
+    /// Scopes the login asks for. `/campaigns` needs `campaigns` and
+    /// `/campaigns/{id}/members` needs `campaigns.members`; without them Patreon
+    /// answers 401, so a creator's campaign and patrons can never load. The
+    /// bracketed scopes cover the `email` fields `getUserIdentity` and
+    /// `getMembers` request. Tokens issued with fewer scopes keep them until the
+    /// user signs in again.
+    public static let oauthScope = "identity identity[email] campaigns campaigns.members campaigns.members[email]"
     private let urlSession: URLSession
 
     @MainActor @Published public var isAuthenticated = false
@@ -235,7 +242,7 @@ public actor PatreonClient: ObservableObject {
             URLQueryItem(name: "response_type", value: "code"),
             URLQueryItem(name: "client_id", value: clientId),
             URLQueryItem(name: "redirect_uri", value: PatreonClient.redirectURI),
-            URLQueryItem(name: "scope", value: "identity"),
+            URLQueryItem(name: "scope", value: PatreonClient.oauthScope),
             URLQueryItem(name: "state", value: UUID().uuidString),
         ]
 
@@ -251,7 +258,7 @@ public actor PatreonClient: ObservableObject {
             URLQueryItem(name: "response_type", value: "code"),
             URLQueryItem(name: "client_id", value: clientId),
             URLQueryItem(name: "redirect_uri", value: PatreonClient.redirectURI),
-            URLQueryItem(name: "scope", value: "identity"),
+            URLQueryItem(name: "scope", value: PatreonClient.oauthScope),
             URLQueryItem(name: "state", value: UUID().uuidString),
         ]
 
