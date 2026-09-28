@@ -10,7 +10,7 @@ import OpenTDFKit
 #endif
 
 /// Main errors that can occur in ArkavoClient operations
-enum ArkavoError: Error {
+public enum ArkavoError: Error {
     case invalidURL
     case authenticationFailed(String)
     case connectionFailed(String)
@@ -617,7 +617,6 @@ public final class ArkavoClient: NSObject {
         let authOptions = try decoder.decode(AuthenticationOptionsResponse.self, from: data)
 
         let challengeData = Data(base64Encoded: authOptions.publicKey.challenge.base64URLToBase64())!
-        print("Challenge data: \(challengeData)")
 
         // Create assertion request
         let assertionRequest = provider.createCredentialAssertionRequest(
@@ -646,23 +645,7 @@ public final class ArkavoClient: NSObject {
 
         completeRequest.httpBody = try JSONSerialization.data(withJSONObject: parameters)
 
-        // Headers/parameters/body carry auth tokens and credentials — debug builds only.
-        #if DEBUG
-        print("\n=== Authentication Completion Request ===")
-        print("URL: \(completeRequest.url?.absoluteString ?? "none")")
-        print("Headers: \(completeRequest.allHTTPHeaderFields ?? [:])")
-        print("Parameters: \(parameters)")
-        #endif
-
         let (responseData, completionResponse) = try await Self.http3Data(for: completeRequest)
-
-        #if DEBUG
-        print("\nServer Response:")
-        print("Status Code: \((completionResponse as? HTTPURLResponse)?.statusCode ?? -1)")
-        print("Response Headers: \((completionResponse as? HTTPURLResponse)?.allHeaderFields ?? [:])")
-        print("Response Body: \(String(data: responseData, encoding: .utf8) ?? "none")")
-        print("=== End Authentication Completion ===\n")
-        #endif
 
         guard let completionHttpResponse = completionResponse as? HTTPURLResponse,
               (200 ... 299).contains(completionHttpResponse.statusCode)
@@ -1070,18 +1053,6 @@ public final class ArkavoClient: NSObject {
         try await withCheckedThrowingContinuation { continuation in
             print("\n=== WebAuthn Authentication ===")
             print("Starting performAuthentication")
-
-            if let platformProvider = request as? ASAuthorizationPlatformPublicKeyCredentialAssertionRequest {
-                print("Challenge: \(platformProvider.challenge.base64EncodedString())")
-                print("RelyingPartyIdentifier: \(platformProvider.relyingPartyIdentifier)")
-                let allowedCredentials = platformProvider.allowedCredentials
-                print("Allowed credentials count: \(allowedCredentials.count)")
-                for (index, credential) in allowedCredentials.enumerated() {
-                    print("Credential [\(index)]: \(credential.credentialID.base64EncodedString())")
-                }
-            } else {
-                print("Warning: Request is not a platform credential assertion request")
-            }
 
             let controller = ASAuthorizationController(authorizationRequests: [request])
             let delegate = WebAuthnAuthenticationDelegate(continuation: continuation)
@@ -1924,9 +1895,7 @@ private class WebAuthnAuthenticationDelegate: NSObject, ASAuthorizationControlle
         }
 
         print("Successfully received credential:")
-        print("Credential ID: \(credential.credentialID.base64EncodedString())")
         print("Raw AuthenticatorData length: \(credential.rawAuthenticatorData.count) bytes")
-        print("Raw ClientDataJSON: \(String(data: credential.rawClientDataJSON, encoding: .utf8) ?? "unable to decode")")
         print("Signature length: \(credential.signature.count) bytes")
         print("UserID present: \(credential.userID != nil)")
         print("=== End WebAuthn Authentication Completion ===\n")
