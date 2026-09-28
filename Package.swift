@@ -20,6 +20,12 @@ let package = Package(
             name: "ArkavoKit",
             targets: ["ArkavoKit"]
         ),
+        // Identity and distribution without the recorder, streaming and A2A targets,
+        // which reference camera, microphone and screen-capture APIs.
+        .library(
+            name: "ArkavoSocial",
+            targets: ["ArkavoSocial"]
+        ),
         .library(
             name: "ArkavoC2PA",
             targets: ["ArkavoC2PA"]
