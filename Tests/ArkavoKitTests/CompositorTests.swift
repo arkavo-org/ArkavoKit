@@ -743,4 +743,36 @@ struct CompositorTests {
             #expect(cornerColor.g > 100, "Corner should have camera (green), got g=\(Int(cornerColor.g))")
         }
     }
+
+    @Test("Muse is composited bottom-left over an avatar base when pipPosition is bottom-right")
+    func museOverAvatarNoScreen() throws {
+        let compositor = try CompositorManager()
+        compositor.outputSize = CGSize(width: 1920, height: 1080)
+        compositor.watermarkEnabled = false
+        compositor.pipPosition = .bottomRight
+        compositor.pipScale = 0.2
+        let avatar = try #require(createTestPixelBuffer(width: 1920, height: 1080, red: 0, green: 255, blue: 0, alpha: 255))
+        let muse = try #require(createTestPixelBuffer(width: 1080, height: 1920, red: 0, green: 0, blue: 255, alpha: 255))
+        let out = try #require(compositor.composite(avatarTexture: avatar, cameraLayers: [], museTexture: muse))
+        let bottomLeft = try #require(getAverageColor(in: out, region: CGRect(x: 60, y: 1000, width: 40, height: 40)))
+        #expect(bottomLeft.b > 200 && bottomLeft.g < 60)
+        let center = try #require(getAverageColor(in: out, region: CGRect(x: 940, y: 520, width: 40, height: 40)))
+        #expect(center.g > 200)
+    }
+
+    @Test("Muse is composited over a camera base with no screen")
+    func museOverCameraNoScreen() throws {
+        let compositor = try CompositorManager()
+        compositor.outputSize = CGSize(width: 1920, height: 1080)
+        compositor.watermarkEnabled = false
+        compositor.pipPosition = .bottomRight
+        compositor.pipScale = 0.2
+        let cam = try #require(createTestPixelBuffer(width: 1280, height: 720, red: 255, green: 0, blue: 0, alpha: 255))
+        let camSB = try #require(createTestSampleBuffer(from: cam))
+        let muse = try #require(createTestPixelBuffer(width: 1080, height: 1920, red: 0, green: 0, blue: 255, alpha: 255))
+        let layer = CompositorManager.CameraLayer(id: "cam", buffer: camSB, position: nil)
+        let out = try #require(compositor.composite(cameraLayers: [layer], canvasSize: CGSize(width: 1920, height: 1080), museTexture: muse))
+        let bottomLeft = try #require(getAverageColor(in: out, region: CGRect(x: 60, y: 1000, width: 40, height: 40)))
+        #expect(bottomLeft.b > 200 && bottomLeft.r < 60)
+    }
 }

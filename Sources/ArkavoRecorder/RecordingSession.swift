@@ -553,6 +553,7 @@ public final class RecordingSession: Sendable {
 
         var composited: CVPixelBuffer?
         var timestamp: CMTime
+        let museTexture: CVPixelBuffer? = museTextureProvider?()
 
         switch mode {
         case .cameraWithMic, .cameraOnly:
@@ -564,7 +565,8 @@ public final class RecordingSession: Sendable {
 
             composited = compositor.composite(
                 cameraLayers: cameraLayers,
-                canvasSize: canvasSize
+                canvasSize: canvasSize,
+                museTexture: museTexture
             )
             timestamp = CMSampleBufferGetPresentationTimeStamp(firstBuffer)
 
@@ -577,7 +579,8 @@ public final class RecordingSession: Sendable {
             let cameraLayers = await MainActor.run { self.cameraLayersForComposition() }
             composited = compositor.composite(
                 avatarTexture: avatarTexture,
-                cameraLayers: cameraLayers
+                cameraLayers: cameraLayers,
+                museTexture: museTexture
             )
             timestamp = CMTime(seconds: CACurrentMediaTime(), preferredTimescale: 600)
 
