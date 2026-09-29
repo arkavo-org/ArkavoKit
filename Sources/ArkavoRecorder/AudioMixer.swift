@@ -6,7 +6,9 @@
 //  Clock-driven FIFO: one source (the first to deliver, or `clockSourceID`)
 //  sets the frame cadence; every other source is a FIFO of samples drained
 //  by the clock's frame length and zero-filled when short. A configured voice
-//  source ducks the others while it has audio queued.
+//  source ducks the others while it has audio queued. The voice is never
+//  auto-picked as the clock while other sources are registered, and every FIFO
+//  is capped at `maxQueuedSeconds` (oldest samples dropped).
 //
 
 import AVFoundation
@@ -19,6 +21,7 @@ public final class AudioMixer: @unchecked Sendable {
     private let lock = NSLock()
     private var fifos: [String: [Int16]] = [:]        // interleaved Int16, non-clock sources only
     private var clockSourceID: String?
+    private var registeredSourceIDs: Set<String> = []
     private var sourceGains: [String: Float] = [:]
     private var lastVoiceActivity: TimeInterval = -.infinity
 
@@ -29,6 +32,9 @@ public final class AudioMixer: @unchecked Sendable {
     /// How long after the voice FIFO empties the duck stays applied, in seconds.
     public var voiceDuckHangover: TimeInterval = 0.3
 
+    /// Longest a non-clock source may queue, in seconds. Older samples are dropped.
+    public let maxQueuedSeconds: Double = 0.2
+
     public var onMixedSample: ((CMSampleBuffer) -> Void)?
 
     public init(sampleRate: Double = 48000, channels: UInt32 = 2, voiceSourceID: String? = nil) {
@@ -38,8 +44,19 @@ public final class AudioMixer: @unchecked Sendable {
     }
 
     /// Pins the clock source. Otherwise the first source to deliver becomes the clock.
+    /// Drops any audio the new clock had queued as a non-clock source.
     public func setClockSource(_ sourceID: String?) {
-        lock.lock(); clockSourceID = sourceID; lock.unlock()
+        lock.lock()
+        clockSourceID = sourceID
+        if let sourceID { fifos.removeValue(forKey: sourceID) }
+        lock.unlock()
+    }
+
+    /// Declares a source that exists but may not have delivered yet. While any
+    /// non-voice source is registered, the voice is never auto-picked as the clock.
+    /// Registrations survive `reset()` (they mirror the router, not the session).
+    public func registerSource(_ sourceID: String) {
+        lock.lock(); registeredSourceIDs.insert(sourceID); lock.unlock()
     }
 
     public func setGain(_ gain: Float, for sourceID: String) {
@@ -57,21 +74,34 @@ public final class AudioMixer: @unchecked Sendable {
         guard !incoming.isEmpty else { return }
 
         lock.lock()
-        if clockSourceID == nil { clockSourceID = sourceID }
+        if clockSourceID == nil {
+            let isVoice = sourceID == voiceSourceID
+            let othersExist = !registeredSourceIDs.subtracting([sourceID]).isEmpty
+            // The voice is intermittent: it only becomes the clock when nothing else could be.
+            if !(isVoice && othersExist) { clockSourceID = sourceID }
+        }
         let isClock = clockSourceID == sourceID
         if sourceID == voiceSourceID { lastVoiceActivity = CACurrentMediaTime() }
         if !isClock {
-            fifos[sourceID, default: []].append(contentsOf: incoming)
+            let cap = Int(sampleRate * Double(channels) * maxQueuedSeconds)
+            var fifo = fifos[sourceID] ?? []
+            fifos[sourceID] = nil   // keep `fifo` uniquely referenced so removeFirst is in place
+            fifo.append(contentsOf: incoming)
+            if fifo.count > cap { fifo.removeFirst(fifo.count - cap) }
+            fifos[sourceID] = fifo
             lock.unlock()
             return
         }
         // Drain every other FIFO by the clock's frame count.
         let frameSamples = incoming.count
-        var contributions: [(id: String, samples: ArraySlice<Int16>)] = []
-        for (id, fifo) in fifos {
+        var contributions: [(id: String, samples: [Int16])] = []
+        for id in Array(fifos.keys) where id != clockSourceID {
+            guard var fifo = fifos[id] else { continue }
+            fifos[id] = nil
             let take = min(frameSamples, fifo.count)
-            contributions.append((id, fifo[0..<take]))
-            fifos[id] = Array(fifo[take...])
+            contributions.append((id, Array(fifo.prefix(take))))
+            fifo.removeFirst(take)
+            fifos[id] = fifo
         }
         let voiceQueued = voiceSourceID.map { (fifos[$0]?.isEmpty == false) } ?? false
         let voiceRecent = CACurrentMediaTime() - lastVoiceActivity <= voiceDuckHangover
@@ -80,12 +110,12 @@ public final class AudioMixer: @unchecked Sendable {
         lock.unlock()
 
         var mixed = [Float](repeating: 0, count: frameSamples)
-        func add(_ id: String, _ src: ArraySlice<Int16>) {
+        func add(_ id: String, _ src: [Int16]) {
             let duck: Float = (ducking && id != voiceSourceID) ? voiceDuckAmount : 1.0
             let g = (gains[id] ?? 1.0) * duck
             for (i, v) in src.enumerated() { mixed[i] += Float(v) * g }
         }
-        add(sourceID, incoming[...])
+        add(sourceID, incoming)
         for c in contributions { add(c.id, c.samples) }
 
         let out = mixed.map { Int16(max(-32768, min(32767, $0))) }

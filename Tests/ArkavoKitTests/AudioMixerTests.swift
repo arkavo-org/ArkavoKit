@@ -18,7 +18,7 @@ struct AudioMixerTests {
         var block: CMBlockBuffer?
         CMBlockBufferCreateWithMemoryBlock(allocator: nil, memoryBlock: nil, blockLength: length, blockAllocator: nil,
                                            customBlockSource: nil, offsetToData: 0, dataLength: length, flags: 0, blockBufferOut: &block)
-        samples.withUnsafeMutableBytes { CMBlockBufferReplaceDataBytes(with: $0.baseAddress!, blockBuffer: block!, offsetIntoDestination: 0, dataLength: length) }
+        samples.withUnsafeMutableBytes { _ = CMBlockBufferReplaceDataBytes(with: $0.baseAddress!, blockBuffer: block!, offsetIntoDestination: 0, dataLength: length) }
         var out: CMSampleBuffer?
         CMAudioSampleBufferCreateReadyWithPacketDescriptions(allocator: nil, dataBuffer: block!, formatDescription: desc!,
             sampleCount: frames, presentationTimeStamp: pts, packetDescriptions: nil, sampleBufferOut: &out)
@@ -118,5 +118,84 @@ struct AudioMixerTests {
         let pts2 = CMTime(value: 124_416, timescale: 48000)
         mixer.addSample(Self.buffer(frames: 960, value: 1, pts: pts2), from: "microphone")
         #expect(CMSampleBufferGetPresentationTimeStamp(out[1]) == pts2)
+    }
+
+    @Test("A pinned clock is not displaced by the voice delivering first")
+    func pinnedClockWithVoiceFirst() {
+        let mixer = AudioMixer(voiceSourceID: "muse-voice")
+        mixer.voiceDuckAmount = 1.0
+        mixer.setClockSource("microphone")
+        var out: [CMSampleBuffer] = []
+        mixer.onMixedSample = { out.append($0) }
+        mixer.addSample(Self.buffer(frames: 960, value: 50, pts: .zero), from: "muse-voice")
+        #expect(out.isEmpty)
+        mixer.addSample(Self.buffer(frames: 960, value: 100, pts: .zero), from: "microphone")
+        #expect(out.count == 1)
+        #expect(Self.samples(out[0]).first == 150)
+    }
+
+    @Test("An unpinned voice is queued, not the clock, while another source is registered")
+    func voiceIsNotAutoClockWhenOthersRegistered() {
+        let mixer = AudioMixer(voiceSourceID: "muse-voice")
+        mixer.voiceDuckAmount = 1.0
+        mixer.registerSource("microphone")
+        var out: [CMSampleBuffer] = []
+        mixer.onMixedSample = { out.append($0) }
+        mixer.addSample(Self.buffer(frames: 960, value: 50, pts: .zero), from: "muse-voice")
+        #expect(out.isEmpty)
+        mixer.addSample(Self.buffer(frames: 960, value: 100, pts: .zero), from: "microphone")
+        #expect(out.count == 1)
+        #expect(Self.samples(out[0]).first == 150)
+        // The mic is now the clock: more voice does not emit.
+        mixer.addSample(Self.buffer(frames: 960, value: 50, pts: .zero), from: "muse-voice")
+        #expect(out.count == 1)
+    }
+
+    @Test("Pinning the clock drops that source's stale queued audio")
+    func setClockSourceDropsStaleFifo() {
+        let mixer = AudioMixer()
+        var out: [CMSampleBuffer] = []
+        mixer.onMixedSample = { out.append($0) }
+        mixer.addSample(Self.buffer(frames: 960, value: 10, pts: .zero), from: "screen")       // screen is the clock
+        mixer.addSample(Self.buffer(frames: 960, value: 500, pts: .zero), from: "microphone")  // queued backlog
+        mixer.setClockSource("microphone")
+        mixer.addSample(Self.buffer(frames: 960, value: 100, pts: .zero), from: "microphone")
+        #expect(out.count == 2)
+        #expect(Self.samples(out[1]).first == 100)   // not 600
+    }
+
+    @Test("reset() clears queued audio and the clock")
+    func resetClearsFifosAndClock() {
+        let mixer = AudioMixer(voiceSourceID: "muse-voice")
+        mixer.voiceDuckAmount = 1.0
+        mixer.setClockSource("microphone")
+        var out: [CMSampleBuffer] = []
+        mixer.onMixedSample = { out.append($0) }
+        mixer.addSample(Self.buffer(frames: 960, value: 50, pts: .zero), from: "muse-voice")
+        mixer.reset()
+        // Clock is cleared: a different source now becomes the clock and emits.
+        mixer.addSample(Self.buffer(frames: 960, value: 100, pts: .zero), from: "screen")
+        #expect(out.count == 1)
+        // Queued voice is gone.
+        #expect(Self.samples(out[0]).first == 100)
+    }
+
+    @Test("Each FIFO holds at most 200 ms; the oldest samples are dropped")
+    func fifoIsCapped() {
+        let mixer = AudioMixer(voiceSourceID: "muse-voice")
+        mixer.voiceDuckAmount = 1.0
+        mixer.setClockSource("microphone")
+        var out: [CMSampleBuffer] = []
+        mixer.onMixedSample = { out.append($0) }
+        // 1 s of voice as 100 x 10 ms buffers, values 1...100, with no clock ticks.
+        for i in 1...100 {
+            mixer.addSample(Self.buffer(frames: 480, value: Int16(i), pts: .zero), from: "muse-voice")
+        }
+        mixer.addSample(Self.buffer(frames: 12_000, value: 0, pts: .zero), from: "microphone")
+        let s = Self.samples(out[0])
+        #expect(s.count == 24_000)
+        #expect(s[0] == 81)                 // only buffers 81...100 (last 200 ms = 20 x 10 ms) survive
+        #expect(s[19_199] == 100)
+        #expect(s[19_200] == 0)             // 9,600 frames of voice, rest zero-filled
     }
 }
