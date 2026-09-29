@@ -184,7 +184,11 @@ public final class RecordingSession: Sendable {
     /// Register a Muse TTS audio source for mixing into the stream
     public func addMuseAudioSource(_ source: AudioSource) {
         audioRouter.addSource(source)
+        if audioRouter.allSourceIDs.contains("microphone") { audioMixer.setClockSource("microphone") }
     }
+
+    /// Every audio source registered with the router (tests: Creator CRE-233).
+    public var registeredAudioSourceIDs: [String] { audioRouter.allSourceIDs }
 
     /// Timer for driving frame capture in non-desktop modes
     nonisolated(unsafe) private var cameraFrameTimer: Timer?
@@ -216,7 +220,7 @@ public final class RecordingSession: Sendable {
         self.screenCapture = ScreenCaptureManager()
         self.cameraCaptures = [:]
         self.audioRouter = AudioRouter()
-        self.audioMixer = AudioMixer()
+        self.audioMixer = AudioMixer(voiceSourceID: "muse-voice")
         self.compositor = try CompositorManager()
         self.encoder = VideoEncoder()
 
