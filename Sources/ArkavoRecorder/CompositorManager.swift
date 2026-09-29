@@ -103,7 +103,8 @@ public final class CompositorManager: Sendable {
     /// First camera becomes the primary full-canvas source, additional cameras become PiP overlays
     public func composite(
         cameraLayers: [CameraLayer],
-        canvasSize: CGSize
+        canvasSize: CGSize,
+        museTexture: CVPixelBuffer? = nil
     ) -> CVPixelBuffer? {
         guard !cameraLayers.isEmpty else { return nil }
 
@@ -122,18 +123,19 @@ public final class CompositorManager: Sendable {
         // Remaining cameras become PiP overlays
         let overlayLayers = Array(cameraLayers.dropFirst())
 
-        return compositeWithBase(baseImage: scaledBaseImage, screenSize: canvasSize, cameraLayers: overlayLayers)
+        return compositeWithBase(baseImage: scaledBaseImage, screenSize: canvasSize, cameraLayers: overlayLayers, museTexture: museTexture)
     }
 
     /// Composites an avatar texture as the primary source with optional camera overlays
     public func composite(
         avatarTexture: CVPixelBuffer,
-        cameraLayers: [CameraLayer] = []
+        cameraLayers: [CameraLayer] = [],
+        museTexture: CVPixelBuffer? = nil
     ) -> CVPixelBuffer? {
         let avatarImage = CIImage(cvPixelBuffer: avatarTexture)
         let screenSize = avatarImage.extent.size
 
-        return compositeWithBase(baseImage: avatarImage, screenSize: screenSize, cameraLayers: cameraLayers)
+        return compositeWithBase(baseImage: avatarImage, screenSize: screenSize, cameraLayers: cameraLayers, museTexture: museTexture)
     }
 
     // MARK: - Private Composition Core

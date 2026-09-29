@@ -184,7 +184,25 @@ public final class RecordingSession: Sendable {
     /// Register a Muse TTS audio source for mixing into the stream
     public func addMuseAudioSource(_ source: AudioSource) {
         audioRouter.addSource(source)
+        syncAudioMixerRouting()
     }
+
+    /// Mirrors the router's sources into the mixer and pins the microphone as the mix clock when present.
+    /// Without a pin the first source to deliver (screen audio, say) would set the cadence.
+    private func syncAudioMixerRouting() {
+        let ids = audioRouter.allSourceIDs
+        for id in ids { audioMixer.registerSource(id) }
+        if ids.contains("microphone") { audioMixer.setClockSource("microphone") }
+    }
+
+    /// Drops queued audio and the clock choice so nothing carries over between sessions.
+    private func resetAudioMixer() {
+        audioMixer.reset()
+        syncAudioMixerRouting()
+    }
+
+    /// Every audio source registered with the router (tests: Creator CRE-233).
+    public var registeredAudioSourceIDs: [String] { audioRouter.allSourceIDs }
 
     /// Timer for driving frame capture in non-desktop modes
     nonisolated(unsafe) private var cameraFrameTimer: Timer?
@@ -216,7 +234,7 @@ public final class RecordingSession: Sendable {
         self.screenCapture = ScreenCaptureManager()
         self.cameraCaptures = [:]
         self.audioRouter = AudioRouter()
-        self.audioMixer = AudioMixer()
+        self.audioMixer = AudioMixer(voiceSourceID: "muse-voice")
         self.compositor = try CompositorManager()
         self.encoder = VideoEncoder()
 
@@ -310,6 +328,7 @@ public final class RecordingSession: Sendable {
         }
 
         // STEP 2: Add audio sources to audio router (but don't start yet)
+        resetAudioMixer()
         if mode.needsMicrophone {
             print("🎙️ RecordingSession: Adding microphone to audio router")
             let micSource = await audioRouter.addMicrophone()
@@ -317,6 +336,7 @@ public final class RecordingSession: Sendable {
                 self?.audioLevel = level
             }
             print("🎙️ RecordingSession: Microphone source created: \(micSource.sourceID)")
+            syncAudioMixerRouting()
         }
 
         // Add desktop/screen audio if enabled
@@ -324,6 +344,7 @@ public final class RecordingSession: Sendable {
             print("🔊 RecordingSession: Adding screen audio to audio router")
             let _ = await audioRouter.addScreenAudio()
             print("🔊 RecordingSession: Screen audio source created")
+            syncAudioMixerRouting()
         }
 
         // STEP 3: Start encoder FIRST with pre-created audio tracks for all sources
@@ -425,6 +446,7 @@ public final class RecordingSession: Sendable {
 
         // Stop all audio sources
         try? await audioRouter.stopAll()
+        if !_streamingActive.withLock({ $0 }) { resetAudioMixer() }
 
         // Finish encoding
         let result = try await encoder.finishRecording()
@@ -549,6 +571,7 @@ public final class RecordingSession: Sendable {
 
         var composited: CVPixelBuffer?
         var timestamp: CMTime
+        let museTexture: CVPixelBuffer? = museTextureProvider?()
 
         switch mode {
         case .cameraWithMic, .cameraOnly:
@@ -560,7 +583,8 @@ public final class RecordingSession: Sendable {
 
             composited = compositor.composite(
                 cameraLayers: cameraLayers,
-                canvasSize: canvasSize
+                canvasSize: canvasSize,
+                museTexture: museTexture
             )
             timestamp = CMSampleBufferGetPresentationTimeStamp(firstBuffer)
 
@@ -573,7 +597,8 @@ public final class RecordingSession: Sendable {
             let cameraLayers = await MainActor.run { self.cameraLayersForComposition() }
             composited = compositor.composite(
                 avatarTexture: avatarTexture,
-                cameraLayers: cameraLayers
+                cameraLayers: cameraLayers,
+                museTexture: museTexture
             )
             timestamp = CMTime(seconds: CACurrentMediaTime(), preferredTimescale: 600)
 
@@ -697,6 +722,9 @@ public final class RecordingSession: Sendable {
             startCameraFrameDriver()
         }
 
+        // Fresh mixer state for this stream (before any audio source starts delivering)
+        resetAudioMixer()
+
         // Add audio sources if not already added (streaming without recording)
         Task { @MainActor in
             if mode.needsMicrophone && !audioRouter.allSourceIDs.contains("microphone") {
@@ -708,6 +736,7 @@ public final class RecordingSession: Sendable {
             if enableScreenAudio && !audioRouter.allSourceIDs.contains("screen") {
                 let _ = audioRouter.addScreenAudio()
             }
+            syncAudioMixerRouting()
             try? await audioRouter.startAll()
         }
 
@@ -753,6 +782,7 @@ public final class RecordingSession: Sendable {
         _streamingActive.withLock { $0 = false }
         await encoder.stopStreaming()
         await encoder.stopNTDFStreaming()
+        if !_isRecording { resetAudioMixer() }
     }
 
     /// Stop streaming to a single destination (others continue)
@@ -761,6 +791,7 @@ public final class RecordingSession: Sendable {
         // If no destinations remain, deactivate streaming
         if await encoder.activeDestinationIds.isEmpty {
             _streamingActive.withLock { $0 = false }
+            if !_isRecording { resetAudioMixer() }
         }
     }
 

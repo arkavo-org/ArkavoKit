@@ -3,293 +3,164 @@
 //  ArkavoKit
 //
 //  Mixes multiple audio CMSampleBuffer streams into a single output.
-//  Used to combine microphone audio with Muse TTS audio for streaming.
+//  Clock-driven FIFO: one source (the first to deliver, or `clockSourceID`)
+//  sets the frame cadence; every other source is a FIFO of samples drained
+//  by the clock's frame length and zero-filled when short. A configured voice
+//  source ducks the others while it has audio queued. The voice is never
+//  auto-picked as the clock while other sources are registered, and every FIFO
+//  is capped at `maxQueuedSeconds` (oldest samples dropped).
 //
 
 import AVFoundation
 import CoreMedia
 
-/// Mixes multiple audio sources into a single output stream
-/// Sums PCM samples and applies clipping to prevent distortion
 public final class AudioMixer: @unchecked Sendable {
-    // MARK: - Properties
-
-    /// Target output format
     private let sampleRate: Double
     private let channels: UInt32
 
-    /// Source buffers keyed by source ID, with latest sample
     private let lock = NSLock()
-    private var sourceBuffers: [String: CMSampleBuffer] = [:]
-    private var activeSourceIDs: Set<String> = []
-
-    /// Per-source volume/gain (0.0–1.0). Sources not in this dictionary default to 1.0.
+    private var fifos: [String: [Int16]] = [:]        // interleaved Int16, non-clock sources only
+    private var clockSourceID: String?
+    private var registeredSourceIDs: Set<String> = []
     private var sourceGains: [String: Float] = [:]
-    private let gainLock = NSLock()
+    private var lastVoiceActivity: TimeInterval = -.infinity
 
-    /// Ducking: reduce other sources when a priority source is active
-    /// Key = source ID that triggers ducking, value = attenuation factor (0-1)
-    public var duckingRules: [String: Float] = [:]
+    /// The source whose activity ducks the others (the Muse voice). nil = no ducking.
+    public let voiceSourceID: String?
+    /// Attenuation applied to non-voice sources while the voice is active (0.7 = 70%).
+    public var voiceDuckAmount: Float = 0.7
+    /// How long after the voice FIFO empties the duck stays applied, in seconds.
+    public var voiceDuckHangover: TimeInterval = 0.3
 
-    /// Default ducking amount when Muse TTS is speaking (0.7 = reduce mic to 70%)
-    public var ttsActiveDuckAmount: Float = 0.7
+    /// Longest a non-clock source may queue, in seconds. Older samples are dropped.
+    public let maxQueuedSeconds: Double = 0.2
 
-    /// Callback for mixed output
     public var onMixedSample: ((CMSampleBuffer) -> Void)?
 
-    // MARK: - Per-Source Gain
-
-    /// Set volume/gain for a specific source (0.0 = silent, 1.0 = full volume)
-    public func setGain(_ gain: Float, for sourceID: String) {
-        gainLock.lock()
-        sourceGains[sourceID] = max(0, min(1, gain))
-        gainLock.unlock()
+    public init(sampleRate: Double = 48000, channels: UInt32 = 2, voiceSourceID: String? = nil) {
+        self.sampleRate = sampleRate
+        self.channels = channels
+        self.voiceSourceID = voiceSourceID
     }
 
-    /// Get current gain for a source (defaults to 1.0)
+    /// Pins the clock source. Otherwise the first source to deliver becomes the clock.
+    /// Drops any audio the new clock had queued as a non-clock source.
+    public func setClockSource(_ sourceID: String?) {
+        lock.lock()
+        clockSourceID = sourceID
+        if let sourceID { fifos.removeValue(forKey: sourceID) }
+        lock.unlock()
+    }
+
+    /// Declares a source that exists but may not have delivered yet. While any
+    /// non-voice source is registered, the voice is never auto-picked as the clock.
+    /// Registrations survive `reset()` (they mirror the router, not the session).
+    public func registerSource(_ sourceID: String) {
+        lock.lock(); registeredSourceIDs.insert(sourceID); lock.unlock()
+    }
+
+    public func setGain(_ gain: Float, for sourceID: String) {
+        lock.lock(); sourceGains[sourceID] = max(0, min(1, gain)); lock.unlock()
+    }
+
     public func gain(for sourceID: String) -> Float {
-        gainLock.lock()
-        defer { gainLock.unlock() }
+        lock.lock(); defer { lock.unlock() }
         return sourceGains[sourceID] ?? 1.0
     }
 
-    // MARK: - Initialization
-
-    public init(sampleRate: Double = 48000, channels: UInt32 = 2) {
-        self.sampleRate = sampleRate
-        self.channels = channels
-    }
-
-    // MARK: - Public API
-
-    /// Feed a sample from a source into the mixer
-    /// - Parameters:
-    ///   - sampleBuffer: Audio sample buffer (expected: PCM, target sample rate)
-    ///   - sourceID: Identifier of the source
     public func addSample(_ sampleBuffer: CMSampleBuffer, from sourceID: String) {
-        lock.lock()
-        sourceBuffers[sourceID] = sampleBuffer
-        activeSourceIDs.insert(sourceID)
-        let sources = sourceBuffers
-        lock.unlock()
+        guard let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer) else { return }
+        let incoming = Self.samples(of: sampleBuffer)
+        guard !incoming.isEmpty else { return }
 
-        // If only one source, apply gain and pass through (most common case)
-        if sources.count == 1 {
-            gainLock.lock()
-            let vol = sourceGains[sourceID] ?? 1.0
-            gainLock.unlock()
-            if vol >= 0.99 {
-                // Full volume - zero-copy passthrough
-                onMixedSample?(sampleBuffer)
-            } else if let scaled = applyGain(vol, to: sampleBuffer) {
-                onMixedSample?(scaled)
-            }
+        lock.lock()
+        if clockSourceID == nil {
+            let isVoice = sourceID == voiceSourceID
+            let othersExist = !registeredSourceIDs.subtracting([sourceID]).isEmpty
+            // The voice is intermittent: it only becomes the clock when nothing else could be.
+            if !(isVoice && othersExist) { clockSourceID = sourceID }
+        }
+        let isClock = clockSourceID == sourceID
+        if sourceID == voiceSourceID { lastVoiceActivity = CACurrentMediaTime() }
+        if !isClock {
+            let cap = Int(sampleRate * Double(channels) * maxQueuedSeconds)
+            var fifo = fifos[sourceID] ?? []
+            fifos[sourceID] = nil   // keep `fifo` uniquely referenced so removeFirst is in place
+            fifo.append(contentsOf: incoming)
+            if fifo.count > cap { fifo.removeFirst(fifo.count - cap) }
+            fifos[sourceID] = fifo
+            lock.unlock()
             return
         }
-
-        // Mix all current source buffers
-        if let mixed = mixBuffers(sources) {
-            onMixedSample?(mixed)
+        // Drain every other FIFO by the clock's frame count.
+        let frameSamples = incoming.count
+        var contributions: [(id: String, samples: [Int16])] = []
+        for id in Array(fifos.keys) where id != clockSourceID {
+            guard var fifo = fifos[id] else { continue }
+            fifos[id] = nil
+            let take = min(frameSamples, fifo.count)
+            contributions.append((id, Array(fifo.prefix(take))))
+            fifo.removeFirst(take)
+            fifos[id] = fifo
         }
-    }
-
-    /// Mark a source as inactive (e.g., TTS finished speaking)
-    public func deactivateSource(_ sourceID: String) {
-        lock.lock()
-        activeSourceIDs.remove(sourceID)
-        sourceBuffers.removeValue(forKey: sourceID)
-        lock.unlock()
-    }
-
-    /// Remove all sources
-    public func reset() {
-        lock.lock()
-        sourceBuffers.removeAll()
-        activeSourceIDs.removeAll()
-        lock.unlock()
-    }
-
-    // MARK: - Mixing
-
-    /// Apply a gain factor to a single-source sample buffer
-    private func applyGain(_ gain: Float, to sampleBuffer: CMSampleBuffer) -> CMSampleBuffer? {
-        guard let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
-              let srcBlock = CMSampleBufferGetDataBuffer(sampleBuffer) else { return nil }
-
-        let frameCount = CMSampleBufferGetNumSamples(sampleBuffer)
-        guard frameCount > 0 else { return nil }
-
-        let bytesPerSample = Int(channels) * MemoryLayout<Int16>.size
-        let dataLength = frameCount * bytesPerSample
-
-        var blockBuffer: CMBlockBuffer?
-        CMBlockBufferCreateWithMemoryBlock(
-            allocator: kCFAllocatorDefault,
-            memoryBlock: nil,
-            blockLength: dataLength,
-            blockAllocator: kCFAllocatorDefault,
-            customBlockSource: nil,
-            offsetToData: 0,
-            dataLength: dataLength,
-            flags: 0,
-            blockBufferOut: &blockBuffer
-        )
-        guard let outBlock = blockBuffer else { return nil }
-
-        var srcPtr: UnsafeMutablePointer<Int8>?
-        var srcLength = 0
-        CMBlockBufferGetDataPointer(srcBlock, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &srcLength, dataPointerOut: &srcPtr)
-        guard let srcData = srcPtr else { return nil }
-
-        var outPtr: UnsafeMutablePointer<Int8>?
-        var outLength = 0
-        CMBlockBufferGetDataPointer(outBlock, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &outLength, dataPointerOut: &outPtr)
-        guard let outData = outPtr else { return nil }
-
-        let sampleCount = min(srcLength, dataLength) / MemoryLayout<Int16>.size
-        srcData.withMemoryRebound(to: Int16.self, capacity: sampleCount) { src in
-            outData.withMemoryRebound(to: Int16.self, capacity: sampleCount) { dst in
-                for i in 0..<sampleCount {
-                    let scaled = Float(src[i]) * gain
-                    dst[i] = Int16(max(-32768, min(32767, scaled)))
-                }
-            }
-        }
-
-        let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        var result: CMSampleBuffer?
-        CMAudioSampleBufferCreateReadyWithPacketDescriptions(
-            allocator: kCFAllocatorDefault,
-            dataBuffer: outBlock,
-            formatDescription: formatDesc,
-            sampleCount: frameCount,
-            presentationTimeStamp: presentationTime,
-            packetDescriptions: nil,
-            sampleBufferOut: &result
-        )
-        return result
-    }
-
-    private func mixBuffers(_ sources: [String: CMSampleBuffer]) -> CMSampleBuffer? {
-        guard !sources.isEmpty else { return nil }
-
-        // Use the first buffer as the template for format and timing
-        guard let (_, templateBuffer) = sources.first else { return nil }
-
-        guard let formatDesc = CMSampleBufferGetFormatDescription(templateBuffer) else {
-            return nil
-        }
-
-        let frameCount = CMSampleBufferGetNumSamples(templateBuffer)
-        guard frameCount > 0 else { return nil }
-
-        // Check if TTS is active for ducking
-        let ttsActive = activeSourceIDs.contains("muse-tts")
-
-        // Allocate output buffer
-        let bytesPerSample = Int(channels) * MemoryLayout<Int16>.size
-        let dataLength = frameCount * bytesPerSample
-
-        var blockBuffer: CMBlockBuffer?
-        CMBlockBufferCreateWithMemoryBlock(
-            allocator: kCFAllocatorDefault,
-            memoryBlock: nil,
-            blockLength: dataLength,
-            blockAllocator: kCFAllocatorDefault,
-            customBlockSource: nil,
-            offsetToData: 0,
-            dataLength: dataLength,
-            flags: 0,
-            blockBufferOut: &blockBuffer
-        )
-
-        guard let outBlock = blockBuffer else { return nil }
-
-        // Zero the output buffer
-        var zeroData = [UInt8](repeating: 0, count: dataLength)
-        CMBlockBufferReplaceDataBytes(
-            with: &zeroData,
-            blockBuffer: outBlock,
-            offsetIntoDestination: 0,
-            dataLength: dataLength
-        )
-
-        // Get output data pointer
-        var outputPtr: UnsafeMutablePointer<Int8>?
-        var outputLength = 0
-        CMBlockBufferGetDataPointer(
-            outBlock,
-            atOffset: 0,
-            lengthAtOffsetOut: nil,
-            totalLengthOut: &outputLength,
-            dataPointerOut: &outputPtr
-        )
-
-        guard let outData = outputPtr else { return nil }
-        let outputSamples = outData.withMemoryRebound(
-            to: Int16.self,
-            capacity: frameCount * Int(channels)
-        ) { $0 }
-
-        // Snapshot per-source gains
-        gainLock.lock()
+        let voiceQueued = voiceSourceID.map { (fifos[$0]?.isEmpty == false) } ?? false
+        let voiceRecent = CACurrentMediaTime() - lastVoiceActivity <= voiceDuckHangover
+        let ducking = voiceSourceID != nil && (voiceQueued || voiceRecent || contributions.contains { $0.id == voiceSourceID && !$0.samples.isEmpty })
         let gains = sourceGains
-        gainLock.unlock()
+        lock.unlock()
 
-        // Mix each source into the output
-        for (sourceID, buffer) in sources {
-            guard let srcBlock = CMSampleBufferGetDataBuffer(buffer) else { continue }
-
-            var srcPtr: UnsafeMutablePointer<Int8>?
-            var srcLength = 0
-            CMBlockBufferGetDataPointer(
-                srcBlock,
-                atOffset: 0,
-                lengthAtOffsetOut: nil,
-                totalLengthOut: &srcLength,
-                dataPointerOut: &srcPtr
-            )
-
-            guard let srcData = srcPtr else { continue }
-            let srcSamples = srcData.withMemoryRebound(
-                to: Int16.self,
-                capacity: min(srcLength / MemoryLayout<Int16>.size, frameCount * Int(channels))
-            ) { $0 }
-
-            let sampleCount = min(
-                srcLength / MemoryLayout<Int16>.size,
-                frameCount * Int(channels)
-            )
-
-            // Apply per-source volume gain (default 1.0) and TTS ducking
-            let volumeGain = gains[sourceID] ?? 1.0
-            let duckGain: Float = (ttsActive && sourceID != "muse-tts") ? ttsActiveDuckAmount : 1.0
-            let totalGain = volumeGain * duckGain
-
-            for i in 0..<sampleCount {
-                let srcValue = Float(srcSamples[i]) * totalGain
-                let currentValue = Float(outputSamples[i])
-                let mixed = currentValue + srcValue
-
-                // Clip to Int16 range
-                outputSamples[i] = Int16(max(-32768, min(32767, mixed)))
-            }
+        var mixed = [Float](repeating: 0, count: frameSamples)
+        func add(_ id: String, _ src: [Int16]) {
+            let duck: Float = (ducking && id != voiceSourceID) ? voiceDuckAmount : 1.0
+            let g = (gains[id] ?? 1.0) * duck
+            for (i, v) in src.enumerated() { mixed[i] += Float(v) * g }
         }
+        add(sourceID, incoming)
+        for c in contributions { add(c.id, c.samples) }
 
-        // Create output sample buffer
-        let presentationTime = CMSampleBufferGetPresentationTimeStamp(templateBuffer)
+        let out = mixed.map { Int16(max(-32768, min(32767, $0))) }
+        if let sb = Self.makeBuffer(out, frames: frameSamples / Int(channels), format: formatDesc,
+                                    pts: CMSampleBufferGetPresentationTimeStamp(sampleBuffer)) {
+            onMixedSample?(sb)
+        }
+    }
 
-        var sampleBuffer: CMSampleBuffer?
-        CMAudioSampleBufferCreateReadyWithPacketDescriptions(
-            allocator: kCFAllocatorDefault,
-            dataBuffer: outBlock,
-            formatDescription: formatDesc,
-            sampleCount: frameCount,
-            presentationTimeStamp: presentationTime,
-            packetDescriptions: nil,
-            sampleBufferOut: &sampleBuffer
-        )
+    /// Drops a source's queued audio (e.g. the voice was cut).
+    public func deactivateSource(_ sourceID: String) {
+        lock.lock(); fifos.removeValue(forKey: sourceID); lock.unlock()
+    }
 
-        return sampleBuffer
+    public func reset() {
+        lock.lock(); fifos.removeAll(); clockSourceID = nil; lastVoiceActivity = -.infinity; lock.unlock()
+    }
+
+    // MARK: - Buffers
+
+    private static func samples(of sb: CMSampleBuffer) -> [Int16] {
+        guard let block = CMSampleBufferGetDataBuffer(sb) else { return [] }
+        var length = 0
+        var ptr: UnsafeMutablePointer<Int8>?
+        CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &length, dataPointerOut: &ptr)
+        guard let ptr, length >= 2 else { return [] }
+        return ptr.withMemoryRebound(to: Int16.self, capacity: length / 2) {
+            Array(UnsafeBufferPointer(start: $0, count: length / 2))
+        }
+    }
+
+    private static func makeBuffer(_ samples: [Int16], frames: Int, format: CMFormatDescription, pts: CMTime) -> CMSampleBuffer? {
+        let length = samples.count * MemoryLayout<Int16>.size
+        var block: CMBlockBuffer?
+        CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: length,
+                                           blockAllocator: kCFAllocatorDefault, customBlockSource: nil, offsetToData: 0,
+                                           dataLength: length, flags: 0, blockBufferOut: &block)
+        guard let block else { return nil }
+        var copy = samples
+        copy.withUnsafeMutableBytes { raw in
+            _ = CMBlockBufferReplaceDataBytes(with: raw.baseAddress!, blockBuffer: block, offsetIntoDestination: 0, dataLength: length)
+        }
+        var out: CMSampleBuffer?
+        CMAudioSampleBufferCreateReadyWithPacketDescriptions(allocator: kCFAllocatorDefault, dataBuffer: block,
+            formatDescription: format, sampleCount: frames, presentationTimeStamp: pts, packetDescriptions: nil, sampleBufferOut: &out)
+        return out
     }
 }
