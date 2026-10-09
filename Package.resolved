@@ -1,13 +1,13 @@
 {
-  "originHash" : "db2d33ce2ae5df2577aa07d3e22d00b773a85957f70a6e3a75b7421d58e906d2",
+  "originHash" : "411ea9dc19ba0676471f1b76d41608c403b8da67e896ae1d96e84856594d75f7",
   "pins" : [
     {
       "identity" : "arkavomediakit",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/arkavo-org/ArkavoMediaKit",
       "state" : {
-        "revision" : "e945588cde271a398d3242e96d1927884a7230f6",
-        "version" : "0.1.2"
+        "revision" : "9c0068df15e8726302563923b66d8ad4a6c5d04e",
+        "version" : "0.2.0"
       }
     },
     {
@@ -24,8 +24,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/arkavo-org/iroh-swift",
       "state" : {
-        "revision" : "c1624b0d5823e548506134996030b633c9c12ca4",
-        "version" : "0.5.0"
+        "revision" : "b62347b05546010ec13ebe9eddec008ca5172f02",
+        "version" : "0.5.1"
       }
     },
     {
@@ -33,8 +33,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/arkavo-org/OpenTDFKit",
       "state" : {
-        "revision" : "5e68ccb2e41744ab73506f3d250e0a7f44a6fc80",
-        "version" : "4.0.1"
+        "revision" : "3512e279d371e19f1495be13be3229c2e24c8783",
+        "version" : "5.0.1"
       }
     },
     {
