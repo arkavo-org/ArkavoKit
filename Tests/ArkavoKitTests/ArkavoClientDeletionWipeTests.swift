@@ -48,6 +48,37 @@ final class ArkavoClientDeletionWipeTests: XCTestCase {
         return (handler, connection)
     }
 
+    private struct TimedOut: Error {}
+
+    /// The error `task` threw, or nil when it returned. A waiter still parked
+    /// after two seconds is released and `TimedOut` comes back, so the test
+    /// fails instead of hanging.
+    private func thrownError<T: Sendable>(by task: Task<T, Error>) async -> Error? {
+        let client = harness.client
+        return await withTaskGroup(of: Error?.self) { group in
+            group.addTask {
+                do {
+                    _ = try await task.value
+                    return nil
+                } catch {
+                    return error
+                }
+            }
+            group.addTask {
+                do {
+                    try await Task.sleep(nanoseconds: 2_000_000_000)
+                } catch {
+                    return nil // cancelled: the waiter finished first
+                }
+                await releaseParkedWaiters(on: client)
+                return TimedOut()
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
+    }
+
     private func assertThrewAccountDeletionFailed(_ call: () async throws -> AccountDeletionResult, file: StaticString = #filePath, line: UInt = #line) async {
         do {
             let result = try await call()
@@ -324,6 +355,7 @@ final class ArkavoClientDeletionWipeTests: XCTestCase {
         let cancelled = URLError(.cancelled)
         harness.client.handleSocketState(.error(cancelled), from: staleSocket)
         await harness.client.handleReceiveResult(.failure(cancelled), from: staleSocket)
+        harness.client.handleInitialPingResult(cancelled, from: staleSocket)
         harness.client.handleSocketState(.disconnected, from: staleSocket)
 
         XCTAssertEqual(harness.client.currentState, .disconnected)
@@ -374,6 +406,54 @@ final class ArkavoClientDeletionWipeTests: XCTestCase {
         _ = try? await waiters.connection.value
     }
 
+    func testPingFailureOfAReplacedSocketIsIgnoredButTheCurrentOneStillCounts() async throws {
+        installLiveSession()
+        let staleSocket = try XCTUnwrap(harness.client.webSocket)
+        let currentSocket = harness.client.session!.webSocketTask(with: URL(string: "wss://kas.example.test/2")!)
+        harness.client.webSocket = currentSocket
+        harness.client.currentState = .connecting
+        let waiters = await installPendingWaiters()
+
+        harness.client.handleInitialPingResult(URLError(.cancelled), from: staleSocket)
+        XCTAssertEqual(harness.client.currentState, .connecting)
+        XCTAssertNotNil(harness.client.connectionContinuation, "the closed socket's ping does not fail the pending connection")
+
+        // Control: the current socket's ping failure still fails the connection.
+        harness.client.handleInitialPingResult(URLError(.timedOut), from: currentSocket)
+        XCTAssertEqual(harness.client.currentState, .error(URLError(.timedOut)))
+        let connectionError = await thrownError(by: waiters.connection)
+        XCTAssertEqual((connectionError as? URLError)?.code, .timedOut)
+
+        // A ping failure leaves message handlers alone; release this one so its task finishes.
+        releaseParkedWaiters(on: harness.client)
+        _ = await thrownError(by: waiters.handler)
+    }
+
+    // MARK: - disconnect()
+
+    /// The closed socket's late callbacks are dropped, so `disconnect()` itself
+    /// must fail whatever waits on the connection (a `decryptNanoTDF` waiting
+    /// for its key, say).
+    func testDisconnectFailsPendingWaiters() async throws {
+        installLiveSession()
+        let staleSocket = try XCTUnwrap(harness.client.webSocket)
+        let waiters = await installPendingWaiters()
+
+        await harness.client.disconnect()
+        let cancelled = URLError(.cancelled)
+        harness.client.handleSocketState(.error(cancelled), from: staleSocket)
+        await harness.client.handleReceiveResult(.failure(cancelled), from: staleSocket)
+        harness.client.handleInitialPingResult(cancelled, from: staleSocket)
+
+        XCTAssertTrue(harness.client.messageHandlers.isEmpty)
+        XCTAssertNil(harness.client.connectionContinuation)
+        XCTAssertEqual(harness.client.currentState, .disconnected, "the closed socket's late error does not replace .disconnected")
+        let handlerError = await thrownError(by: waiters.handler)
+        let connectionError = await thrownError(by: waiters.connection)
+        assertConnectionClosed(handlerError)
+        assertConnectionClosed(connectionError)
+    }
+
     func testTearDownInvalidatesTheSession() async throws {
         let probe = InvalidationProbe()
         let client = harness.client
@@ -394,6 +474,20 @@ final class ArkavoClientDeletionWipeTests: XCTestCase {
         XCTAssertNotNil(harness.client.webSocket, file: file, line: line)
         XCTAssertNotNil(harness.client.session, file: file, line: line)
     }
+}
+
+/// Resumes whatever is still parked on `client`, so a failing test leaks no
+/// continuation.
+@MainActor
+private func releaseParkedWaiters(on client: ArkavoClient) {
+    let handlers = client.messageHandlers.values
+    client.messageHandlers.removeAll()
+    let connection = client.connectionContinuation
+    client.connectionContinuation = nil
+    for handler in handlers {
+        handler.resume(throwing: CancellationError())
+    }
+    connection?.resume(throwing: CancellationError())
 }
 
 /// Records what the client tells its delegate.

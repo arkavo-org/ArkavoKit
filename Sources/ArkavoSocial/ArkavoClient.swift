@@ -316,6 +316,8 @@ public final class ArkavoClient: NSObject {
         webSocket?.cancel()
         webSocket = nil
         session = nil
+        // The cancelled socket's callbacks are ignored, so nothing else fails these.
+        failPendingWaiters(ArkavoError.connectionFailed("Connection disconnected"))
         KeychainManager.deleteAuthenticationToken()
     }
 
@@ -461,18 +463,22 @@ public final class ArkavoClient: NSObject {
         salt = nil
         kasPublicKey = nil
 
-        let closed = ArkavoError.connectionFailed("Account deleted")
-        let handlers = messageHandlers.values
-        messageHandlers.removeAll()
-        for handler in handlers {
-            handler.resume(throwing: closed)
-        }
-        if let continuation = connectionContinuation {
-            connectionContinuation = nil
-            continuation.resume(throwing: closed)
-        }
+        failPendingWaiters(ArkavoError.connectionFailed("Account deleted"))
 
         currentState = .disconnected
+    }
+
+    /// Fails every pending message handler and the pending connection with
+    /// `error`. Both are cleared before any is resumed.
+    private func failPendingWaiters(_ error: Error) {
+        let handlers = messageHandlers.values
+        messageHandlers.removeAll()
+        let continuation = connectionContinuation
+        connectionContinuation = nil
+        for handler in handlers {
+            handler.resume(throwing: error)
+        }
+        continuation?.resume(throwing: error)
     }
 
     /// What the server said about a deletion, and the token it said it to.
@@ -930,22 +936,36 @@ public final class ArkavoClient: NSObject {
         let webSocket = session.webSocketTask(with: request)
         self.webSocket = webSocket
 
-        webSocket.sendPing { [weak self] error in
+        webSocket.sendPing { [weak self, weak webSocket] error in
+            guard let self, let webSocket else { return }
+
             Task { @MainActor in
-                if let error {
-                    print("Initial ping failed: \(error)")
-                    self?.connectionContinuation?.resume(throwing: error)
-                    self?.connectionContinuation = nil
-                    self?.currentState = .error(error)
-                } else {
-                    print("Initial ping successful")
-                }
+                self.handleInitialPingResult(error, from: webSocket)
             }
         }
 
         print("\nWebSocket Task Created: \(webSocket)")
         webSocket.resume()
         receiveMessage()
+    }
+
+    /// Handles the reply to the first ping on `task`: a failure fails the
+    /// pending connection and sets `.error`. Dropped when `task` is no longer
+    /// `webSocket`: a ping still outstanding when its socket was cancelled
+    /// fails, and that failure is not the current connection's. Internal so
+    /// tests can drive it.
+    func handleInitialPingResult(_ error: Error?, from task: URLSessionWebSocketTask) {
+        guard task === webSocket else { return }
+        if let error {
+            print("Initial ping failed: \(error)")
+            if let continuation = connectionContinuation {
+                connectionContinuation = nil
+                continuation.resume(throwing: error)
+            }
+            currentState = .error(error)
+        } else {
+            print("Initial ping successful")
+        }
     }
 
     private func receiveMessage() {
