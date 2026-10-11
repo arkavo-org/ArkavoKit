@@ -239,6 +239,25 @@ final class ArkavoClientDeletionTests: XCTestCase {
         XCTAssertTrue(http.requests.isEmpty)
     }
 
+    func testPaddedNameIsRefusedWithoutASignIn() async {
+        harness.stubCeremonies([.failure(Self.userNotFound)])
+        let http = harness.stubHTTP([])
+        harness.store.handle = "alice"
+
+        do {
+            _ = try await client.deleteAccount(accountName: " alice")
+            XCTFail("expected a refusal")
+        } catch ArkavoError.invalidURL {
+            // expected
+        } catch {
+            XCTFail("wrong error: \(error)")
+        }
+        XCTAssertTrue(harness.ceremonies.isEmpty)
+        XCTAssertTrue(http.requests.isEmpty)
+        XCTAssertTrue(harness.store.removals.isEmpty)
+        XCTAssertFalse(client.isDeletingAccount)
+    }
+
     func testRefusedWhileConnectingOrAuthenticating() async {
         harness.stubCeremonies([.success("fresh-token")])
         let http = harness.stubHTTP([])

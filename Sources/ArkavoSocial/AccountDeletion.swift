@@ -17,6 +17,15 @@ public struct AccountDeletionReceipt: Sendable, Equatable {
     }
 }
 
+extension AccountDeletionReceipt: CustomStringConvertible, CustomDebugStringConvertible {
+    /// Never includes `deletionID`, which is a bearer secret.
+    public var description: String {
+        "AccountDeletionReceipt(deletionID: <redacted>, requestedAt: \(requestedAt), completesBy: \(completesBy))"
+    }
+
+    public var debugDescription: String { description }
+}
+
 /// How `ArkavoClient.deleteAccount(accountName:)` ended.
 public enum AccountDeletionResult: Sendable, Equatable {
     /// The server accepted the deletion. The receipt is nil when a 2xx body did

@@ -63,13 +63,14 @@ public final class ArkavoClient: NSObject {
     private var sharedSecret: SharedSecret?
     private var salt: Data?
     private var kasPublicKey: P256.KeyAgreement.PublicKey?
-    private var sessionSymmetricKey: SymmetricKey?
-    private var webSocket: URLSessionWebSocketTask?
-    private var session: URLSession?
+    // Internal rather than private so tests can install and observe a live-looking session.
+    var sessionSymmetricKey: SymmetricKey?
+    var webSocket: URLSessionWebSocketTask?
+    var session: URLSession?
     private let delegateQueue = OperationQueue()
     private let socketDelegate: WebSocketDelegate
-    private var connectionContinuation: CheckedContinuation<Void, Error>?
-    private var messageHandlers: [UInt8: CheckedContinuation<Data, Error>] = [:]
+    var connectionContinuation: CheckedContinuation<Void, Error>?
+    var messageHandlers: [UInt8: CheckedContinuation<Data, Error>] = [:]
     private let profileCache = ProfileCache(capacity: 100)
 
     // MARK: - Test seams (internal; tests replace them through @testable import)
@@ -350,23 +351,116 @@ public final class ArkavoClient: NSObject {
     ///   `.alreadyDeleted` when the sign-in found no such account.
     /// - Throws: `ArkavoError.invalidState` while another deletion runs or the
     ///   client is connecting or authenticating; `ArkavoError.invalidURL` for an
-    ///   empty name; the ceremony's own error (`ASAuthorizationError.canceled`
-    ///   when the person cancels); otherwise
-    ///   `ArkavoError.authenticationFailed("Account deletion failed")`.
+    ///   empty name or one with leading or trailing whitespace (a padded name
+    ///   could find no account and be taken for an already deleted one); the
+    ///   ceremony's own error (`ASAuthorizationError.canceled` when the person
+    ///   cancels); otherwise `ArkavoError.authenticationFailed("Account deletion failed")`.
     ///   Nothing is removed from this device when it throws.
     @MainActor
     public func deleteAccount(accountName: String) async throws -> AccountDeletionResult {
         guard !isDeletingAccount, currentState != .connecting, currentState != .authenticating else {
             throw ArkavoError.invalidState
         }
-        guard !accountName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        let trimmedName = accountName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty, trimmedName == accountName else {
             throw ArkavoError.invalidURL
         }
         isDeletingAccount = true
         defer { isDeletingAccount = false }
 
+        // Read before the ceremony: the wipe decides from what was stored then.
+        let storedToken = credentialStore.authenticationToken()
+        let storedHandle = credentialStore.sharedHandle()
+
         let outcome = try await requestAccountDeletion(accountName: accountName)
+        wipeLocalAccountState(
+            after: outcome,
+            accountName: accountName,
+            storedToken: storedToken,
+            storedHandle: storedHandle
+        )
         return outcome.result
+    }
+
+    /// Removes this device's copy of a deleted account. Best effort: a failure
+    /// is logged without secrets and the remaining steps still run.
+    ///
+    /// The shared keychain items belong to every Arkavo app on the device, so
+    /// they go only when they are this account's: the session token when its
+    /// CWT `sub` is the fresh token's (or, when either `sub` is unreadable or
+    /// there is no fresh token, under the handle condition); the shared handle,
+    /// DID, local identity pair and DID key when the stored shared handle is
+    /// nil or `accountName`.
+    private func wipeLocalAccountState(
+        after outcome: DeletionOutcome,
+        accountName: String,
+        storedToken: String?,
+        storedHandle: String?
+    ) {
+        tearDownSession()
+
+        let handleIsThisAccount = storedHandle == nil || storedHandle == accountName
+        if let storedToken,
+           Self.storedToken(storedToken, belongsToAccountOf: outcome.freshToken, handleIsThisAccount: handleIsThisAccount)
+        {
+            credentialStore.deleteAuthenticationToken()
+        }
+        if handleIsThisAccount {
+            credentialStore.deleteSharedHandleAndDID()
+            credentialStore.deleteIdentityPair()
+            do {
+                try credentialStore.deleteDIDKey()
+            } catch {
+                // A KeychainError carries an OSStatus, no secret.
+                print("ArkavoClient.deleteAccount: could not remove the DID key: \(error)")
+            }
+        }
+        credentialStore.deleteAppleAccount()
+    }
+
+    /// Whether the stored session token is the deleted account's: the two CWT
+    /// subjects match. When either is unreadable, or there is no fresh token
+    /// (`.alreadyDeleted`), the handle condition decides.
+    private static func storedToken(
+        _ storedToken: String,
+        belongsToAccountOf freshToken: String?,
+        handleIsThisAccount: Bool
+    ) -> Bool {
+        guard let freshToken,
+              let storedSubject = CWTSubject.sub(fromToken: storedToken),
+              let freshSubject = CWTSubject.sub(fromToken: freshToken)
+        else {
+            return handleIsThisAccount
+        }
+        return storedSubject == freshSubject
+    }
+
+    /// Closes the socket and forgets the session without touching the keychain,
+    /// whatever the connection state. (`disconnect()` runs only from
+    /// `.connected` and always deletes the stored token.)
+    private func tearDownSession() {
+        webSocket?.cancel()
+        webSocket = nil
+        session = nil
+
+        sessionSymmetricKey = nil
+        keyPair = nil
+        sharedSecret = nil
+        salt = nil
+        kasPublicKey = nil
+
+        let closed = ArkavoError.connectionFailed("Account deleted")
+        let handlers = messageHandlers.values
+        messageHandlers.removeAll()
+        for handler in handlers {
+            handler.resume(throwing: closed)
+        }
+        if let continuation = connectionContinuation {
+            connectionContinuation = nil
+            continuation.resume(throwing: closed)
+        }
+
+        currentState = .disconnected
     }
 
     /// What the server said about a deletion, and the token it said it to.
