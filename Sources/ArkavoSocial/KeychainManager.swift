@@ -520,14 +520,19 @@ public extension KeychainManager {
         return result
     }
 
-    internal static func deleteDIDKey() throws {
-        let query: [String: Any] = [
+    /// The query that finds the Secure Enclave DID key for deletion. The tag is
+    /// `Data`, as at creation and lookup; a `String` tag matches nothing, so
+    /// `SecItemDelete` used to report success while the key stayed.
+    internal static func didKeyDeletionQuery() -> [String: Any] {
+        [
             kSecClass as String: kSecClassKey,
-            kSecAttrApplicationTag as String: didKeyTag,
+            kSecAttrApplicationTag as String: didKeyTag.data(using: .utf8)!,
             kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
         ]
+    }
 
-        let status = SecItemDelete(query as CFDictionary)
+    internal static func deleteDIDKey() throws {
+        let status = SecItemDelete(didKeyDeletionQuery() as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw KeychainError.unknown(status)
         }
