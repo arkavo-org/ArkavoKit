@@ -1645,6 +1645,10 @@ public final class ArkavoClient: NSObject {
     ///
     /// Throws [`AppleLinkError.conflict`] if this Apple identity is already
     /// linked to a different arkavo account.
+    ///
+    /// Sends no authorization code. A server that requires one (so it can
+    /// revoke the Apple token when the account is deleted) answers 400.
+    @available(*, deprecated, message: "Pass the credential's authorizationCode: linkAppleIdentity(idToken:authorizationCode:)")
     public func linkAppleIdentity(idToken: String) async throws {
         try await linkAppleIdentity(idToken: idToken, authorizationCode: nil)
     }

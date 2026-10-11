@@ -34,6 +34,8 @@ final class AppleLinkAuthorizationCodeTests: XCTestCase {
         XCTAssertEqual(try body(of: XCTUnwrap(http.requests.first)), ["id_token": "apple-id-token"])
     }
 
+    /// Deprecated itself so that calling the deprecated overload does not warn.
+    @available(*, deprecated)
     func testTheOneArgumentLinkSendsNoAuthorizationCode() async throws {
         let client = makeTestClient()
         let http = ScriptedHTTP([.status(200, "{}")])
