@@ -394,8 +394,10 @@ public final class ArkavoClient: NSObject {
         return outcome.result
     }
 
-    /// Removes this device's copy of a deleted account. Best effort: a failure
-    /// is logged without secrets and the remaining steps still run.
+    /// Removes this device's copy of a deleted account. Best effort: every step
+    /// runs whatever the others did. Only removing the DID key reports a
+    /// failure, which is logged as its `KeychainError` (no secret); the other
+    /// removals ignore theirs.
     ///
     /// The shared keychain items belong to every Arkavo app on the device, so
     /// they go only when they are this account's: the session token when its

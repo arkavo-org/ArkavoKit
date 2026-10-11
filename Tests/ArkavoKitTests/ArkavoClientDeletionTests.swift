@@ -209,7 +209,7 @@ final class ArkavoClientDeletionTests: XCTestCase {
 
     func testTransportErrorThrows() async {
         harness.stubCeremonies([.success("fresh-token")])
-        harness.stubHTTP([.failure(URLError(.notConnectedToInternet))])
+        let http = harness.stubHTTP([.failure(URLError(.notConnectedToInternet))])
 
         do {
             _ = try await client.deleteAccount(accountName: "alice")
@@ -217,6 +217,7 @@ final class ArkavoClientDeletionTests: XCTestCase {
         } catch {
             assertDeletionFailed(error)
         }
+        XCTAssertEqual(http.requests.count, 1, "a transport error is not retried")
     }
 
     // MARK: - Refusals
