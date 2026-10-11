@@ -74,6 +74,11 @@ public final class ArkavoClient: NSObject {
 
     // MARK: - Test seams (internal; tests replace them through @testable import)
 
+    /// The passkey ceremony: account name → fresh auth CWT. Never stores the token.
+    lazy var authenticator: @MainActor (String) async throws -> String = { [unowned self] accountName in
+        try await self.authenticateUser(accountName: accountName)
+    }
+
     /// Performs an identity REST request. Used by the account-deletion and
     /// Apple-link requests.
     var httpData: @MainActor (URLRequest) async throws -> (Data, URLResponse) = ArkavoClient.http3Data(for:)
@@ -113,6 +118,10 @@ public final class ArkavoClient: NSObject {
     }
 
     public weak var delegate: ArkavoClientDelegate?
+
+    /// True while `deleteAccount(accountName:)` runs. `connect`, `registerUser`
+    /// and `linkAppleIdentity` refuse with `ArkavoError.invalidState` meanwhile.
+    private(set) var isDeletingAccount = false
     private let presentationProvider: ASAuthorizationControllerPresentationContextProviding
     public var currentToken: String? {
         // TODO: Check if the token has expired
@@ -189,6 +198,7 @@ public final class ArkavoClient: NSObject {
 
     @MainActor
     public func connect(accountName: String) async throws {
+        guard !isDeletingAccount else { throw ArkavoError.invalidState }
         print("ArkavoClient: Connecting...")
         // Check current state more thoroughly
         switch currentState {
@@ -300,6 +310,7 @@ public final class ArkavoClient: NSObject {
 
     /// Deletes the user's account from the server
     /// - Throws: ArkavoError if the deletion fails
+    @available(*, deprecated, message: "Use deleteAccount(accountName:)")
     public func deleteAccount() async throws {
         guard let token = KeychainManager.getAuthenticationToken() else {
             throw ArkavoError.authenticationFailed("No authentication token")
@@ -326,6 +337,108 @@ public final class ArkavoClient: NSObject {
 
         // Disconnect and clear local auth state
         await disconnect()
+    }
+
+    /// Deletes the Arkavo account `accountName` (App Store guideline 5.1.1(v)).
+    ///
+    /// Runs a passkey sign-in for a fresh token, because the server accepts
+    /// only one minted within 300 s, then sends `DELETE /account`. A 409 is
+    /// retried once with the same token; a 401 runs the sign-in once more and
+    /// retries once.
+    ///
+    /// - Returns: `.deleted` when the server accepted the deletion, or
+    ///   `.alreadyDeleted` when the sign-in found no such account.
+    /// - Throws: `ArkavoError.invalidState` while another deletion runs or the
+    ///   client is connecting or authenticating; `ArkavoError.invalidURL` for an
+    ///   empty name; the ceremony's own error (`ASAuthorizationError.canceled`
+    ///   when the person cancels); otherwise
+    ///   `ArkavoError.authenticationFailed("Account deletion failed")`.
+    ///   Nothing is removed from this device when it throws.
+    @MainActor
+    public func deleteAccount(accountName: String) async throws -> AccountDeletionResult {
+        guard !isDeletingAccount, currentState != .connecting, currentState != .authenticating else {
+            throw ArkavoError.invalidState
+        }
+        guard !accountName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw ArkavoError.invalidURL
+        }
+        isDeletingAccount = true
+        defer { isDeletingAccount = false }
+
+        let outcome = try await requestAccountDeletion(accountName: accountName)
+        return outcome.result
+    }
+
+    /// What the server said about a deletion, and the token it said it to.
+    private struct DeletionOutcome {
+        let result: AccountDeletionResult
+        /// The fresh token behind `.deleted`; nil for `.alreadyDeleted`.
+        let freshToken: String?
+    }
+
+    private static let accountDeletionFailed = ArkavoError.authenticationFailed("Account deletion failed")
+
+    /// The ceremony and `DELETE /account`, with one retry at most: a 409 again
+    /// with the same token, a 401 with a new one. Never logs the token or a body.
+    private func requestAccountDeletion(accountName: String) async throws -> DeletionOutcome {
+        guard var token = try await freshDeletionToken(accountName: accountName) else {
+            return DeletionOutcome(result: .alreadyDeleted, freshToken: nil)
+        }
+
+        var (data, status) = try await sendDeleteAccount(token: token)
+        switch status {
+        case 200 ... 299:
+            return DeletionOutcome(result: .deleted(AccountDeletionReceipt.decode(data)), freshToken: token)
+        case 409:
+            break // a concurrent change on the server: retry with the same token
+        case 401:
+            guard let renewed = try await freshDeletionToken(accountName: accountName) else {
+                return DeletionOutcome(result: .alreadyDeleted, freshToken: nil)
+            }
+            token = renewed
+        default:
+            throw Self.accountDeletionFailed
+        }
+
+        (data, status) = try await sendDeleteAccount(token: token)
+        guard (200 ... 299).contains(status) else {
+            throw Self.accountDeletionFailed
+        }
+        return DeletionOutcome(result: .deleted(AccountDeletionReceipt.decode(data)), freshToken: token)
+    }
+
+    /// The passkey ceremony for a deletion. nil when the server has no account
+    /// by that name ("User Not Found"): it was already deleted. Every other
+    /// error, `ASAuthorizationError.canceled` included, is rethrown unchanged.
+    private func freshDeletionToken(accountName: String) async throws -> String? {
+        do {
+            return try await authenticator(accountName)
+        } catch let ArkavoError.authenticationFailed(message) where message == "User Not Found" {
+            return nil
+        }
+    }
+
+    /// Sends `DELETE /account` with `token` and returns the body and status.
+    /// A transport error or a non-HTTP response is the generic failure.
+    private func sendDeleteAccount(token: String) async throws -> (Data, Int) {
+        var request = URLRequest(url: authURL.appendingPathComponent("account"))
+        request.httpMethod = "DELETE"
+        request.setValue(token, forHTTPHeaderField: "X-Auth-Token")
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await httpData(request)
+        } catch {
+            let nsError = error as NSError
+            print("ArkavoClient.deleteAccount: transport error domain=\(nsError.domain) code=\(nsError.code)")
+            throw Self.accountDeletionFailed
+        }
+        guard let http = response as? HTTPURLResponse else {
+            throw Self.accountDeletionFailed
+        }
+        print("ArkavoClient.deleteAccount: status=\(http.statusCode)")
+        return (data, http.statusCode)
     }
 
     public func sendMessage(_ data: Data) async throws {
@@ -908,6 +1021,7 @@ public final class ArkavoClient: NSObject {
 
     /// Register a new user with WebAuthn
     public func registerUser(handle: String, did: String) async throws -> String {
+        guard !isDeletingAccount else { throw ArkavoError.invalidState }
         print("Initiating user registration with handle: \(handle)")
 
         // Admission control: the server refuses registration without a
@@ -1404,7 +1518,9 @@ public final class ArkavoClient: NSObject {
     /// a server without that support ignores the field.
     ///
     /// Pass `ASAuthorizationAppleIDCredential.authorizationCode` decoded as UTF-8.
+    /// Throws `ArkavoError.invalidState` while an account deletion is running.
     public func linkAppleIdentity(idToken: String, authorizationCode: String?) async throws {
+        guard !isDeletingAccount else { throw ArkavoError.invalidState }
         guard let cwt = credentialStore.authenticationToken() else {
             print("ArkavoClient.linkAppleIdentity: no CWT in keychain (missingAuthToken)")
             throw AppleLinkError.missingAuthToken

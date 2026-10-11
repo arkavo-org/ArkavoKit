@@ -75,3 +75,64 @@ func makeTestClient() -> ArkavoClient {
         relyingPartyID: "identity.example.test"
     )
 }
+
+/// Holds an async call until the test opens it, so a test can act while a
+/// deletion is suspended inside its passkey ceremony.
+@MainActor
+final class Gate {
+    private var held: CheckedContinuation<Void, Never>?
+    private var arrival: CheckedContinuation<Void, Never>?
+    private(set) var isHolding = false
+
+    /// Called by the code under test; returns once `open()` is called.
+    func pass() async {
+        await withCheckedContinuation { continuation in
+            held = continuation
+            isHolding = true
+            arrival?.resume()
+            arrival = nil
+        }
+    }
+
+    /// Called by the test; returns once something is waiting in `pass()`.
+    func waitUntilHolding() async {
+        if isHolding { return }
+        await withCheckedContinuation { arrival = $0 }
+    }
+
+    func open() {
+        isHolding = false
+        held?.resume()
+        held = nil
+    }
+}
+
+/// A client wired to a fake keychain, scripted ceremonies and scripted HTTP.
+@MainActor
+final class DeletionHarness {
+    let client = makeTestClient()
+    let store = FakeCredentialStore()
+    /// The account name of every ceremony run, in order.
+    private(set) var ceremonies: [String] = []
+
+    init() {
+        client.credentialStore = store
+    }
+
+    /// Each ceremony returns the next token or throws the next error.
+    func stubCeremonies(_ outcomes: [Result<String, Error>]) {
+        var remaining = outcomes
+        client.authenticator = { [unowned self] accountName in
+            ceremonies.append(accountName)
+            guard !remaining.isEmpty else { throw ArkavoError.invalidResponse }
+            return try remaining.removeFirst().get()
+        }
+    }
+
+    @discardableResult
+    func stubHTTP(_ outcomes: [ScriptedHTTP.Outcome]) -> ScriptedHTTP {
+        let http = ScriptedHTTP(outcomes)
+        client.httpData = http.perform
+        return http
+    }
+}
