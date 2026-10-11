@@ -310,10 +310,113 @@ final class ArkavoClientDeletionWipeTests: XCTestCase {
         assertSessionUntouched()
     }
 
+    // MARK: - Late callbacks of the torn-down socket
+
+    func testLateCancellationOfTheClosedSocketDoesNotOverwriteDisconnected() async throws {
+        installLiveSession()
+        let staleSocket = try XCTUnwrap(harness.client.webSocket)
+        let delegate = RecordingClientDelegate()
+        harness.client.delegate = delegate
+
+        _ = try await deleteAlice(signIn: .success(TestCWT.token(sub: "user-1")))
+        delegate.reset() // the teardown's own .disconnected is expected; only later events matter
+
+        let cancelled = URLError(.cancelled)
+        harness.client.handleSocketState(.error(cancelled), from: staleSocket)
+        await harness.client.handleReceiveResult(.failure(cancelled), from: staleSocket)
+        harness.client.handleSocketState(.disconnected, from: staleSocket)
+
+        XCTAssertEqual(harness.client.currentState, .disconnected)
+        XCTAssertTrue(delegate.errors.isEmpty, "the delegate hears nothing from the closed socket")
+        XCTAssertTrue(delegate.states.isEmpty, "no state change from the closed socket")
+    }
+
+    func testCallbacksOfAReplacedSocketAreIgnoredButTheCurrentOneStillCounts() async throws {
+        installLiveSession()
+        let staleSocket = try XCTUnwrap(harness.client.webSocket)
+        let currentSocket = harness.client.session!.webSocketTask(with: URL(string: "wss://kas.example.test/2")!)
+        harness.client.webSocket = currentSocket
+        harness.client.currentState = .connecting
+        let delegate = RecordingClientDelegate()
+        harness.client.delegate = delegate
+
+        harness.client.handleSocketState(.error(URLError(.cancelled)), from: staleSocket)
+        await harness.client.handleReceiveResult(.failure(URLError(.cancelled)), from: staleSocket)
+        XCTAssertEqual(harness.client.currentState, .connecting)
+        XCTAssertTrue(delegate.errors.isEmpty)
+
+        // Control: the current socket's callbacks still update state.
+        harness.client.handleSocketState(.connected, from: currentSocket)
+        XCTAssertEqual(harness.client.currentState, .connected)
+
+        await harness.client.handleReceiveResult(.failure(URLError(.networkConnectionLost)), from: currentSocket)
+        if case .error = harness.client.currentState {} else {
+            XCTFail("the current socket's receive failure must set .error, got \(harness.client.currentState)")
+        }
+        XCTAssertEqual(delegate.errors.count, 1, "the current socket's receive failure reaches the delegate")
+    }
+
+    func testStaleSocketDoesNotFailPendingWaiters() async throws {
+        installLiveSession()
+        let staleSocket = try XCTUnwrap(harness.client.webSocket)
+        harness.client.webSocket = harness.client.session!.webSocketTask(with: URL(string: "wss://kas.example.test/2")!)
+        let waiters = await installPendingWaiters()
+
+        harness.client.handleSocketState(.error(URLError(.cancelled)), from: staleSocket)
+        await harness.client.handleReceiveResult(.failure(URLError(.cancelled)), from: staleSocket)
+
+        XCTAssertFalse(harness.client.messageHandlers.isEmpty)
+        XCTAssertNotNil(harness.client.connectionContinuation)
+
+        // Resolve the waiters so the tasks finish.
+        harness.client.handleSocketState(.error(URLError(.networkConnectionLost)), from: harness.client.webSocket!)
+        _ = try? await waiters.handler.value
+        _ = try? await waiters.connection.value
+    }
+
+    func testTearDownInvalidatesTheSession() async throws {
+        let probe = InvalidationProbe()
+        let client = harness.client
+        client.currentState = .connected
+        let session = URLSession(configuration: .ephemeral, delegate: probe, delegateQueue: nil)
+        client.session = session
+        client.webSocket = session.webSocketTask(with: URL(string: "wss://kas.example.test")!)
+
+        _ = try await deleteAlice(signIn: .success(TestCWT.token(sub: "user-1")))
+
+        await fulfillment(of: [probe.invalidated], timeout: 5)
+        XCTAssertNil(client.session)
+    }
+
     private func assertSessionUntouched(file: StaticString = #filePath, line: UInt = #line) {
         XCTAssertEqual(harness.client.currentState, .connected, "a failed deletion leaves the session alone", file: file, line: line)
         XCTAssertNotNil(harness.client.sessionSymmetricKey, file: file, line: line)
         XCTAssertNotNil(harness.client.webSocket, file: file, line: line)
         XCTAssertNotNil(harness.client.session, file: file, line: line)
+    }
+}
+
+/// Records what the client tells its delegate.
+@MainActor
+private final class RecordingClientDelegate: ArkavoClientDelegate {
+    private(set) var states: [ArkavoClientState] = []
+    private(set) var errors: [Error] = []
+
+    func reset() {
+        states = []
+        errors = []
+    }
+
+    func clientDidChangeState(_: ArkavoClient, state: ArkavoClientState) { states.append(state) }
+    func clientDidReceiveMessage(_: ArkavoClient, message _: Data) {}
+    func clientDidReceiveError(_: ArkavoClient, error: Error) { errors.append(error) }
+}
+
+/// Fulfils `invalidated` when its URLSession is invalidated.
+private final class InvalidationProbe: NSObject, URLSessionDelegate, @unchecked Sendable {
+    let invalidated = XCTestExpectation(description: "session invalidated")
+
+    func urlSession(_: URLSession, didBecomeInvalidWithError _: Error?) {
+        invalidated.fulfill()
     }
 }

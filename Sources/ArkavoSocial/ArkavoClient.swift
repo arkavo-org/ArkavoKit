@@ -151,47 +151,57 @@ public final class ArkavoClient: NSObject {
 
         super.init()
 
-        socketDelegate.setStateHandler { [weak self] newState in
+        socketDelegate.setStateHandler { [weak self] newState, task in
             Task { @MainActor [weak self] in
-                guard let self else { return }
-                print("WebSocket state changing to: \(newState)")
-                self.currentState = newState
-
-                // Resume the continuation when connected
-                switch newState {
-                case .connected:
-                    if let continuation = self.connectionContinuation {
-                        self.connectionContinuation = nil
-                        continuation.resume(returning: ())
-                    }
-                case let .error(error):
-                    if let continuation = self.connectionContinuation {
-                        self.connectionContinuation = nil
-                        continuation.resume(throwing: error)
-                    }
-                    // Also handle any pending message handlers
-                    for handler in self.messageHandlers.values {
-                        handler.resume(throwing: error)
-                    }
-                    self.messageHandlers.removeAll()
-                case .disconnected:
-                    // Clean up any pending handlers on disconnect
-                    let error = ArkavoError.connectionFailed("Connection disconnected")
-                    for handler in self.messageHandlers.values {
-                        handler.resume(throwing: error)
-                    }
-                    self.messageHandlers.removeAll()
-                case .connecting:
-                    print("connecting")
-                case .authenticating:
-                    print("authenticating")
-                }
+                self?.handleSocketState(newState, from: task)
             }
         }
 
         // Start receiving messages when connection is established
         socketDelegate.onConnect = { [weak self] in
             self?.receiveMessage()
+        }
+    }
+
+    // MARK: - Socket callbacks
+
+    /// Applies a state change reported by the socket delegate. A task that is no
+    /// longer `webSocket` (cancelled by `disconnect()`, the connect fallback or
+    /// account deletion) is stale: its late cancellation error must not
+    /// overwrite the state that replaced it. Internal so tests can drive it.
+    func handleSocketState(_ newState: ArkavoClientState, from task: URLSessionTask) {
+        guard task === webSocket else { return }
+        print("WebSocket state changing to: \(newState)")
+        currentState = newState
+
+        // Resume the continuation when connected
+        switch newState {
+        case .connected:
+            if let continuation = connectionContinuation {
+                connectionContinuation = nil
+                continuation.resume(returning: ())
+            }
+        case let .error(error):
+            if let continuation = connectionContinuation {
+                connectionContinuation = nil
+                continuation.resume(throwing: error)
+            }
+            // Also handle any pending message handlers
+            for handler in messageHandlers.values {
+                handler.resume(throwing: error)
+            }
+            messageHandlers.removeAll()
+        case .disconnected:
+            // Clean up any pending handlers on disconnect
+            let error = ArkavoError.connectionFailed("Connection disconnected")
+            for handler in messageHandlers.values {
+                handler.resume(throwing: error)
+            }
+            messageHandlers.removeAll()
+        case .connecting:
+            print("connecting")
+        case .authenticating:
+            print("authenticating")
         }
     }
 
@@ -441,6 +451,8 @@ public final class ArkavoClient: NSObject {
     private func tearDownSession() {
         webSocket?.cancel()
         webSocket = nil
+        // A session retains its delegate until invalidated.
+        session?.invalidateAndCancel()
         session = nil
 
         sessionSymmetricKey = nil
@@ -943,40 +955,49 @@ public final class ArkavoClient: NSObject {
             return
         }
 
-        webSocket.receive { [weak self] result in
-            guard let self else { return }
+        webSocket.receive { [weak self, weak webSocket] result in
+            guard let self, let webSocket else { return }
 
             Task { @MainActor in
-                switch result {
-                case let .success(message):
-//                    print("\n=== Received WebSocket Message ===")
-//                    print("Message type: \(message)")
-                    switch message {
-                    case let .data(data):
-                        await self.handleIncomingMessage(data)
-                    case let .string(string):
-                        print("Received string message: \(string)")
-                    @unknown default:
-                        print("Received unknown message type \(message)")
-                    }
-
-                case let .failure(error):
-                    print("WebSocket receive error: \(error)")
-                    self.currentState = .error(error)
-                    self.delegate?.clientDidReceiveError(self, error: error)
-
-                    // Resume any waiting continuations with error
-                    for continuation in self.messageHandlers.values {
-                        continuation.resume(throwing: error)
-                    }
-                    self.messageHandlers.removeAll()
-                }
-
-                // Continue receiving messages if still connected
-                if self.currentState == .connected {
-                    self.receiveMessage()
-                }
+                await self.handleReceiveResult(result, from: webSocket)
             }
+        }
+    }
+
+    /// Handles what `receive` on `task` returned. Dropped when `task` is no
+    /// longer `webSocket`: the receive of a cancelled socket fails, and that
+    /// failure is not the current connection's. Internal so tests can drive it.
+    func handleReceiveResult(_ result: Result<URLSessionWebSocketTask.Message, Error>, from task: URLSessionWebSocketTask) async {
+        guard task === webSocket else { return }
+
+        switch result {
+        case let .success(message):
+//            print("\n=== Received WebSocket Message ===")
+//            print("Message type: \(message)")
+            switch message {
+            case let .data(data):
+                await handleIncomingMessage(data)
+            case let .string(string):
+                print("Received string message: \(string)")
+            @unknown default:
+                print("Received unknown message type \(message)")
+            }
+
+        case let .failure(error):
+            print("WebSocket receive error: \(error)")
+            currentState = .error(error)
+            delegate?.clientDidReceiveError(self, error: error)
+
+            // Resume any waiting continuations with error
+            for continuation in messageHandlers.values {
+                continuation.resume(throwing: error)
+            }
+            messageHandlers.removeAll()
+        }
+
+        // Continue receiving messages if still connected
+        if currentState == .connected {
+            receiveMessage()
         }
     }
 
@@ -1772,14 +1793,14 @@ private class AuthenticationDelegate: NSObject, ASAuthorizationControllerDelegat
 // MARK: - WebSocket Delegate
 
 private actor WebSocketStateHandler {
-    var stateHandler: ((ArkavoClientState) async -> Void)?
+    var stateHandler: ((ArkavoClientState, URLSessionTask) async -> Void)?
 
-    func updateHandler(_ handler: @escaping (ArkavoClientState) -> Void) {
+    func updateHandler(_ handler: @escaping (ArkavoClientState, URLSessionTask) -> Void) {
         stateHandler = handler
     }
 
-    func handleState(_ state: ArkavoClientState) async {
-        await stateHandler?(state)
+    func handleState(_ state: ArkavoClientState, from task: URLSessionTask) async {
+        await stateHandler?(state, task)
     }
 }
 
@@ -1793,34 +1814,34 @@ private final class WebSocketDelegate: NSObject, URLSessionWebSocketDelegate, @u
         set { stateQueue.sync { _onConnect = newValue } }
     }
 
-    func setStateHandler(_ handler: @Sendable @escaping (ArkavoClientState) -> Void) {
+    func setStateHandler(_ handler: @Sendable @escaping (ArkavoClientState, URLSessionTask) -> Void) {
         Task {
             await stateHandler.updateHandler(handler)
         }
     }
 
     public func urlSession(_: URLSession,
-                           webSocketTask _: URLSessionWebSocketTask,
+                           webSocketTask: URLSessionWebSocketTask,
                            didOpenWithProtocol protocol: String?)
     {
         print("WebSocket did connect with protocol: \(`protocol` ?? "none")")
         onConnect?()
         Task {
-            await stateHandler.handleState(.connected)
+            await stateHandler.handleState(.connected, from: webSocketTask)
         }
     }
 
     public func urlSession(_: URLSession,
-                           task _: URLSessionTask,
+                           task: URLSessionTask,
                            didCompleteWithError error: Error?)
     {
         Task {
             if let error {
                 print("WebSocket did complete with error: \(error)")
-                await stateHandler.handleState(.error(error))
+                await stateHandler.handleState(.error(error), from: task)
             } else {
                 print("WebSocket did complete normally")
-                await stateHandler.handleState(.disconnected)
+                await stateHandler.handleState(.disconnected, from: task)
             }
         }
     }
