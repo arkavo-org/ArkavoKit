@@ -72,6 +72,15 @@ public final class ArkavoClient: NSObject {
     private var messageHandlers: [UInt8: CheckedContinuation<Data, Error>] = [:]
     private let profileCache = ProfileCache(capacity: 100)
 
+    // MARK: - Test seams (internal; tests replace them through @testable import)
+
+    /// Performs an identity REST request. Used by the account-deletion and
+    /// Apple-link requests.
+    var httpData: @MainActor (URLRequest) async throws -> (Data, URLResponse) = ArkavoClient.http3Data(for:)
+
+    /// The keychain items account deletion and Apple linking touch.
+    var credentialStore: any AccountCredentialStore = KeychainCredentialStore()
+
     /// Performs a request that opts into HTTP/3 on the first hop.
     ///
     /// `URLRequest.assumesHTTP3Capable` lets the first request negotiate HTTP/3
@@ -1386,7 +1395,17 @@ public final class ArkavoClient: NSObject {
     /// Throws [`AppleLinkError.conflict`] if this Apple identity is already
     /// linked to a different arkavo account.
     public func linkAppleIdentity(idToken: String) async throws {
-        guard let cwt = KeychainManager.getAuthenticationToken() else {
+        try await linkAppleIdentity(idToken: idToken, authorizationCode: nil)
+    }
+
+    /// Posts the verified Apple id_token, and the authorization code when there
+    /// is one, to `/oauth/apple/link`. The server exchanges the code for a
+    /// refresh token it can revoke when the Arkavo account is deleted (TN3194);
+    /// a server without that support ignores the field.
+    ///
+    /// Pass `ASAuthorizationAppleIDCredential.authorizationCode` decoded as UTF-8.
+    public func linkAppleIdentity(idToken: String, authorizationCode: String?) async throws {
+        guard let cwt = credentialStore.authenticationToken() else {
             print("ArkavoClient.linkAppleIdentity: no CWT in keychain (missingAuthToken)")
             throw AppleLinkError.missingAuthToken
         }
@@ -1397,11 +1416,15 @@ public final class ArkavoClient: NSObject {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(cwt, forHTTPHeaderField: "X-Auth-Token")
-        request.httpBody = try JSONSerialization.data(withJSONObject: ["id_token": idToken])
+        var payload = ["id_token": idToken]
+        if let authorizationCode {
+            payload["authorization_code"] = authorizationCode
+        }
+        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
 
         let (data, response): (Data, URLResponse)
         do {
-            (data, response) = try await Self.http3Data(for: request)
+            (data, response) = try await httpData(request)
         } catch {
             print("ArkavoClient.linkAppleIdentity: network error \(error)")
             throw AppleLinkError.networkError(error)
