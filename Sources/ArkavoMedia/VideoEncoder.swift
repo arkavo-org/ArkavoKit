@@ -219,23 +219,23 @@ public final class VideoEncoder: Sendable {
             return
         }
 
-        // Extract H.264 data
-        var length: Int = 0
-        var dataPointer: UnsafeMutablePointer<Int8>?
-        let status = CMBlockBufferGetDataPointer(
-            dataBuffer,
-            atOffset: 0,
-            lengthAtOffsetOut: nil,
-            totalLengthOut: &length,
-            dataPointerOut: &dataPointer
-        )
-
-        guard status == kCMBlockBufferNoErr, let data = dataPointer else {
-            print("❌ Failed to get data pointer")
+        // Extract H.264 data. The block buffer can be non-contiguous (VideoToolbox's CBR filler can
+        // sit in its own memory block), so copy through CMBlockBufferCopyDataBytes rather than
+        // reading totalLength bytes from the first block's pointer, which read past that block.
+        let length = CMBlockBufferGetDataLength(dataBuffer)
+        guard length > 0 else {
+            print("❌ Empty compressed frame")
             return
         }
-
-        let h264Data = Data(bytes: data, count: length)
+        var h264Data = Data(count: length)
+        let status = h264Data.withUnsafeMutableBytes { raw -> OSStatus in
+            guard let base = raw.baseAddress else { return kCMBlockBufferBadPointerParameterErr }
+            return CMBlockBufferCopyDataBytes(dataBuffer, atOffset: 0, dataLength: length, destination: base)
+        }
+        guard status == kCMBlockBufferNoErr else {
+            print("❌ Failed to copy compressed frame (\(status))")
+            return
+        }
         let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
 
         // Determine if this is a keyframe
