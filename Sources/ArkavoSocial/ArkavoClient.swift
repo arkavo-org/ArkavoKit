@@ -823,6 +823,23 @@ public final class ArkavoClient: NSObject {
         )
     }
 
+    /// The passkey assertion request for one account. It is limited to the credentials
+    /// the server's options listed for `accountName`, so the system sheet offers only that
+    /// account's passkeys instead of every Arkavo passkey on the device. With no listed
+    /// credentials the request stays open (any passkey for the relying party), as before.
+    /// An id that is not base64url is skipped.
+    nonisolated static func passkeyAssertionRequest(
+        provider: ASAuthorizationPlatformPublicKeyCredentialProvider,
+        challenge: Data,
+        allowCredentialIDs: [String]
+    ) -> ASAuthorizationPlatformPublicKeyCredentialAssertionRequest {
+        let request = provider.createCredentialAssertionRequest(challenge: challenge)
+        request.allowedCredentials = allowCredentialIDs
+            .compactMap { Data(base64Encoded: $0.base64URLToBase64()) }
+            .map { ASAuthorizationPlatformPublicKeyCredentialDescriptor(credentialID: $0) }
+        return request
+    }
+
     private func authenticateUser(accountName: String) async throws -> String {
         print("authenticateUser \(accountName) \(relyingPartyID)")
         let provider = ASAuthorizationPlatformPublicKeyCredentialProvider(relyingPartyIdentifier: relyingPartyID)
@@ -854,9 +871,10 @@ public final class ArkavoClient: NSObject {
 
         let challengeData = Data(base64Encoded: authOptions.publicKey.challenge.base64URLToBase64())!
 
-        // Create assertion request
-        let assertionRequest = provider.createCredentialAssertionRequest(
-            challenge: challengeData
+        let assertionRequest = Self.passkeyAssertionRequest(
+            provider: provider,
+            challenge: challengeData,
+            allowCredentialIDs: authOptions.publicKey.publicKeyCredentialIDs
         )
 
         // Perform the authentication
@@ -2218,19 +2236,24 @@ private class WebAuthnAuthenticationDelegate: NSObject, ASAuthorizationControlle
 }
 
 // Response type for authentication options
-private struct AuthenticationOptionsResponse: Decodable {
+struct AuthenticationOptionsResponse: Decodable {
     let publicKey: PublicKeyAuthenticationOptions
 }
 
-private struct PublicKeyAuthenticationOptions: Decodable {
+struct PublicKeyAuthenticationOptions: Decodable {
     let challenge: String
     let timeout: Int?
     let rpId: String?
     let allowCredentials: [AllowCredential]?
     let userVerification: String?
+
+    /// The base64url ids of the listed `public-key` credentials (none when the server lists none).
+    var publicKeyCredentialIDs: [String] {
+        (allowCredentials ?? []).filter { $0.type == "public-key" }.map(\.id)
+    }
 }
 
-private struct AllowCredential: Decodable {
+struct AllowCredential: Decodable {
     let id: String
     let type: String
 }
