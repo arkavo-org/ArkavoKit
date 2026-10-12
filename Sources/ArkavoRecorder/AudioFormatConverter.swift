@@ -67,35 +67,29 @@ public class AudioFormatConverter {
 
         guard let converter = converter else { return nil }
 
-        // Extract audio buffer from CMSampleBuffer
-        guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else {
-            print("⚠️ AudioFormatConverter [\(sourceID)]: Failed to get data buffer")
-            return nil
-        }
-
-        var length: Int = 0
-        var dataPointer: UnsafeMutablePointer<Int8>?
-        let status = CMBlockBufferGetDataPointer(blockBuffer, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &length, dataPointerOut: &dataPointer)
-
-        guard status == noErr, let data = dataPointer else {
-            print("⚠️ AudioFormatConverter [\(sourceID)]: Failed to get data pointer")
-            return nil
-        }
-
-        // Calculate frame count
-        let bytesPerFrame = sourceFormat.streamDescription.pointee.mBytesPerFrame
-        let frameCount = AVAudioFrameCount(length) / AVAudioFrameCount(bytesPerFrame)
-
-        // Create source PCM buffer
-        guard let sourcePCMBuffer = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: frameCount) else {
+        // Frame count comes from the sample buffer, not its byte length: for non-interleaved
+        // (planar) audio, as ScreenCaptureKit delivers, the bytes span every channel plane while
+        // mBytesPerFrame covers one, so bytes / mBytesPerFrame doubled the frames.
+        let frameCount = AVAudioFrameCount(CMSampleBufferGetNumSamples(sampleBuffer))
+        guard frameCount > 0,
+              let sourcePCMBuffer = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: frameCount)
+        else {
             print("⚠️ AudioFormatConverter [\(sourceID)]: Failed to create source PCM buffer")
             return nil
         }
         sourcePCMBuffer.frameLength = frameCount
 
-        // Copy data to PCM buffer
-        let audioBufferList = sourcePCMBuffer.mutableAudioBufferList.pointee
-        memcpy(audioBufferList.mBuffers.mData, data, Int(length))
+        // Copy every channel plane (or the one interleaved buffer) into the PCM buffer.
+        let copyStatus = CMSampleBufferCopyPCMDataIntoAudioBufferList(
+            sampleBuffer,
+            at: 0,
+            frameCount: Int32(frameCount),
+            into: sourcePCMBuffer.mutableAudioBufferList
+        )
+        guard copyStatus == noErr else {
+            print("⚠️ AudioFormatConverter [\(sourceID)]: Failed to copy PCM data (\(copyStatus))")
+            return nil
+        }
 
         // Calculate output frame capacity (may differ due to sample rate conversion)
         let outputFrameCapacity = AVAudioFrameCount(Double(frameCount) * (targetFormat.sampleRate / sourceFormat.sampleRate)) + 1
@@ -110,7 +104,15 @@ public class AudioFormatConverter {
         var error: NSError?
         // Note: sourcePCMBuffer is captured but used synchronously, so it's safe despite not being Sendable
         nonisolated(unsafe) let buffer = sourcePCMBuffer
-        let inputBlock: AVAudioConverterInputBlock = { @Sendable inNumPackets, outStatus in
+        // Hand the input over once: the converter may ask again to fill its output, and
+        // answering .haveData with the same buffer repeated the audio.
+        nonisolated(unsafe) var supplied = false
+        let inputBlock: AVAudioConverterInputBlock = { @Sendable _, outStatus in
+            if supplied {
+                outStatus.pointee = .noDataNow
+                return nil
+            }
+            supplied = true
             outStatus.pointee = .haveData
             return buffer
         }
