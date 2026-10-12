@@ -107,8 +107,10 @@ public class AppleSignInService: NSObject, ObservableObject {
 
         // 4. Bind on the server. Session cookie carries the nonce; CWT in
         //    X-Auth-Token (read from keychain inside the client) identifies
-        //    the arkavo account.
-        try await client.linkAppleIdentity(idToken: identityToken)
+        //    the arkavo account. The authorization code lets the server get a
+        //    refresh token it revokes when the account is deleted (TN3194).
+        let authorizationCode = credential.authorizationCode.flatMap { String(data: $0, encoding: .utf8) }
+        try await client.linkAppleIdentity(idToken: identityToken, authorizationCode: authorizationCode)
 
         // 5. Persist only the opaque Apple userID locally so we can show
         //    "linked" state across launches. Email/name are deliberately

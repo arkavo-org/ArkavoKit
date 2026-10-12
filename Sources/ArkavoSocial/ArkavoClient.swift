@@ -63,14 +63,29 @@ public final class ArkavoClient: NSObject {
     private var sharedSecret: SharedSecret?
     private var salt: Data?
     private var kasPublicKey: P256.KeyAgreement.PublicKey?
-    private var sessionSymmetricKey: SymmetricKey?
-    private var webSocket: URLSessionWebSocketTask?
-    private var session: URLSession?
+    // Internal rather than private so tests can install and observe a live-looking session.
+    var sessionSymmetricKey: SymmetricKey?
+    var webSocket: URLSessionWebSocketTask?
+    var session: URLSession?
     private let delegateQueue = OperationQueue()
     private let socketDelegate: WebSocketDelegate
-    private var connectionContinuation: CheckedContinuation<Void, Error>?
-    private var messageHandlers: [UInt8: CheckedContinuation<Data, Error>] = [:]
+    var connectionContinuation: CheckedContinuation<Void, Error>?
+    var messageHandlers: [UInt8: CheckedContinuation<Data, Error>] = [:]
     private let profileCache = ProfileCache(capacity: 100)
+
+    // MARK: - Test seams (internal; tests replace them through @testable import)
+
+    /// The passkey ceremony: account name → fresh auth CWT. Never stores the token.
+    lazy var authenticator: @MainActor (String) async throws -> String = { [unowned self] accountName in
+        try await self.authenticateUser(accountName: accountName)
+    }
+
+    /// Performs an identity REST request. Used by the account-deletion and
+    /// Apple-link requests.
+    var httpData: @MainActor (URLRequest) async throws -> (Data, URLResponse) = ArkavoClient.http3Data(for:)
+
+    /// The keychain items account deletion and Apple linking touch.
+    var credentialStore: any AccountCredentialStore = KeychainCredentialStore()
 
     /// Performs a request that opts into HTTP/3 on the first hop.
     ///
@@ -104,6 +119,10 @@ public final class ArkavoClient: NSObject {
     }
 
     public weak var delegate: ArkavoClientDelegate?
+
+    /// True while `deleteAccount(accountName:)` runs. `connect`, `registerUser`
+    /// and `linkAppleIdentity` refuse with `ArkavoError.invalidState` meanwhile.
+    private(set) var isDeletingAccount = false
     private let presentationProvider: ASAuthorizationControllerPresentationContextProviding
     public var currentToken: String? {
         // TODO: Check if the token has expired
@@ -132,41 +151,9 @@ public final class ArkavoClient: NSObject {
 
         super.init()
 
-        socketDelegate.setStateHandler { [weak self] newState in
+        socketDelegate.setStateHandler { [weak self] newState, task in
             Task { @MainActor [weak self] in
-                guard let self else { return }
-                print("WebSocket state changing to: \(newState)")
-                self.currentState = newState
-
-                // Resume the continuation when connected
-                switch newState {
-                case .connected:
-                    if let continuation = self.connectionContinuation {
-                        self.connectionContinuation = nil
-                        continuation.resume(returning: ())
-                    }
-                case let .error(error):
-                    if let continuation = self.connectionContinuation {
-                        self.connectionContinuation = nil
-                        continuation.resume(throwing: error)
-                    }
-                    // Also handle any pending message handlers
-                    for handler in self.messageHandlers.values {
-                        handler.resume(throwing: error)
-                    }
-                    self.messageHandlers.removeAll()
-                case .disconnected:
-                    // Clean up any pending handlers on disconnect
-                    let error = ArkavoError.connectionFailed("Connection disconnected")
-                    for handler in self.messageHandlers.values {
-                        handler.resume(throwing: error)
-                    }
-                    self.messageHandlers.removeAll()
-                case .connecting:
-                    print("connecting")
-                case .authenticating:
-                    print("authenticating")
-                }
+                self?.handleSocketState(newState, from: task)
             }
         }
 
@@ -176,10 +163,53 @@ public final class ArkavoClient: NSObject {
         }
     }
 
+    // MARK: - Socket callbacks
+
+    /// Applies a state change reported by the socket delegate. A task that is no
+    /// longer `webSocket` (cancelled by `disconnect()`, the connect fallback or
+    /// account deletion) is stale: its late cancellation error must not
+    /// overwrite the state that replaced it. Internal so tests can drive it.
+    func handleSocketState(_ newState: ArkavoClientState, from task: URLSessionTask) {
+        guard task === webSocket else { return }
+        print("WebSocket state changing to: \(newState)")
+        currentState = newState
+
+        // Resume the continuation when connected
+        switch newState {
+        case .connected:
+            if let continuation = connectionContinuation {
+                connectionContinuation = nil
+                continuation.resume(returning: ())
+            }
+        case let .error(error):
+            if let continuation = connectionContinuation {
+                connectionContinuation = nil
+                continuation.resume(throwing: error)
+            }
+            // Also handle any pending message handlers
+            for handler in messageHandlers.values {
+                handler.resume(throwing: error)
+            }
+            messageHandlers.removeAll()
+        case .disconnected:
+            // Clean up any pending handlers on disconnect
+            let error = ArkavoError.connectionFailed("Connection disconnected")
+            for handler in messageHandlers.values {
+                handler.resume(throwing: error)
+            }
+            messageHandlers.removeAll()
+        case .connecting:
+            print("connecting")
+        case .authenticating:
+            print("authenticating")
+        }
+    }
+
     // MARK: - Public Methods
 
     @MainActor
     public func connect(accountName: String) async throws {
+        guard !isDeletingAccount else { throw ArkavoError.invalidState }
         print("ArkavoClient: Connecting...")
         // Check current state more thoroughly
         switch currentState {
@@ -286,11 +316,14 @@ public final class ArkavoClient: NSObject {
         webSocket?.cancel()
         webSocket = nil
         session = nil
+        // The cancelled socket's callbacks are ignored, so nothing else fails these.
+        failPendingWaiters(ArkavoError.connectionFailed("Connection disconnected"))
         KeychainManager.deleteAuthenticationToken()
     }
 
     /// Deletes the user's account from the server
     /// - Throws: ArkavoError if the deletion fails
+    @available(*, deprecated, message: "Use deleteAccount(accountName:)")
     public func deleteAccount() async throws {
         guard let token = KeychainManager.getAuthenticationToken() else {
             throw ArkavoError.authenticationFailed("No authentication token")
@@ -317,6 +350,209 @@ public final class ArkavoClient: NSObject {
 
         // Disconnect and clear local auth state
         await disconnect()
+    }
+
+    /// Deletes the Arkavo account `accountName` (App Store guideline 5.1.1(v)).
+    ///
+    /// Runs a passkey sign-in for a fresh token, because the server accepts
+    /// only one minted within 300 s, then sends `DELETE /account`. A 409 is
+    /// retried once with the same token; a 401 runs the sign-in once more and
+    /// retries once.
+    ///
+    /// - Returns: `.deleted` when the server accepted the deletion, or
+    ///   `.alreadyDeleted` when the sign-in found no such account.
+    /// - Throws: `ArkavoError.invalidState` while another deletion runs or the
+    ///   client is connecting or authenticating; `ArkavoError.invalidURL` for an
+    ///   empty name or one with leading or trailing whitespace (a padded name
+    ///   could find no account and be taken for an already deleted one); the
+    ///   ceremony's own error (`ASAuthorizationError.canceled` when the person
+    ///   cancels); otherwise `ArkavoError.authenticationFailed("Account deletion failed")`.
+    ///   Nothing is removed from this device when it throws.
+    @MainActor
+    public func deleteAccount(accountName: String) async throws -> AccountDeletionResult {
+        guard !isDeletingAccount, currentState != .connecting, currentState != .authenticating else {
+            throw ArkavoError.invalidState
+        }
+        let trimmedName = accountName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty, trimmedName == accountName else {
+            throw ArkavoError.invalidURL
+        }
+        isDeletingAccount = true
+        defer { isDeletingAccount = false }
+
+        // Read before the ceremony: the wipe decides from what was stored then.
+        let storedToken = credentialStore.authenticationToken()
+        let storedHandle = credentialStore.sharedHandle()
+
+        let outcome = try await requestAccountDeletion(accountName: accountName)
+        wipeLocalAccountState(
+            after: outcome,
+            accountName: accountName,
+            storedToken: storedToken,
+            storedHandle: storedHandle
+        )
+        return outcome.result
+    }
+
+    /// Removes this device's copy of a deleted account. Best effort: every step
+    /// runs whatever the others did. Only removing the DID key reports a
+    /// failure, which is logged as its `KeychainError` (no secret); the other
+    /// removals ignore theirs.
+    ///
+    /// The shared keychain items belong to every Arkavo app on the device, so
+    /// they go only when they are this account's: the session token when its
+    /// CWT `sub` is the fresh token's (or, when either `sub` is unreadable or
+    /// there is no fresh token, under the handle condition); the shared handle,
+    /// DID, local identity pair and DID key when the stored shared handle is
+    /// nil or `accountName`.
+    private func wipeLocalAccountState(
+        after outcome: DeletionOutcome,
+        accountName: String,
+        storedToken: String?,
+        storedHandle: String?
+    ) {
+        tearDownSession()
+
+        let handleIsThisAccount = storedHandle == nil || storedHandle == accountName
+        if let storedToken,
+           Self.storedToken(storedToken, belongsToAccountOf: outcome.freshToken, handleIsThisAccount: handleIsThisAccount)
+        {
+            credentialStore.deleteAuthenticationToken()
+        }
+        if handleIsThisAccount {
+            credentialStore.deleteSharedHandleAndDID()
+            credentialStore.deleteIdentityPair()
+            do {
+                try credentialStore.deleteDIDKey()
+            } catch {
+                // A KeychainError carries an OSStatus, no secret.
+                print("ArkavoClient.deleteAccount: could not remove the DID key: \(error)")
+            }
+        }
+        credentialStore.deleteAppleAccount()
+    }
+
+    /// Whether the stored session token is the deleted account's: the two CWT
+    /// subjects match. When either is unreadable, or there is no fresh token
+    /// (`.alreadyDeleted`), the handle condition decides.
+    private static func storedToken(
+        _ storedToken: String,
+        belongsToAccountOf freshToken: String?,
+        handleIsThisAccount: Bool
+    ) -> Bool {
+        guard let freshToken,
+              let storedSubject = CWTSubject.sub(fromToken: storedToken),
+              let freshSubject = CWTSubject.sub(fromToken: freshToken)
+        else {
+            return handleIsThisAccount
+        }
+        return storedSubject == freshSubject
+    }
+
+    /// Closes the socket and forgets the session without touching the keychain,
+    /// whatever the connection state. (`disconnect()` runs only from
+    /// `.connected` and always deletes the stored token.)
+    private func tearDownSession() {
+        webSocket?.cancel()
+        webSocket = nil
+        // A session retains its delegate until invalidated.
+        session?.invalidateAndCancel()
+        session = nil
+
+        sessionSymmetricKey = nil
+        keyPair = nil
+        sharedSecret = nil
+        salt = nil
+        kasPublicKey = nil
+
+        failPendingWaiters(ArkavoError.connectionFailed("Account deleted"))
+
+        currentState = .disconnected
+    }
+
+    /// Fails every pending message handler and the pending connection with
+    /// `error`. Both are cleared before any is resumed.
+    private func failPendingWaiters(_ error: Error) {
+        let handlers = messageHandlers.values
+        messageHandlers.removeAll()
+        let continuation = connectionContinuation
+        connectionContinuation = nil
+        for handler in handlers {
+            handler.resume(throwing: error)
+        }
+        continuation?.resume(throwing: error)
+    }
+
+    /// What the server said about a deletion, and the token it said it to.
+    private struct DeletionOutcome {
+        let result: AccountDeletionResult
+        /// The fresh token behind `.deleted`; nil for `.alreadyDeleted`.
+        let freshToken: String?
+    }
+
+    private static let accountDeletionFailed = ArkavoError.authenticationFailed("Account deletion failed")
+
+    /// The ceremony and `DELETE /account`, with one retry at most: a 409 again
+    /// with the same token, a 401 with a new one. Never logs the token or a body.
+    private func requestAccountDeletion(accountName: String) async throws -> DeletionOutcome {
+        guard var token = try await freshDeletionToken(accountName: accountName) else {
+            return DeletionOutcome(result: .alreadyDeleted, freshToken: nil)
+        }
+
+        var (data, status) = try await sendDeleteAccount(token: token)
+        switch status {
+        case 200 ... 299:
+            return DeletionOutcome(result: .deleted(AccountDeletionReceipt.decode(data)), freshToken: token)
+        case 409:
+            break // a concurrent change on the server: retry with the same token
+        case 401:
+            guard let renewed = try await freshDeletionToken(accountName: accountName) else {
+                return DeletionOutcome(result: .alreadyDeleted, freshToken: nil)
+            }
+            token = renewed
+        default:
+            throw Self.accountDeletionFailed
+        }
+
+        (data, status) = try await sendDeleteAccount(token: token)
+        guard (200 ... 299).contains(status) else {
+            throw Self.accountDeletionFailed
+        }
+        return DeletionOutcome(result: .deleted(AccountDeletionReceipt.decode(data)), freshToken: token)
+    }
+
+    /// The passkey ceremony for a deletion. nil when the server has no account
+    /// by that name ("User Not Found"): it was already deleted. Every other
+    /// error, `ASAuthorizationError.canceled` included, is rethrown unchanged.
+    private func freshDeletionToken(accountName: String) async throws -> String? {
+        do {
+            return try await authenticator(accountName)
+        } catch let ArkavoError.authenticationFailed(message) where message == "User Not Found" {
+            return nil
+        }
+    }
+
+    /// Sends `DELETE /account` with `token` and returns the body and status.
+    /// A transport error or a non-HTTP response is the generic failure.
+    private func sendDeleteAccount(token: String) async throws -> (Data, Int) {
+        var request = URLRequest(url: authURL.appendingPathComponent("account"))
+        request.httpMethod = "DELETE"
+        request.setValue(token, forHTTPHeaderField: "X-Auth-Token")
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await httpData(request)
+        } catch {
+            let nsError = error as NSError
+            print("ArkavoClient.deleteAccount: transport error domain=\(nsError.domain) code=\(nsError.code)")
+            throw Self.accountDeletionFailed
+        }
+        guard let http = response as? HTTPURLResponse else {
+            throw Self.accountDeletionFailed
+        }
+        print("ArkavoClient.deleteAccount: status=\(http.statusCode)")
+        return (data, http.statusCode)
     }
 
     public func sendMessage(_ data: Data) async throws {
@@ -702,22 +938,36 @@ public final class ArkavoClient: NSObject {
         let webSocket = session.webSocketTask(with: request)
         self.webSocket = webSocket
 
-        webSocket.sendPing { [weak self] error in
+        webSocket.sendPing { [weak self, weak webSocket] error in
+            guard let self, let webSocket else { return }
+
             Task { @MainActor in
-                if let error {
-                    print("Initial ping failed: \(error)")
-                    self?.connectionContinuation?.resume(throwing: error)
-                    self?.connectionContinuation = nil
-                    self?.currentState = .error(error)
-                } else {
-                    print("Initial ping successful")
-                }
+                self.handleInitialPingResult(error, from: webSocket)
             }
         }
 
         print("\nWebSocket Task Created: \(webSocket)")
         webSocket.resume()
         receiveMessage()
+    }
+
+    /// Handles the reply to the first ping on `task`: a failure fails the
+    /// pending connection and sets `.error`. Dropped when `task` is no longer
+    /// `webSocket`: a ping still outstanding when its socket was cancelled
+    /// fails, and that failure is not the current connection's. Internal so
+    /// tests can drive it.
+    func handleInitialPingResult(_ error: Error?, from task: URLSessionWebSocketTask) {
+        guard task === webSocket else { return }
+        if let error {
+            print("Initial ping failed: \(error)")
+            if let continuation = connectionContinuation {
+                connectionContinuation = nil
+                continuation.resume(throwing: error)
+            }
+            currentState = .error(error)
+        } else {
+            print("Initial ping successful")
+        }
     }
 
     private func receiveMessage() {
@@ -727,40 +977,49 @@ public final class ArkavoClient: NSObject {
             return
         }
 
-        webSocket.receive { [weak self] result in
-            guard let self else { return }
+        webSocket.receive { [weak self, weak webSocket] result in
+            guard let self, let webSocket else { return }
 
             Task { @MainActor in
-                switch result {
-                case let .success(message):
-//                    print("\n=== Received WebSocket Message ===")
-//                    print("Message type: \(message)")
-                    switch message {
-                    case let .data(data):
-                        await self.handleIncomingMessage(data)
-                    case let .string(string):
-                        print("Received string message: \(string)")
-                    @unknown default:
-                        print("Received unknown message type \(message)")
-                    }
-
-                case let .failure(error):
-                    print("WebSocket receive error: \(error)")
-                    self.currentState = .error(error)
-                    self.delegate?.clientDidReceiveError(self, error: error)
-
-                    // Resume any waiting continuations with error
-                    for continuation in self.messageHandlers.values {
-                        continuation.resume(throwing: error)
-                    }
-                    self.messageHandlers.removeAll()
-                }
-
-                // Continue receiving messages if still connected
-                if self.currentState == .connected {
-                    self.receiveMessage()
-                }
+                await self.handleReceiveResult(result, from: webSocket)
             }
+        }
+    }
+
+    /// Handles what `receive` on `task` returned. Dropped when `task` is no
+    /// longer `webSocket`: the receive of a cancelled socket fails, and that
+    /// failure is not the current connection's. Internal so tests can drive it.
+    func handleReceiveResult(_ result: Result<URLSessionWebSocketTask.Message, Error>, from task: URLSessionWebSocketTask) async {
+        guard task === webSocket else { return }
+
+        switch result {
+        case let .success(message):
+//            print("\n=== Received WebSocket Message ===")
+//            print("Message type: \(message)")
+            switch message {
+            case let .data(data):
+                await handleIncomingMessage(data)
+            case let .string(string):
+                print("Received string message: \(string)")
+            @unknown default:
+                print("Received unknown message type \(message)")
+            }
+
+        case let .failure(error):
+            print("WebSocket receive error: \(error)")
+            currentState = .error(error)
+            delegate?.clientDidReceiveError(self, error: error)
+
+            // Resume any waiting continuations with error
+            for continuation in messageHandlers.values {
+                continuation.resume(throwing: error)
+            }
+            messageHandlers.removeAll()
+        }
+
+        // Continue receiving messages if still connected
+        if currentState == .connected {
+            receiveMessage()
         }
     }
 
@@ -899,6 +1158,7 @@ public final class ArkavoClient: NSObject {
 
     /// Register a new user with WebAuthn
     public func registerUser(handle: String, did: String) async throws -> String {
+        guard !isDeletingAccount else { throw ArkavoError.invalidState }
         print("Initiating user registration with handle: \(handle)")
 
         // Admission control: the server refuses registration without a
@@ -1385,8 +1645,24 @@ public final class ArkavoClient: NSObject {
     ///
     /// Throws [`AppleLinkError.conflict`] if this Apple identity is already
     /// linked to a different arkavo account.
+    ///
+    /// Sends no authorization code. A server that requires one (so it can
+    /// revoke the Apple token when the account is deleted) answers 400.
+    @available(*, deprecated, message: "Pass the credential's authorizationCode: linkAppleIdentity(idToken:authorizationCode:)")
     public func linkAppleIdentity(idToken: String) async throws {
-        guard let cwt = KeychainManager.getAuthenticationToken() else {
+        try await linkAppleIdentity(idToken: idToken, authorizationCode: nil)
+    }
+
+    /// Posts the verified Apple id_token, and the authorization code when there
+    /// is one, to `/oauth/apple/link`. The server exchanges the code for a
+    /// refresh token it can revoke when the Arkavo account is deleted (TN3194);
+    /// a server without that support ignores the field.
+    ///
+    /// Pass `ASAuthorizationAppleIDCredential.authorizationCode` decoded as UTF-8.
+    /// Throws `ArkavoError.invalidState` while an account deletion is running.
+    public func linkAppleIdentity(idToken: String, authorizationCode: String?) async throws {
+        guard !isDeletingAccount else { throw ArkavoError.invalidState }
+        guard let cwt = credentialStore.authenticationToken() else {
             print("ArkavoClient.linkAppleIdentity: no CWT in keychain (missingAuthToken)")
             throw AppleLinkError.missingAuthToken
         }
@@ -1397,11 +1673,15 @@ public final class ArkavoClient: NSObject {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(cwt, forHTTPHeaderField: "X-Auth-Token")
-        request.httpBody = try JSONSerialization.data(withJSONObject: ["id_token": idToken])
+        var payload = ["id_token": idToken]
+        if let authorizationCode {
+            payload["authorization_code"] = authorizationCode
+        }
+        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
 
         let (data, response): (Data, URLResponse)
         do {
-            (data, response) = try await Self.http3Data(for: request)
+            (data, response) = try await httpData(request)
         } catch {
             print("ArkavoClient.linkAppleIdentity: network error \(error)")
             throw AppleLinkError.networkError(error)
@@ -1539,14 +1819,14 @@ private class AuthenticationDelegate: NSObject, ASAuthorizationControllerDelegat
 // MARK: - WebSocket Delegate
 
 private actor WebSocketStateHandler {
-    var stateHandler: ((ArkavoClientState) async -> Void)?
+    var stateHandler: ((ArkavoClientState, URLSessionTask) async -> Void)?
 
-    func updateHandler(_ handler: @escaping (ArkavoClientState) -> Void) {
+    func updateHandler(_ handler: @escaping (ArkavoClientState, URLSessionTask) -> Void) {
         stateHandler = handler
     }
 
-    func handleState(_ state: ArkavoClientState) async {
-        await stateHandler?(state)
+    func handleState(_ state: ArkavoClientState, from task: URLSessionTask) async {
+        await stateHandler?(state, task)
     }
 }
 
@@ -1560,34 +1840,34 @@ private final class WebSocketDelegate: NSObject, URLSessionWebSocketDelegate, @u
         set { stateQueue.sync { _onConnect = newValue } }
     }
 
-    func setStateHandler(_ handler: @Sendable @escaping (ArkavoClientState) -> Void) {
+    func setStateHandler(_ handler: @Sendable @escaping (ArkavoClientState, URLSessionTask) -> Void) {
         Task {
             await stateHandler.updateHandler(handler)
         }
     }
 
     public func urlSession(_: URLSession,
-                           webSocketTask _: URLSessionWebSocketTask,
+                           webSocketTask: URLSessionWebSocketTask,
                            didOpenWithProtocol protocol: String?)
     {
         print("WebSocket did connect with protocol: \(`protocol` ?? "none")")
         onConnect?()
         Task {
-            await stateHandler.handleState(.connected)
+            await stateHandler.handleState(.connected, from: webSocketTask)
         }
     }
 
     public func urlSession(_: URLSession,
-                           task _: URLSessionTask,
+                           task: URLSessionTask,
                            didCompleteWithError error: Error?)
     {
         Task {
             if let error {
                 print("WebSocket did complete with error: \(error)")
-                await stateHandler.handleState(.error(error))
+                await stateHandler.handleState(.error(error), from: task)
             } else {
                 print("WebSocket did complete normally")
-                await stateHandler.handleState(.disconnected)
+                await stateHandler.handleState(.disconnected, from: task)
             }
         }
     }
