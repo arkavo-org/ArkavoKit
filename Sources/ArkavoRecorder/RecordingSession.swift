@@ -631,7 +631,9 @@ public final class RecordingSession: Sendable {
 
     /// Re-evaluates frame generation after a source toggle during a recording or stream.
     /// Camera and avatar modes are driven by the 30 fps frame timer, desktop modes by screen
-    /// frames; without this a live session kept the mode it started in.
+    /// frames; without this a live session kept the mode it started in. For a desktop mode,
+    /// start the screen capture first (e.g. `startScreenPreview()`): this stops the frame
+    /// timer, and the screen frames then carry the output.
     public func inputsDidChange() {
         guard _isRecording || _streamingActive.withLock({ $0 }) else { return }
         let mode = inputMode
