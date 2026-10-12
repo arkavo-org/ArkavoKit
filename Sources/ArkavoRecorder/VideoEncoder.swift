@@ -725,25 +725,16 @@ public actor VideoEncoder {
             dest.videoContinuation = videoCont
             dest.audioContinuation = audioCont
 
-            // Per-destination video send task with frame rate limiting
+            // Per-destination video send task. Every encoded frame is sent: a dropped P-frame
+            // breaks the decode chain, and the picture smears until the next keyframe. The
+            // sources are already capped at the stream frame rate before encoding.
             let publisher = dest.publisher
             let destId = id
-            let targetInterval: Double = 1.0 / Double(self.frameRate) // ~33ms for 30fps
             dest.videoSendTask = Task { [weak self] in
-                var lastSendTime: ContinuousClock.Instant? = nil
                 var frameCount: UInt64 = 0
                 for await frame in videoStream {
                     guard let self = self else { break }
                     guard !Task.isCancelled else { break }
-
-                    // Rate limit: skip frames that arrive faster than target fps
-                    let now = ContinuousClock.now
-                    if let last = lastSendTime {
-                        let elapsed = now - last
-                        if elapsed < .milliseconds(Int(targetInterval * 900)) && !frame.isKeyframe {
-                            continue // Drop frame — too fast
-                        }
-                    }
 
                     do {
                         let needsHeader = await self.shouldSendVideoHeader(for: destId)
@@ -753,7 +744,6 @@ public actor VideoEncoder {
                             print("✅ [\(destId)] Sent video sequence header")
                         }
                         try await publisher.send(video: frame)
-                        lastSendTime = now
                         frameCount += 1
                         if frameCount == 1 || frameCount % 900 == 0 {
                             print("📤 [\(destId)] video #\(frameCount)")
