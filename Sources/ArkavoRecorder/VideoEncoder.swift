@@ -602,6 +602,7 @@ public actor VideoEncoder {
         // Stream audio for RTMP — accept mixed output (from AudioMixer) or direct microphone
         if (isStreaming || isNTDFStreaming), let encoder = streamAudioEncoder, (sourceID == "mixed" || sourceID == "microphone") {
             // Feed PCM audio to encoder for AAC conversion
+            lastRealStreamAudio = CMClockGetTime(CMClockGetHostTimeClock())
             encoder.feed(sampleBuffer)
         }
     }
@@ -647,6 +648,15 @@ public actor VideoEncoder {
 
     // Shared frame queue (not per-destination — destinations get their own via fan-out)
     private var silentAudioTask: Task<Void, Never>?
+    /// Host time real audio last reached the stream encoder; the silence fallback stays off
+    /// while this is recent.
+    private var lastRealStreamAudio: CMTime?
+
+    /// Whether the silence fallback should feed a packet at `now`: no real audio for 200 ms.
+    private func silenceIsDue(at now: CMTime) -> Bool {
+        guard let last = lastRealStreamAudio else { return true }
+        return (now - last).seconds > 0.2
+    }
 
     /// Start streaming to one RTMP destination (convenience wrapper)
     public func startStreaming(to destination: RTMPPublisher.Destination, streamKey: String) async throws {
@@ -725,25 +735,16 @@ public actor VideoEncoder {
             dest.videoContinuation = videoCont
             dest.audioContinuation = audioCont
 
-            // Per-destination video send task with frame rate limiting
+            // Per-destination video send task. Every encoded frame is sent: a dropped P-frame
+            // breaks the decode chain, and the picture smears until the next keyframe. The
+            // sources are already capped at the stream frame rate before encoding.
             let publisher = dest.publisher
             let destId = id
-            let targetInterval: Double = 1.0 / Double(self.frameRate) // ~33ms for 30fps
             dest.videoSendTask = Task { [weak self] in
-                var lastSendTime: ContinuousClock.Instant? = nil
                 var frameCount: UInt64 = 0
                 for await frame in videoStream {
                     guard let self = self else { break }
                     guard !Task.isCancelled else { break }
-
-                    // Rate limit: skip frames that arrive faster than target fps
-                    let now = ContinuousClock.now
-                    if let last = lastSendTime {
-                        let elapsed = now - last
-                        if elapsed < .milliseconds(Int(targetInterval * 900)) && !frame.isKeyframe {
-                            continue // Drop frame — too fast
-                        }
-                    }
 
                     do {
                         let needsHeader = await self.shouldSendVideoHeader(for: destId)
@@ -753,7 +754,6 @@ public actor VideoEncoder {
                             print("✅ [\(destId)] Sent video sequence header")
                         }
                         try await publisher.send(video: frame)
-                        lastSendTime = now
                         frameCount += 1
                         if frameCount == 1 || frameCount % 900 == 0 {
                             print("📤 [\(destId)] video #\(frameCount)")
@@ -822,6 +822,9 @@ public actor VideoEncoder {
         lastStreamVideoTimestamp = .zero
         lastStreamAudioTimestamp = .zero
 
+        // Silence fills gaps only, on the host clock the real audio uses. It once ran alongside
+        // the real audio stamped from 0, and players stalled on the second timeline.
+        lastRealStreamAudio = nil
         startSilentAudioGenerator(encoder: audioEncoder)
 
         print("✅ RTMP stream started to \(streamDestinations.count) destination(s)")
@@ -878,10 +881,10 @@ public actor VideoEncoder {
         }
     }
 
-    /// Generates silent PCM audio and feeds it to the audio encoder.
-    /// Ensures the RTMP stream always has an audio track (required by YouTube).
-    /// Real audio from mic/mixer will supplement this; the silent frames
-    /// act as a fallback when no audio source is active.
+    /// Generates silent PCM audio and feeds it to the audio encoder whenever no real audio has
+    /// arrived for 200 ms, so the RTMP stream always has the audio track its metadata declares
+    /// (YouTube requires one). Packets are stamped with the host clock, the clock the mic,
+    /// desktop audio and Muse voice use, so silence and real audio share one timeline.
     private func startSilentAudioGenerator(encoder: ArkavoMedia.AudioEncoder) {
         // 48kHz stereo Int16 PCM, 1024 frames per AAC packet
         let sampleRate: Double = 48000
@@ -921,11 +924,9 @@ public actor VideoEncoder {
 
         silentAudioTask = Task { [weak self] in
             let silentData = Data(count: bufferSize) // all zeros = silence
-            var sampleTime: Double = 0
+            let packetDuration = CMTime(value: CMTimeValue(framesPerPacket), timescale: CMTimeScale(sampleRate))
 
-            while !Task.isCancelled {
-                guard let self = self, await self.isStreaming else { break }
-
+            func silentBuffer(at pts: CMTime) -> CMSampleBuffer? {
                 var blockBuffer: CMBlockBuffer?
                 silentData.withUnsafeBytes { rawPtr in
                     let ptr = UnsafeMutableRawPointer(mutating: rawPtr.baseAddress!)
@@ -941,26 +942,41 @@ public actor VideoEncoder {
                         blockBufferOut: &blockBuffer
                     )
                 }
+                guard let blockBuffer else { return nil }
+                var sampleBuffer: CMSampleBuffer?
+                CMAudioSampleBufferCreateReadyWithPacketDescriptions(
+                    allocator: kCFAllocatorDefault,
+                    dataBuffer: blockBuffer,
+                    formatDescription: formatDesc,
+                    sampleCount: framesPerPacket,
+                    presentationTimeStamp: pts,
+                    packetDescriptions: nil,
+                    sampleBufferOut: &sampleBuffer
+                )
+                return sampleBuffer
+            }
 
-                if let blockBuffer = blockBuffer {
-                    let pts = CMTime(seconds: sampleTime, preferredTimescale: CMTimeScale(sampleRate))
-                    var sampleBuffer: CMSampleBuffer?
-                    CMAudioSampleBufferCreateReadyWithPacketDescriptions(
-                        allocator: kCFAllocatorDefault,
-                        dataBuffer: blockBuffer,
-                        formatDescription: formatDesc,
-                        sampleCount: framesPerPacket,
-                        presentationTimeStamp: pts,
-                        packetDescriptions: nil,
-                        sampleBufferOut: &sampleBuffer
-                    )
+            // Host time the next silent packet starts. Each wake feeds every packet the clock
+            // says is due, back to back, so the silence is continuous whatever the sleep jitter.
+            var next: CMTime?
 
-                    if let sampleBuffer = sampleBuffer {
-                        encoder.feed(sampleBuffer)
+            while !Task.isCancelled {
+                guard let self = self, await self.isStreaming else { break }
+                let now = CMClockGetTime(CMClockGetHostTimeClock())
+                if await self.silenceIsDue(at: now) {
+                    // Start, or restart after real audio or a stall, at the current time.
+                    if next.map({ (now - $0).seconds > 0.5 }) ?? true {
+                        next = CMTimeConvertScale(now, timescale: CMTimeScale(sampleRate), method: .default)
                     }
+                    while let start = next, CMTimeCompare(start, now) <= 0 {
+                        if let sampleBuffer = silentBuffer(at: start) {
+                            encoder.feed(sampleBuffer)
+                        }
+                        next = start + packetDuration
+                    }
+                } else {
+                    next = nil
                 }
-
-                sampleTime += interval
                 try? await Task.sleep(for: .milliseconds(Int(interval * 1000)))
             }
         }

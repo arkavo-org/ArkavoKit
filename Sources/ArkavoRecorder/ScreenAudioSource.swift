@@ -48,9 +48,17 @@ public final class ScreenAudioSource: NSObject, AudioSource, @unchecked Sendable
             onScreenWindowsOnly: true
         )
 
-        // Create filter to capture all audio
+        // Create filter to capture all audio. The display only anchors the stream (system audio
+        // is not per-display), so use the main display: `displays.first` can be a display
+        // WindowServer cannot open a stream on (seen with a portrait secondary panel), and then
+        // the whole capture fails with CoreGraphicsErrorDomain 1003.
+        guard let display = availableContent.displays.first(where: { $0.displayID == CGMainDisplayID() })
+            ?? availableContent.displays.first
+        else {
+            throw RecorderError.screenCaptureUnavailable
+        }
         let filter = SCContentFilter(
-            display: availableContent.displays.first!,
+            display: display,
             excludingApplications: [],
             exceptingWindows: []
         )
@@ -62,8 +70,9 @@ public final class ScreenAudioSource: NSObject, AudioSource, @unchecked Sendable
         streamConfig.channelCount = 2   // Stereo
 
         // Don't capture video in audio-only source
-        streamConfig.width = 1
-        streamConfig.height = 1
+        // Smallest video surface WindowServer reliably creates (1x1 can fail IOSurface creation).
+        streamConfig.width = 2
+        streamConfig.height = 2
         streamConfig.minimumFrameInterval = CMTime(value: 1, timescale: 1)
 
         // Create stream output handler
