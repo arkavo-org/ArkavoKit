@@ -57,6 +57,29 @@ final class AudioEncoderContinuityTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(frames.count, 44, "960-frame buffers must not lose audio")
     }
 
+    /// Gaps that each stay under the resync threshold (a dropped capture buffer) used to be lost
+    /// for good, so audio fell further behind video with every one.
+    func testSmallGapsAddUpAndResync() throws {
+        let encoder = try AudioEncoder()
+        let output = Mutex<[EncodedAudioFrame]>([])
+        encoder.onFrame = { frame in output.withLock { $0.append(frame) } }
+        let frames = 960
+        var input = CMTime(value: 100 * 48000, timescale: 48000)
+        var fedEnd = input
+        for i in 0 ..< 60 {
+            encoder.feed(try pcmBuffer(frames: frames, pts: input))
+            input = input + CMTime(value: CMTimeValue(frames), timescale: 48000)
+            fedEnd = input
+            // Every 5th buffer is followed by a 60 ms hole: 11 holes reach the encoder, 660 ms.
+            if i % 5 == 4 { input = input + CMTime(value: 60, timescale: 1000) }
+        }
+        let last = try XCTUnwrap(output.withLock { $0.last })
+        // Allowed: the queued remainder and look-ahead (under 70 ms) plus up to 100 ms of loss
+        // not yet past the resync threshold. Lost holes would leave it 0.6+ s behind.
+        let lag = (fedEnd - last.pts).seconds
+        XCTAssertLessThan(lag, 0.2, "audio must stay level with its input, not \(lag) s behind")
+    }
+
     func testPacketTimestampsAdvanceOnePacketAtATime() throws {
         let frames = try encode(count: 50, frames: 960)
         XCTAssertGreaterThan(frames.count, 1)

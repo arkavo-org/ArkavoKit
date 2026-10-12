@@ -7,9 +7,9 @@ import Synchronization
 /// Buffers incoming PCM samples and outputs AAC frames.
 ///
 /// Thread safety: all `feed(...)` calls and `onFrame` access are serialized through
-/// an internal Mutex. Multiple producers (e.g. real microphone audio + a silent-audio
-/// fallback task) may call `feed` concurrently and the AAC output stream remains
-/// well-ordered for a single bitstream.
+/// an internal Mutex. The PCM queue and the sample-count clock assume one audio stream on
+/// one clock: feed one producer at a time (the recorder's silence fallback only fills gaps
+/// in the real audio), or two producers will interleave their samples.
 public final class AudioEncoder: @unchecked Sendable {
     // MARK: - Types
 
@@ -28,8 +28,6 @@ public final class AudioEncoder: @unchecked Sendable {
         /// Timestamp for the next AAC packet out. Packets advance it by exactly 1024 frames,
         /// so the stream's audio clock counts samples rather than following feed timing.
         var nextOutputPTS: CMTime?
-        /// Where the next fed buffer should start if the source is continuous.
-        var expectedInputPTS: CMTime?
         var onFrame: (@Sendable (EncodedAudioFrame) -> Void)?
     }
 
@@ -44,7 +42,7 @@ public final class AudioEncoder: @unchecked Sendable {
     private let targetFrameCount: AVAudioFrameCount = 1024  // AAC frame size
     /// A jump in input timestamps larger than this is a pause in the source, not jitter.
     private let maxContinuityGap: Double = 0.1
-    private var aacFormatDescription: CMAudioFormatDescription? { createAACFormatDescription() }
+    private let aacFormatDescription: CMAudioFormatDescription?
     private let sampleRate: Double = 48000
     private let channelCount: AVAudioChannelCount = 2
     private let bitrate: Int
@@ -102,6 +100,7 @@ public final class AudioEncoder: @unchecked Sendable {
             throw EncoderError.bufferCreationFailed
         }
         self.inputBuffer = inputBuffer
+        self.aacFormatDescription = Self.makeAACFormatDescription(aacFormat)
 
         print("✅ AudioEncoder initialized: PCM 48kHz stereo → AAC-LC \(bitrate/1000)kbps")
     }
@@ -119,12 +118,14 @@ public final class AudioEncoder: @unchecked Sendable {
             return
         }
 
-        let length = CMBlockBufferGetDataLength(dataBuffer)
+        // Whole frames only: a trailing partial frame would overrun the copy or shift the
+        // channels for the rest of the stream.
         let bytesPerFrame = Int(pcmFormat.streamDescription.pointee.mBytesPerFrame)
-        guard length >= bytesPerFrame else { return }
-        var samples = [Int16](repeating: 0, count: length / MemoryLayout<Int16>.size)
+        let frameCount = CMBlockBufferGetDataLength(dataBuffer) / bytesPerFrame
+        guard frameCount > 0 else { return }
+        var samples = [Int16](repeating: 0, count: frameCount * Int(channelCount))
         let status = samples.withUnsafeMutableBytes { raw in
-            CMBlockBufferCopyDataBytes(dataBuffer, atOffset: 0, dataLength: length, destination: raw.baseAddress!)
+            CMBlockBufferCopyDataBytes(dataBuffer, atOffset: 0, dataLength: frameCount * bytesPerFrame, destination: raw.baseAddress!)
         }
         guard status == kCMBlockBufferNoErr else {
             print("❌ AudioEncoder: Failed to copy PCM data (\(status))")
@@ -132,7 +133,6 @@ public final class AudioEncoder: @unchecked Sendable {
         }
 
         let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        let frameCount = length / bytesPerFrame
 
         let frames: [EncodedAudioFrame] = state.withLock { state in
             self.append(state: &state, samples: samples, frameCount: frameCount, timestamp: timestamp)
@@ -151,37 +151,54 @@ public final class AudioEncoder: @unchecked Sendable {
         frameCount: Int,
         timestamp: CMTime
     ) -> [EncodedAudioFrame] {
-        if state.nextOutputPTS == nil {
-            state.nextOutputPTS = timestamp
-        } else if timestamp.isNumeric, let expected = state.expectedInputPTS, expected.isNumeric {
-            // A source that paused leaves a gap in real time: move the audio clock across it
-            // so audio stays level with video. Overlaps are ignored to keep timestamps rising.
-            let gap = timestamp - expected
-            if gap.seconds > maxContinuityGap, let next = state.nextOutputPTS {
-                state.nextOutputPTS = next + gap
+        let tick = CMTimeScale(sampleRate)
+        let packetDuration = CMTime(value: CMTimeValue(targetFrameCount), timescale: tick)
+        if let next = state.nextOutputPTS {
+            // Where this buffer should start if nothing was lost: the output clock plus what is
+            // still queued. Audio a source dropped or paused over puts the input ahead of that;
+            // past the threshold the clock jumps across the difference, so small losses cannot
+            // add up into lip-sync drift. Input behind the clock is ignored to keep timestamps
+            // rising. The encoder's look-ahead (a packet or two) stays inside the threshold.
+            if timestamp.isNumeric {
+                let queued = CMTime(value: CMTimeValue(state.pending.count / Int(channelCount)), timescale: tick)
+                let drift = timestamp - (next + queued)
+                if drift.seconds > maxContinuityGap {
+                    state.nextOutputPTS = next + drift
+                }
             }
-        }
-        if timestamp.isNumeric {
-            state.expectedInputPTS = timestamp + CMTime(value: CMTimeValue(frameCount), timescale: CMTimeScale(sampleRate))
+        } else {
+            state.nextOutputPTS = timestamp
         }
 
         state.pending.append(contentsOf: samples)
 
         let samplesPerPacket = Int(targetFrameCount) * Int(channelCount)
         var frames: [EncodedAudioFrame] = []
-        while state.pending.count >= samplesPerPacket {
-            if let aac = encodePacket(state.pending.prefix(samplesPerPacket)), let pts = state.nextOutputPTS {
+        while state.pending.count >= samplesPerPacket, let pts = state.nextOutputPTS {
+            switch encodePacket(state.pending.prefix(samplesPerPacket)) {
+            case .packet(let aac):
                 frames.append(EncodedAudioFrame(data: aac, pts: pts, formatDescription: aacFormatDescription))
-                state.nextOutputPTS = pts + CMTime(value: CMTimeValue(targetFrameCount), timescale: CMTimeScale(sampleRate))
+                state.nextOutputPTS = pts + packetDuration
+            case .failed:
+                // The PCM is gone either way; keep the clock on it.
+                state.nextOutputPTS = pts + packetDuration
+            case .filling:
+                break
             }
             state.pending.removeFirst(samplesPerPacket)
         }
         return frames
     }
 
-    /// Encode exactly one packet's worth of PCM. Returns nil while the encoder is still
-    /// filling its look-ahead. Caller must hold the state lock.
-    private func encodePacket(_ samples: ArraySlice<Int16>) -> Data? {
+    private enum PacketResult {
+        case packet(Data)
+        /// The encoder took the PCM into its look-ahead and has no packet yet.
+        case filling
+        case failed
+    }
+
+    /// Encode exactly one packet's worth of PCM. Caller must hold the state lock.
+    private func encodePacket(_ samples: ArraySlice<Int16>) -> PacketResult {
         let channelData = inputBuffer.int16ChannelData!
         samples.withUnsafeBufferPointer { src in
             channelData[0].update(from: src.baseAddress!, count: src.count)
@@ -196,7 +213,8 @@ public final class AudioEncoder: @unchecked Sendable {
 
         // Hand the packet over once; answering .haveData again would encode it twice.
         nonisolated(unsafe) var supplied = false
-        let inputBuffer = self.inputBuffer
+        // The converter calls the block synchronously, inside `convert`.
+        nonisolated(unsafe) let inputBuffer = self.inputBuffer
         var error: NSError?
         let status = converter.convert(to: outputBuffer, error: &error) { @Sendable _, outStatus in
             if supplied {
@@ -210,19 +228,19 @@ public final class AudioEncoder: @unchecked Sendable {
 
         guard status != .error, error == nil else {
             print("❌ AudioEncoder: Conversion failed: \(error?.localizedDescription ?? "unknown")")
-            return nil
+            return .failed
         }
         guard let packetDescriptions = outputBuffer.packetDescriptions, outputBuffer.packetCount > 0 else {
-            return nil
+            return .filling
         }
         let packetDesc = packetDescriptions[0]
-        return Data(
+        return .packet(Data(
             bytes: outputBuffer.data.advanced(by: Int(packetDesc.mStartOffset)),
             count: Int(packetDesc.mDataByteSize)
-        )
+        ))
     }
 
-    private func createAACFormatDescription() -> CMAudioFormatDescription? {
+    private static func makeAACFormatDescription(_ aacFormat: AVAudioFormat) -> CMAudioFormatDescription? {
         // Create AudioSpecificConfig for AAC-LC 48kHz stereo
         // Format: 5 bits object type (2=AAC-LC) + 4 bits sample rate index (3=48kHz) + 4 bits channel config (2=stereo)
         let objectType: UInt8 = 2  // AAC-LC
