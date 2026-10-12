@@ -822,7 +822,9 @@ public actor VideoEncoder {
         lastStreamVideoTimestamp = .zero
         lastStreamAudioTimestamp = .zero
 
-        startSilentAudioGenerator(encoder: audioEncoder)
+        // The silence generator is not started: it fed this encoder a second audio timeline,
+        // stamped from 0, alongside the real audio on the host clock, and players stalled on
+        // the jump. A stream with no audio source carries no audio until it fills gaps only.
 
         print("✅ RTMP stream started to \(streamDestinations.count) destination(s)")
     }
