@@ -507,8 +507,9 @@ public final class RecordingSession: Sendable {
             }
         }
 
-        // If preview-only mode (no recording or streaming), don't process for encoding
-        guard !isScreenPreviewOnly || _streamingActive.withLock({ $0 }) else { return }
+        // If preview-only mode (no recording or streaming), don't process for encoding. A screen
+        // turned on mid-recording or mid-stream runs as a preview capture, and its frames still count.
+        guard !isScreenPreviewOnly || _isRecording || _streamingActive.withLock({ $0 }) else { return }
 
         // Continue with recording/streaming if active
         await processFrameSync(screen: screenBuffer)
@@ -625,6 +626,19 @@ public final class RecordingSession: Sendable {
             Task { @MainActor [weak self] in
                 await self?.processCameraOrAvatarFrame()
             }
+        }
+    }
+
+    /// Re-evaluates frame generation after a source toggle during a recording or stream.
+    /// Camera and avatar modes are driven by the 30 fps frame timer, desktop modes by screen
+    /// frames; without this a live session kept the mode it started in.
+    public func inputsDidChange() {
+        guard _isRecording || _streamingActive.withLock({ $0 }) else { return }
+        let mode = inputMode
+        if !mode.needsDesktop && mode.needsVideo {
+            if cameraFrameTimer == nil { startCameraFrameDriver() }
+        } else {
+            stopCameraFrameDriver()
         }
     }
 
