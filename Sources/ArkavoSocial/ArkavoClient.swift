@@ -19,6 +19,9 @@ public enum ArkavoError: Error {
     case notConnected
     case invalidState
     case profileNotFound(String)
+    /// identity does not know the passkey the person picked: its account is gone.
+    /// The passkey has been reported to the system so the sheet stops offering it.
+    case unknownPasskey
 }
 
 /// Represents the current state of the ArkavoClient
@@ -86,6 +89,22 @@ public final class ArkavoClient: NSObject {
 
     /// The keychain items account deletion and Apple linking touch.
     var credentialStore: any AccountCredentialStore = KeychainCredentialStore()
+
+    /// The system passkey sheet: an assertion request → the picked passkey's assertion.
+    /// A cancelled sheet throws `ASAuthorizationError` (`.canceled`) unchanged.
+    lazy var assertionProvider: @MainActor (ASAuthorizationPlatformPublicKeyCredentialAssertionRequest) async throws -> PasskeyAssertion = { [unowned self] request in
+        let assertion = try await self.performAuthentication(request: request)
+        return PasskeyAssertion(
+            credentialID: assertion.credentialID,
+            rawClientDataJSON: assertion.rawClientDataJSON,
+            rawAuthenticatorData: assertion.rawAuthenticatorData,
+            signature: assertion.signature,
+            userID: assertion.userID
+        )
+    }
+
+    /// Tells the system which passkeys identity no longer accepts.
+    var credentialReporter: any PasskeyCredentialReporting = SystemPasskeyCredentialReporter()
 
     /// Performs a request that opts into HTTP/3 on the first hop.
     ///
@@ -838,6 +857,101 @@ public final class ArkavoClient: NSObject {
             .compactMap { Data(base64Encoded: $0.base64URLToBase64()) }
             .map { ASAuthorizationPlatformPublicKeyCredentialDescriptor(credentialID: $0) }
         return request
+    }
+
+    /// The passkey ceremony: `GET /authenticate`, the system sheet, then
+    /// `POST /authenticate` with the assertion. Never stores the token.
+    ///
+    /// With no `account` it is the name-free sign-in: the sheet offers every passkey
+    /// for the relying party, and identity names the account in its reply. With an
+    /// `account` it re-authenticates that account, and the sheet offers only its passkeys.
+    ///
+    /// - Throws: `ArkavoError.authenticationFailed("User Not Found")` when the
+    ///   scoped account no longer exists; `ArkavoError.unknownPasskey` when identity
+    ///   does not know the picked passkey (reported to the system first);
+    ///   `ArkavoError.invalidResponse` for unusable options; the sheet's
+    ///   `ASAuthorizationError` unchanged.
+    func passkeyCeremony(account: UUID?) async throws -> AuthenticationReply {
+        print("ArkavoClient.passkeyCeremony: start scoped=\(account != nil)")
+        let provider = ASAuthorizationPlatformPublicKeyCredentialProvider(relyingPartyIdentifier: relyingPartyID)
+
+        var components = URLComponents(url: authURL.appendingPathComponent("authenticate"), resolvingAgainstBaseURL: true)
+        if let account {
+            components?.queryItems = [URLQueryItem(name: "account", value: account.uuidString.lowercased())]
+        }
+        guard let url = components?.url else {
+            throw ArkavoError.invalidURL
+        }
+
+        let (data, response) = try await httpData(URLRequest(url: url))
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw ArkavoError.invalidResponse
+        }
+        print("ArkavoClient.passkeyCeremony: start status=\(httpResponse.statusCode)")
+        guard (200 ... 299).contains(httpResponse.statusCode) else {
+            if String(decoding: data, as: UTF8.self).contains("User Not Found") {
+                throw ArkavoError.authenticationFailed("User Not Found")
+            }
+            throw ArkavoError.invalidResponse
+        }
+
+        guard let options = try? JSONDecoder().decode(AuthenticationOptionsResponse.self, from: data),
+              let challenge = Data(base64Encoded: options.publicKey.challenge.base64URLToBase64())
+        else {
+            throw ArkavoError.invalidResponse
+        }
+
+        let assertionRequest = Self.passkeyAssertionRequest(
+            provider: provider,
+            challenge: challenge,
+            allowCredentialIDs: options.publicKey.publicKeyCredentialIDs
+        )
+        let assertion = try await assertionProvider(assertionRequest)
+
+        var finishRequest = URLRequest(url: authURL.appendingPathComponent("authenticate"))
+        finishRequest.httpMethod = "POST"
+        finishRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let parameters: [String: Any] = [
+            "id": assertion.credentialID.base64URLEncodedString(),
+            "rawId": assertion.credentialID.base64URLEncodedString(),
+            "response": [
+                "clientDataJSON": assertion.rawClientDataJSON.base64URLEncodedString(),
+                "authenticatorData": assertion.rawAuthenticatorData.base64URLEncodedString(),
+                "signature": assertion.signature.base64URLEncodedString(),
+                "userHandle": assertion.userID?.base64URLEncodedString() ?? "",
+            ],
+            "type": "public-key",
+        ]
+        finishRequest.httpBody = try JSONSerialization.data(withJSONObject: parameters)
+
+        let (replyData, finishResponse) = try await httpData(finishRequest)
+        guard let finishHTTPResponse = finishResponse as? HTTPURLResponse else {
+            throw ArkavoError.authenticationFailed("Invalid response from server")
+        }
+        print("ArkavoClient.passkeyCeremony: finish status=\(finishHTTPResponse.statusCode)")
+        let replyText = String(decoding: replyData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        switch finishHTTPResponse.statusCode {
+        case 200 ... 299:
+            break
+        // Only identity's own refusal reports the passkey: a 404 from anywhere
+        // else must not remove a passkey from the person's device.
+        case 404 where replyText == "Unknown Passkey":
+            await credentialReporter.reportUnknown(relyingPartyID: relyingPartyID, credentialID: assertion.credentialID)
+            throw ArkavoError.unknownPasskey
+        case 403:
+            throw ArkavoError.authenticationFailed("Passkey belongs to another account")
+        default:
+            throw ArkavoError.authenticationFailed("Invalid response from server")
+        }
+
+        let json = try? JSONSerialization.jsonObject(with: replyData) as? [String: Any]
+        guard let token = json?["token"] as? String, !token.isEmpty else {
+            throw ArkavoError.authenticationFailed("No authentication token received")
+        }
+        guard let handle = json?["handle"] as? String, !handle.isEmpty else {
+            throw ArkavoError.authenticationFailed("No account handle received")
+        }
+        return AuthenticationReply(token: token, handle: handle)
     }
 
     private func authenticateUser(accountName: String) async throws -> String {
@@ -2256,6 +2370,21 @@ struct PublicKeyAuthenticationOptions: Decodable {
 struct AllowCredential: Decodable {
     let id: String
     let type: String
+}
+
+/// The fields of the passkey sheet's assertion that `POST /authenticate` carries.
+struct PasskeyAssertion: Sendable, Equatable {
+    let credentialID: Data
+    let rawClientDataJSON: Data
+    let rawAuthenticatorData: Data
+    let signature: Data
+    let userID: Data?
+}
+
+/// identity's reply to a passkey ceremony: the auth CWT and the account's handle.
+struct AuthenticationReply: Equatable {
+    let token: String
+    let handle: String
 }
 
 public struct ArkavoProfile: Codable {

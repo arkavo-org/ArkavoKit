@@ -1,3 +1,4 @@
+import AuthenticationServices
 import Foundation
 @testable import ArkavoSocial
 
@@ -64,6 +65,48 @@ final class ScriptedHTTP {
         case let .failure(error):
             throw error
         }
+    }
+}
+
+/// Stands in for the system passkey sheet: records each assertion request and
+/// answers with the scripted assertion or error.
+@MainActor
+final class ScriptedAssertion {
+    private let outcome: Result<PasskeyAssertion, Error>
+    private(set) var requests: [ASAuthorizationPlatformPublicKeyCredentialAssertionRequest] = []
+
+    init(_ outcome: Result<PasskeyAssertion, Error>) {
+        self.outcome = outcome
+    }
+
+    func perform(_ request: ASAuthorizationPlatformPublicKeyCredentialAssertionRequest) async throws -> PasskeyAssertion {
+        requests.append(request)
+        return try outcome.get()
+    }
+}
+
+/// Records every passkey report instead of telling the system.
+@MainActor
+final class RecordingReporter: PasskeyCredentialReporting {
+    struct Unknown: Equatable {
+        let relyingPartyID: String
+        let credentialID: Data
+    }
+
+    struct NoAcceptedCredentials: Equatable {
+        let relyingPartyID: String
+        let userHandle: Data
+    }
+
+    private(set) var unknown: [Unknown] = []
+    private(set) var noAcceptedCredentials: [NoAcceptedCredentials] = []
+
+    func reportUnknown(relyingPartyID: String, credentialID: Data) async {
+        unknown.append(Unknown(relyingPartyID: relyingPartyID, credentialID: credentialID))
+    }
+
+    func reportNoAcceptedCredentials(relyingPartyID: String, userHandle: Data) async {
+        noAcceptedCredentials.append(NoAcceptedCredentials(relyingPartyID: relyingPartyID, userHandle: userHandle))
     }
 }
 
