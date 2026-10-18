@@ -295,7 +295,7 @@ final class ArkavoClientDeletionTests: XCTestCase {
         XCTAssertTrue(client.isDeletingAccount)
 
         await assertRefused { _ = try await self.client.deleteAccount(accountName: "alice") }
-        await assertRefused { try await self.client.connect(accountName: "alice") }
+        await assertRefused { try await self.client.connect() }
         await assertRefused { _ = try await self.client.registerUser(handle: "alice", did: "did:key:z1") }
         await assertRefused { try await self.client.linkAppleIdentity(idToken: "t", authorizationCode: "c") }
 

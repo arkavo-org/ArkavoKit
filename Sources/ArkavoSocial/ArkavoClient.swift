@@ -226,8 +226,19 @@ public final class ArkavoClient: NSObject {
 
     // MARK: - Public Methods
 
+    /// Whether a cached session can be reused without a passkey ceremony: it needs both
+    /// the token and the stored handle, so a token alone never "signs in" with an empty handle.
+    nonisolated static func usesCachedSession(token: String?, handle: String?) -> Bool {
+        guard let token, !token.isEmpty, let handle, !handle.isEmpty else { return false }
+        return true
+    }
+
+    /// Signs in with a passkey (no account name) and opens the socket.
+    /// - Parameter account: re-authenticates this account only; `nil` lets the passkey choose.
+    /// - Returns: the signed-in account's handle.
+    @discardableResult
     @MainActor
-    public func connect(accountName: String) async throws {
+    public func connect(account: UUID? = nil) async throws -> String {
         guard !isDeletingAccount else { throw ArkavoError.invalidState }
         print("ArkavoClient: Connecting...")
         // Check current state more thoroughly
@@ -239,8 +250,12 @@ public final class ArkavoClient: NSObject {
             // First disconnect if we're in error state
             await disconnect()
         case .connected:
-            print("Already connected, no need to reconnect")
-            return
+            if let handle = KeychainManager.getArkavoHandle(), !handle.isEmpty {
+                print("Already connected, no need to reconnect")
+                return handle
+            }
+            // Connected, but no handle to return: drop the session and sign in again.
+            await disconnect()
         case .connecting, .authenticating:
             throw ArkavoError.invalidState
         }
@@ -249,15 +264,16 @@ public final class ArkavoClient: NSObject {
         // Server is authoritative — if the handshake succeeds, we skip the
         // WebAuthn ceremony entirely. If it fails for any reason (expired,
         // revoked, network), we drop the cached token and fall through to the
-        // ceremony branch below.
-        if KeychainManager.getAuthenticationToken() != nil {
+        // ceremony branch below. A token without a stored handle is not a session.
+        let cachedToken = KeychainManager.getAuthenticationToken()
+        let cachedHandle = KeychainManager.getArkavoHandle()
+        if Self.usesCachedSession(token: cachedToken, handle: cachedHandle), let cachedHandle {
             do {
                 currentState = .connecting
                 try await setupWebSocketConnection()
                 try await waitForConnection()
                 try await sendInitialMessages()
-                try? KeychainManager.saveArkavoHandle(accountName)
-                return
+                return cachedHandle
             } catch {
                 print("ArkavoClient: cached token rejected (\(error)); falling back to passkey ceremony")
                 KeychainManager.deleteAuthenticationToken()
@@ -270,15 +286,17 @@ public final class ArkavoClient: NSObject {
                 session = nil
                 currentState = .disconnected
             }
+        } else if cachedToken != nil {
+            KeychainManager.deleteAuthenticationToken()
         }
 
         do {
             // First authenticate
             currentState = .authenticating
-            let token = try await authenticateUser(accountName: accountName)
-            try KeychainManager.saveAuthenticationToken(token)
-            // Save the account name (handle) for future sessions
-            try KeychainManager.saveArkavoHandle(accountName)
+            let reply = try await passkeyCeremony(account: account)
+            try KeychainManager.saveAuthenticationToken(reply.token)
+            // Save the handle for future sessions
+            try KeychainManager.saveArkavoHandle(reply.handle)
 
             // Then establish WebSocket connection
             currentState = .connecting
@@ -287,6 +305,7 @@ public final class ArkavoClient: NSObject {
             try await waitForConnection()
             // swap keys
             try await sendInitialMessages()
+            return reply.handle
         } catch {
             print("connect error: \(error)")
             if let kcError = error as? KeychainManager.KeychainError {
