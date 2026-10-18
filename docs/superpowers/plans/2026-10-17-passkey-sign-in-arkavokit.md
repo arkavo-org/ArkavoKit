@@ -113,7 +113,9 @@
     - `connect` calls it with `KeychainManager.getAuthenticationToken()` and `KeychainManager.getArkavoHandle()`.
   - Update `testWhileDeletingEverythingElseIsRefused` to call `connect()`, and still expect `.invalidState`.
 - [ ] **Step 2: Run to verify they fail.** `swift test --filter ArkavoKitTests.ConnectTests`. Expect a FAIL.
-- [ ] **Step 3: Implement** the signature and paths above. Delete `connect(accountName:)`.
+- [ ] **Step 3: Implement** the signature and paths above. Delete `connect(accountName:)`. Then confirm that the apps' registration writes the same Keychain item `getArkavoHandle()` reads: `KeychainManager.saveArkavoCredentials(handle:did:)` (Creator) and `saveIdentityPair`/`saveArkavoCredentials` (iOS `ArkavoSharedCredentialStore`). Do this with `grep -n "com.arkavo.handle" Sources/ArkavoSocial/KeychainManager.swift`.
+  - If the registration writes a different item, the fast path after registration would miss the handle.
+  - In that case `saveArkavoCredentials` must also write it. Add a test for that.
 - [ ] **Step 4: Run.** `swift test`. Expect a PASS.
 - [ ] **Step 5: Commit.** `git commit -m "feat(social)!: connect signs in by passkey without an account name"`
 
@@ -134,6 +136,9 @@
   - `lazy var authenticator: @MainActor (UUID) async throws -> String`, whose default is `passkeyCeremony(account:).token`.
   - `freshDeletionToken(accountName:)` re-authenticates `UUID(uuidString: CWTSubject.sub(fromToken: storedToken))`, but only when `credentialStore.sharedHandle() == accountName`. Otherwise it throws `ArkavoError.notConnected` with no request.
   - On `.deleted` and `.alreadyDeleted`: `credentialReporter.reportNoAcceptedCredentials(relyingPartyID:userHandle:)` with the UUID's 16 bytes, written as `withUnsafeBytes(of: uuid.uuid) { Data($0) }`.
+  - Unverified: whether the system accepts an **empty** `acceptedCredentialIDs` list. Note it on the PR for TestFlight QA.
+    - If QA finds it refused (the passkey stays listed after a deletion), the follow-up is that the reporter also calls `reportUnknown` for the credential id used in the deletion's re-authentication.
+    - Supporting that, `passkeyCeremony` would return that id.
 
 - [ ] **Step 1: Write the failing tests.**
   - `testDeletionReauthenticatesTheStoredAccount`: `authenticator` is called once, with the stored token's `sub` UUID.
