@@ -4,11 +4,18 @@ import XCTest
 @testable import ArkavoSocial
 
 /// What `deleteAccount(accountName:)` removes from this device, and when.
+///
+/// A deletion runs only when the stored handle is the named one and the stored
+/// token carries that account's id; otherwise it is refused before any sign-in
+/// and removes nothing.
 @MainActor
 final class ArkavoClientDeletionWipeTests: XCTestCase {
     private static let accepted = ScriptedHTTP.Outcome.status(202, "{}")
     private static let everything = ["token", "sharedHandleAndDID", "identityPair", "didKey", "appleAccount"]
     private static let userNotFound = ArkavoError.authenticationFailed("User Not Found")
+    /// A token of the stored account (the harness's "alice").
+    private static let aliceToken = DeletionHarness.token(of: DeletionHarness.account)
+    private static let otherToken = DeletionHarness.token(of: DeletionHarness.otherAccount)
 
     private var harness: DeletionHarness!
 
@@ -99,89 +106,44 @@ final class ArkavoClientDeletionWipeTests: XCTestCase {
     // MARK: - After .deleted
 
     func testSameAccountRemovesEverything() async throws {
-        harness.store.token = TestCWT.token(sub: "user-1")
+        harness.store.token = Self.aliceToken
         harness.store.handle = "alice"
 
-        _ = try await deleteAlice(signIn: .success(TestCWT.token(sub: "user-1")))
+        _ = try await deleteAlice(signIn: .success(Self.aliceToken))
 
         XCTAssertEqual(harness.store.removals, Self.everything)
         XCTAssertNil(harness.store.token)
         XCTAssertNil(harness.store.handle)
     }
 
+    /// Identity answers the re-authentication of the stored account with
+    /// another account's token: the stored token is not the deleted account's.
     func testStoredTokenOfAnotherAccountIsKept() async throws {
-        harness.store.token = TestCWT.token(sub: "user-2")
+        harness.store.token = Self.aliceToken
         harness.store.handle = "alice"
 
-        _ = try await deleteAlice(signIn: .success(TestCWT.token(sub: "user-1")))
+        _ = try await deleteAlice(signIn: .success(Self.otherToken))
 
         XCTAssertEqual(harness.store.removals, ["sharedHandleAndDID", "identityPair", "didKey", "appleAccount"])
-        XCTAssertEqual(harness.store.token, TestCWT.token(sub: "user-2"))
+        XCTAssertEqual(harness.store.token, Self.aliceToken)
     }
 
-    func testSharedHandleOfAnotherAccountIsKept() async throws {
-        harness.store.token = TestCWT.token(sub: "user-1")
-        harness.store.handle = "bob"
-
-        _ = try await deleteAlice(signIn: .success(TestCWT.token(sub: "user-1")))
-
-        XCTAssertEqual(harness.store.removals, ["token", "appleAccount"])
-        XCTAssertEqual(harness.store.handle, "bob")
-    }
-
-    func testHandleOfDifferentCaseIsAnotherAccount() async throws {
-        harness.store.token = TestCWT.token(sub: "user-1")
-        harness.store.handle = "Alice"
-
-        _ = try await deleteAlice(signIn: .success(TestCWT.token(sub: "user-1")))
-
-        XCTAssertEqual(harness.store.removals, ["token", "appleAccount"])
-        XCTAssertEqual(harness.store.handle, "Alice")
-    }
-
-    func testNoStoredHandleCountsAsThisAccount() async throws {
-        harness.store.token = TestCWT.token(sub: "user-1")
-        harness.store.handle = nil
-
-        _ = try await deleteAlice(signIn: .success(TestCWT.token(sub: "user-1")))
-
-        XCTAssertEqual(harness.store.removals, Self.everything)
-    }
-
-    func testNoStoredTokenRemovesNoToken() async throws {
-        harness.store.token = nil
-        harness.store.handle = "alice"
-
-        _ = try await deleteAlice(signIn: .success(TestCWT.token(sub: "user-1")))
-
-        XCTAssertEqual(harness.store.removals, ["sharedHandleAndDID", "identityPair", "didKey", "appleAccount"])
-    }
-
+    /// The fresh token's subject is unreadable; the stored handle is "alice".
     func testUnreadableSubjectFallsBackToTheHandle() async throws {
-        harness.store.token = "opaque-stored-token"
+        harness.store.token = Self.aliceToken
         harness.store.handle = "alice"
-
-        _ = try await deleteAlice(signIn: .success(TestCWT.token(sub: "user-1")))
-
-        XCTAssertEqual(harness.store.removals, Self.everything)
-    }
-
-    func testUnreadableSubjectWithAnotherHandleKeepsTheToken() async throws {
-        harness.store.token = TestCWT.token(sub: "user-1")
-        harness.store.handle = "bob"
 
         _ = try await deleteAlice(signIn: .success("opaque-fresh-token"))
 
-        XCTAssertEqual(harness.store.removals, ["appleAccount"])
-        XCTAssertNotNil(harness.store.token)
+        XCTAssertEqual(harness.store.removals, Self.everything)
     }
 
     func testDIDKeyFailureDoesNotFailTheDeletion() async throws {
-        harness.store.token = TestCWT.token(sub: "user-1")
+        harness.store.token = Self.aliceToken
         harness.store.handle = "alice"
         harness.store.didKeyDeletionError = KeychainManager.KeychainError.unknown(-25_244)
 
-        let result = try await deleteAlice(signIn: .success(TestCWT.token(sub: "user-1")))
+        let result = try await deleteAlice(signIn: .success(Self.aliceToken))
 
         XCTAssertEqual(result, .deleted(nil))
         XCTAssertEqual(harness.store.removals, Self.everything, "the steps after the DID key still run")
@@ -195,7 +157,7 @@ final class ArkavoClientDeletionWipeTests: XCTestCase {
             installLiveSession(state: state)
             let waiters = await installPendingWaiters()
 
-            _ = try await deleteAlice(signIn: .success(TestCWT.token(sub: "user-1")))
+            _ = try await deleteAlice(signIn: .success(Self.aliceToken))
 
             let client = harness.client
             XCTAssertNil(client.sessionSymmetricKey, "from \(state)")
@@ -237,7 +199,7 @@ final class ArkavoClientDeletionWipeTests: XCTestCase {
     // MARK: - After .alreadyDeleted
 
     func testAlreadyDeletedWithThisHandleRemovesEverything() async throws {
-        harness.store.token = TestCWT.token(sub: "user-1")
+        harness.store.token = Self.aliceToken
         harness.store.handle = "alice"
 
         let result = try await deleteAlice(signIn: .failure(Self.userNotFound), http: [])
@@ -246,27 +208,83 @@ final class ArkavoClientDeletionWipeTests: XCTestCase {
         XCTAssertEqual(harness.store.removals, Self.everything)
     }
 
-    func testAlreadyDeletedWithAnotherHandleKeepsTheSharedItems() async throws {
-        harness.store.token = TestCWT.token(sub: "user-2")
+    // MARK: - Not this account: refused, nothing removed
+
+    // A deletion of "alice" is scoped to the stored account, so one this device
+    // cannot tie to her is refused before any sign-in. Another account's items
+    // are kept because nothing is removed at all.
+
+    func testSharedHandleOfAnotherAccountIsKept() async {
+        harness.store.token = Self.aliceToken
         harness.store.handle = "bob"
-        installLiveSession()
 
-        let result = try await deleteAlice(signIn: .failure(Self.userNotFound), http: [])
+        await assertRefusedAndRemovesNothing()
 
-        XCTAssertEqual(result, .alreadyDeleted)
-        XCTAssertEqual(harness.store.removals, ["appleAccount"])
-        XCTAssertEqual(harness.client.currentState, .disconnected)
+        XCTAssertEqual(harness.store.handle, "bob")
+        XCTAssertEqual(harness.store.token, Self.aliceToken)
+    }
+
+    func testHandleOfDifferentCaseIsAnotherAccount() async {
+        harness.store.token = Self.aliceToken
+        harness.store.handle = "Alice"
+
+        await assertRefusedAndRemovesNothing()
+
+        XCTAssertEqual(harness.store.handle, "Alice")
+    }
+
+    /// No stored handle: nothing says the stored token is alice's.
+    func testNoStoredHandleIsNotThisAccount() async {
+        harness.store.token = Self.aliceToken
+        harness.store.handle = nil
+
+        await assertRefusedAndRemovesNothing()
+    }
+
+    /// No stored token: no account id to scope the sign-in to.
+    func testNoStoredTokenRemovesNothing() async {
+        harness.store.token = nil
+        harness.store.handle = "alice"
+
+        await assertRefusedAndRemovesNothing()
+    }
+
+    func testUnreadableStoredSubjectRemovesNothing() async {
+        harness.store.token = "opaque-stored-token"
+        harness.store.handle = "alice"
+
+        await assertRefusedAndRemovesNothing()
+
+        XCTAssertEqual(harness.store.token, "opaque-stored-token")
+    }
+
+    func testUnreadableSubjectWithAnotherHandleKeepsTheToken() async {
+        harness.store.token = Self.aliceToken
+        harness.store.handle = "bob"
+
+        await assertRefusedAndRemovesNothing(signIn: .success("opaque-fresh-token"))
+
+        XCTAssertNotNil(harness.store.token)
+    }
+
+    /// Another account is signed in: alice's deletion cannot learn she is gone,
+    /// and the other account's session is left alone.
+    func testAlreadyDeletedWithAnotherHandleKeepsTheSharedItems() async {
+        harness.store.token = Self.otherToken
+        harness.store.handle = "bob"
+
+        await assertRefusedAndRemovesNothing(signIn: .failure(Self.userNotFound))
     }
 
     // MARK: - Nothing removed on failure
 
     func testTwoConflictsRemoveNothing() async {
-        harness.store.token = TestCWT.token(sub: "user-1")
+        harness.store.token = Self.aliceToken
         harness.store.handle = "alice"
         installLiveSession()
 
         await assertThrewAccountDeletionFailed {
-            try await self.deleteAlice(signIn: .success(TestCWT.token(sub: "user-1")), http: [.status(409, "{}"), .status(409, "{}")])
+            try await self.deleteAlice(signIn: .success(Self.aliceToken), http: [.status(409, "{}"), .status(409, "{}")])
         }
 
         XCTAssertTrue(harness.store.removals.isEmpty)
@@ -274,7 +292,7 @@ final class ArkavoClientDeletionWipeTests: XCTestCase {
     }
 
     func testCancelledSignInRemovesNothing() async {
-        harness.store.token = TestCWT.token(sub: "user-1")
+        harness.store.token = Self.aliceToken
         harness.store.handle = "alice"
         installLiveSession()
 
@@ -292,12 +310,12 @@ final class ArkavoClientDeletionWipeTests: XCTestCase {
     }
 
     func testTransportErrorRemovesNothing() async {
-        harness.store.token = TestCWT.token(sub: "user-1")
+        harness.store.token = Self.aliceToken
         harness.store.handle = "alice"
         installLiveSession()
 
         await assertThrewAccountDeletionFailed {
-            try await self.deleteAlice(signIn: .success(TestCWT.token(sub: "user-1")), http: [.failure(URLError(.timedOut))])
+            try await self.deleteAlice(signIn: .success(Self.aliceToken), http: [.failure(URLError(.timedOut))])
         }
 
         XCTAssertTrue(harness.store.removals.isEmpty)
@@ -305,12 +323,12 @@ final class ArkavoClientDeletionWipeTests: XCTestCase {
     }
 
     func testServerErrorRemovesNothing() async {
-        harness.store.token = TestCWT.token(sub: "user-1")
+        harness.store.token = Self.aliceToken
         harness.store.handle = "alice"
         installLiveSession()
 
         await assertThrewAccountDeletionFailed {
-            try await self.deleteAlice(signIn: .success(TestCWT.token(sub: "user-1")), http: [.status(500, "{}")])
+            try await self.deleteAlice(signIn: .success(Self.aliceToken), http: [.status(500, "{}")])
         }
 
         XCTAssertTrue(harness.store.removals.isEmpty)
@@ -318,7 +336,7 @@ final class ArkavoClientDeletionWipeTests: XCTestCase {
     }
 
     func testPaddedNameIsRefusedAndRemovesNothing() async {
-        harness.store.token = TestCWT.token(sub: "user-1")
+        harness.store.token = Self.aliceToken
         harness.store.handle = "alice"
         installLiveSession()
         harness.stubCeremonies([.failure(Self.userNotFound)])
@@ -349,7 +367,7 @@ final class ArkavoClientDeletionWipeTests: XCTestCase {
         let delegate = RecordingClientDelegate()
         harness.client.delegate = delegate
 
-        _ = try await deleteAlice(signIn: .success(TestCWT.token(sub: "user-1")))
+        _ = try await deleteAlice(signIn: .success(Self.aliceToken))
         delegate.reset() // the teardown's own .disconnected is expected; only later events matter
 
         let cancelled = URLError(.cancelled)
@@ -462,10 +480,37 @@ final class ArkavoClientDeletionWipeTests: XCTestCase {
         client.session = session
         client.webSocket = session.webSocketTask(with: URL(string: "wss://kas.example.test")!)
 
-        _ = try await deleteAlice(signIn: .success(TestCWT.token(sub: "user-1")))
+        _ = try await deleteAlice(signIn: .success(Self.aliceToken))
 
         await fulfillment(of: [probe.invalidated], timeout: 5)
         XCTAssertNil(client.session)
+    }
+
+    /// Deletes "alice" with a live session installed and expects the refusal:
+    /// `.notConnected`, no sign-in, no request, nothing removed, session untouched.
+    private func assertRefusedAndRemovesNothing(
+        signIn: Result<String, Error> = .success(aliceToken),
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        installLiveSession()
+        harness.stubCeremonies([signIn])
+        let http = harness.stubHTTP([Self.accepted])
+
+        do {
+            let result = try await harness.client.deleteAccount(accountName: "alice")
+            XCTFail("expected notConnected, got \(result)", file: file, line: line)
+        } catch ArkavoError.notConnected {
+            // expected
+        } catch {
+            XCTFail("wrong error: \(error)", file: file, line: line)
+        }
+
+        XCTAssertTrue(harness.ceremonies.isEmpty, "no sign-in", file: file, line: line)
+        XCTAssertTrue(http.requests.isEmpty, "no request", file: file, line: line)
+        XCTAssertTrue(harness.store.removals.isEmpty, file: file, line: line)
+        XCTAssertTrue(harness.reporter.noAcceptedCredentials.isEmpty, "no passkey is cleared", file: file, line: line)
+        assertSessionUntouched(file: file, line: line)
     }
 
     private func assertSessionUntouched(file: StaticString = #filePath, line: UInt = #line) {

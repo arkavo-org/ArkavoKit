@@ -2,13 +2,15 @@ import AuthenticationServices
 import XCTest
 @testable import ArkavoSocial
 
-/// `deleteAccount(accountName:)`: the ceremony, the request, its retries and
-/// its refusals. What it removes from the device is in ArkavoClientDeletionWipeTests.
+/// `deleteAccount(accountName:)`: the ceremony, the request, its retries, its
+/// refusals and the passkeys it clears. What it removes from the keychain is in
+/// ArkavoClientDeletionWipeTests.
 @MainActor
 final class ArkavoClientDeletionTests: XCTestCase {
     private static let receiptBody =
         #"{"deletion_id":"del-secret","status":"pending","requested_at":1760000000,"completes_by":1760000300}"#
     private static let userNotFound = ArkavoError.authenticationFailed("User Not Found")
+    private static let account = DeletionHarness.account
 
     private var harness: DeletionHarness!
     private var client: ArkavoClient { harness.client }
@@ -22,6 +24,17 @@ final class ArkavoClientDeletionTests: XCTestCase {
             return XCTFail("expected authenticationFailed, got \(error)", file: file, line: line)
         }
         XCTAssertEqual(message, "Account deletion failed", file: file, line: line)
+    }
+
+    private func assertNotConnected(_ call: () async throws -> Void, file: StaticString = #filePath, line: UInt = #line) async {
+        do {
+            try await call()
+            XCTFail("expected notConnected", file: file, line: line)
+        } catch ArkavoError.notConnected {
+            // expected
+        } catch {
+            XCTFail("wrong error: \(error)", file: file, line: line)
+        }
     }
 
     private func assertRefused(_ call: () async throws -> Void, file: StaticString = #filePath, line: UInt = #line) async {
@@ -69,17 +82,18 @@ final class ArkavoClientDeletionTests: XCTestCase {
     }
 
     func testRequestCarriesTheFreshTokenNotTheStoredOne() async throws {
-        harness.store.token = "stored-token"
+        let storedToken = try XCTUnwrap(harness.store.token)
         harness.stubCeremonies([.success("fresh-token")])
         let http = harness.stubHTTP([.status(202, Self.receiptBody)])
 
         _ = try await client.deleteAccount(accountName: "alice")
 
-        XCTAssertEqual(harness.ceremonies, ["alice"])
+        XCTAssertEqual(harness.ceremonies, [Self.account])
         let request = try XCTUnwrap(http.requests.first)
         XCTAssertEqual(request.httpMethod, "DELETE")
         XCTAssertEqual(request.url?.absoluteString, "https://identity.example.test/account")
         XCTAssertEqual(request.value(forHTTPHeaderField: "X-Auth-Token"), "fresh-token")
+        XCTAssertNotEqual(request.value(forHTTPHeaderField: "X-Auth-Token"), storedToken)
     }
 
     func testConflictIsRetriedOnceWithTheSameToken() async throws {
@@ -126,7 +140,7 @@ final class ArkavoClientDeletionTests: XCTestCase {
         let result = try await client.deleteAccount(accountName: "alice")
 
         guard case .deleted(.some) = result else { return XCTFail("expected a receipt, got \(result)") }
-        XCTAssertEqual(harness.ceremonies, ["alice", "alice"])
+        XCTAssertEqual(harness.ceremonies, [Self.account, Self.account])
         XCTAssertEqual(http.requests.map { $0.value(forHTTPHeaderField: "X-Auth-Token") }, ["first-token", "second-token"])
     }
 
@@ -218,6 +232,108 @@ final class ArkavoClientDeletionTests: XCTestCase {
             assertDeletionFailed(error)
         }
         XCTAssertEqual(http.requests.count, 1, "a transport error is not retried")
+    }
+
+    // MARK: - The stored account
+
+    func testDeletionReauthenticatesTheStoredAccount() async throws {
+        harness.stubCeremonies([.success("fresh-token")])
+        harness.stubHTTP([.status(202, Self.receiptBody)])
+
+        _ = try await client.deleteAccount(accountName: "alice")
+
+        XCTAssertEqual(harness.ceremonies, [Self.account])
+    }
+
+    func testNoStoredTokenRefusesWithoutASignIn() async {
+        harness.store.token = nil
+        harness.stubCeremonies([.success("fresh-token")])
+        let http = harness.stubHTTP([.status(202, Self.receiptBody)])
+
+        await assertNotConnected { _ = try await self.client.deleteAccount(accountName: "alice") }
+
+        XCTAssertTrue(harness.ceremonies.isEmpty)
+        XCTAssertTrue(http.requests.isEmpty)
+        XCTAssertTrue(harness.reporter.noAcceptedCredentials.isEmpty)
+        XCTAssertFalse(client.isDeletingAccount)
+    }
+
+    /// No account id to scope the sign-in to: an opaque token, one with no
+    /// `sub`, or a `sub` that is not a UUID.
+    func testStoredTokenWithoutAnAccountIdRefusesWithoutASignIn() async {
+        harness.stubCeremonies([.success("fresh-token")])
+        let http = harness.stubHTTP([.status(202, Self.receiptBody)])
+
+        for token in ["opaque-stored-token", TestCWT.tokenWithoutSub(), TestCWT.token(sub: "user-1")] {
+            harness.store.token = token
+            await assertNotConnected { _ = try await self.client.deleteAccount(accountName: "alice") }
+        }
+
+        XCTAssertTrue(harness.ceremonies.isEmpty)
+        XCTAssertTrue(http.requests.isEmpty)
+    }
+
+    /// Review focus: a deletion never re-authenticates an account other than
+    /// the one the person named.
+    func testStoredTokenOfAnotherHandleRefusesWithoutASignIn() async {
+        harness.store.handle = "bob"
+        harness.stubCeremonies([.success("fresh-token")])
+        let http = harness.stubHTTP([.status(202, Self.receiptBody)])
+
+        await assertNotConnected { _ = try await self.client.deleteAccount(accountName: "alice") }
+
+        XCTAssertTrue(harness.ceremonies.isEmpty)
+        XCTAssertTrue(http.requests.isEmpty)
+        XCTAssertTrue(harness.reporter.noAcceptedCredentials.isEmpty)
+    }
+
+    // MARK: - The account's passkeys
+
+    func testDeletionClearsTheAccountsPasskeys() async throws {
+        harness.stubCeremonies([.success("fresh-token")])
+        harness.stubHTTP([.status(202, Self.receiptBody)])
+
+        _ = try await client.deleteAccount(accountName: "alice")
+
+        XCTAssertEqual(harness.reporter.noAcceptedCredentials, [
+            RecordingReporter.NoAcceptedCredentials(
+                relyingPartyID: "identity.example.test",
+                userHandle: DeletionHarness.userHandle(of: Self.account)
+            ),
+        ])
+        XCTAssertEqual(harness.reporter.noAcceptedCredentials.first?.userHandle.count, 16)
+        XCTAssertTrue(harness.reporter.unknown.isEmpty)
+    }
+
+    func testAlreadyDeletedAlsoClearsTheAccountsPasskeys() async throws {
+        for ceremonies: [Result<String, Error>] in [[.failure(Self.userNotFound)], [.success("first-token"), .failure(Self.userNotFound)]] {
+            harness = DeletionHarness()
+            harness.stubCeremonies(ceremonies)
+            harness.stubHTTP([.status(401, "{}")])
+
+            let result = try await client.deleteAccount(accountName: "alice")
+
+            XCTAssertEqual(result, .alreadyDeleted)
+            XCTAssertEqual(harness.reporter.noAcceptedCredentials, [
+                RecordingReporter.NoAcceptedCredentials(
+                    relyingPartyID: "identity.example.test",
+                    userHandle: DeletionHarness.userHandle(of: Self.account)
+                ),
+            ], "after \(ceremonies.count) sign-in(s)")
+        }
+    }
+
+    func testFailedDeletionClearsNoPasskeys() async {
+        harness.stubCeremonies([.success("fresh-token")])
+        harness.stubHTTP([.status(500, "{}")])
+
+        do {
+            _ = try await client.deleteAccount(accountName: "alice")
+            XCTFail("expected a failure")
+        } catch {
+            assertDeletionFailed(error)
+        }
+        XCTAssertTrue(harness.reporter.noAcceptedCredentials.isEmpty)
     }
 
     // MARK: - Refusals

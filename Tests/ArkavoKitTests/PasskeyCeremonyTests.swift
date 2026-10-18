@@ -64,6 +64,22 @@ final class PasskeyCeremonyTests: XCTestCase {
         }
     }
 
+    private func assertInvalidResponse<T>(
+        _ call: () async throws -> T,
+        _ message: @autoclosure () -> String = "",
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        do {
+            _ = try await call()
+            XCTFail("expected invalidResponse. \(message())", file: file, line: line)
+        } catch ArkavoError.invalidResponse {
+            // expected
+        } catch {
+            XCTFail("wrong error: \(error). \(message())", file: file, line: line)
+        }
+    }
+
     // MARK: - The start
 
     func testNameFreeCeremonyAsksWithoutAnAccount() async throws {
@@ -102,6 +118,60 @@ final class PasskeyCeremonyTests: XCTestCase {
 
         XCTAssertTrue(sheet.requests.isEmpty, "no assertion is requested")
         XCTAssertEqual(http.requests.count, 1)
+    }
+
+    /// "User Not Found" makes a deletion `.alreadyDeleted`, which clears the
+    /// account's passkeys from the device for good. So only identity's own
+    /// answer to a scoped start for a missing account means "no such account":
+    /// status 500 with exactly that body.
+    func testOnlyTheServersUserNotFoundMeansNoSuchAccount() async throws {
+        for body in ["User Not Found", "User Not Found\n"] {
+            stubHTTP([.status(500, body)])
+            await assertAuthenticationFailed({ try await self.client.passkeyCeremony(account: Self.account) },
+                                             message: "User Not Found")
+        }
+        XCTAssertTrue(sheet.requests.isEmpty, "no assertion is requested")
+
+        // In a deletion, through the real ceremony.
+        let harness = DeletionHarness()
+        let http = harness.stubHTTP([.status(500, "User Not Found")])
+
+        let result = try await harness.client.deleteAccount(accountName: "alice")
+
+        XCTAssertEqual(result, .alreadyDeleted)
+        XCTAssertEqual(http.requests.count, 1, "only the start is sent")
+        XCTAssertEqual(http.requests.first?.url?.query, "account=\(DeletionHarness.account.uuidString.lowercased())")
+        XCTAssertEqual(harness.reporter.noAcceptedCredentials, [
+            RecordingReporter.NoAcceptedCredentials(
+                relyingPartyID: "identity.example.test",
+                userHandle: DeletionHarness.userHandle(of: DeletionHarness.account)
+            ),
+        ])
+    }
+
+    /// A refusal from anything else (a proxy, a gateway, another route) is not
+    /// "no such account": a deletion fails and clears no passkey.
+    func testAnotherNotFoundIsNotNoSuchAccount() async {
+        let answers: [(status: Int, body: String)] = [
+            (404, "User Not Found here"),
+            (404, "User Not Found"),
+            (502, "<html>User Not Found</html>"),
+            (500, "User Not Found here"),
+            (400, "User Not Found"),
+        ]
+        for answer in answers {
+            let label = "\(answer.status) \(answer.body.debugDescription)"
+            stubHTTP([.status(answer.status, answer.body)])
+            await assertInvalidResponse({ try await self.client.passkeyCeremony(account: Self.account) }, label)
+
+            let harness = DeletionHarness()
+            let http = harness.stubHTTP([.status(answer.status, answer.body)])
+            await assertInvalidResponse({ try await harness.client.deleteAccount(accountName: "alice") }, label)
+            XCTAssertEqual(http.requests.count, 1, "no DELETE is sent. \(label)")
+            XCTAssertTrue(harness.reporter.noAcceptedCredentials.isEmpty, "no passkey is cleared. \(label)")
+            XCTAssertTrue(harness.store.removals.isEmpty, label)
+        }
+        XCTAssertTrue(sheet.requests.isEmpty, "no assertion is requested")
     }
 
     func testUndecodableChallengeIsInvalidResponse() async {

@@ -27,10 +27,11 @@ enum TestCWT {
             .replacingOccurrences(of: "=", with: "")
     }
 
+    /// A text string, with a one-byte length from 24 bytes (an account UUID is 36).
     static func tstr(_ s: String) -> [UInt8] {
         let b = Array(s.utf8)
-        precondition(b.count < 24, "fixture strings stay under 24 bytes")
-        return [0x60 + UInt8(b.count)] + b
+        precondition(b.count < 256, "fixture strings stay under 256 bytes")
+        return b.count < 24 ? [0x60 + UInt8(b.count)] + b : [0x78, UInt8(b.count)] + b
     }
 
     static func bstr(_ b: [UInt8]) -> [UInt8] {

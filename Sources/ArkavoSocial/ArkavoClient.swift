@@ -78,9 +78,10 @@ public final class ArkavoClient: NSObject {
 
     // MARK: - Test seams (internal; tests replace them through @testable import)
 
-    /// The passkey ceremony: account name → fresh auth CWT. Never stores the token.
-    lazy var authenticator: @MainActor (String) async throws -> String = { [unowned self] accountName in
-        try await self.authenticateUser(accountName: accountName)
+    /// The passkey ceremony that re-authenticates an account for its deletion:
+    /// account id → fresh auth CWT. Never stores the token.
+    lazy var authenticator: @MainActor (UUID) async throws -> String = { [unowned self] account in
+        try await self.passkeyCeremony(account: account).token
     }
 
     /// Performs an identity REST request. Used by the account-deletion and
@@ -392,19 +393,28 @@ public final class ArkavoClient: NSObject {
 
     /// Deletes the Arkavo account `accountName` (App Store guideline 5.1.1(v)).
     ///
-    /// Runs a passkey sign-in for a fresh token, because the server accepts
-    /// only one minted within 300 s, then sends `DELETE /account`. A 409 is
-    /// retried once with the same token; a 401 runs the sign-in once more and
-    /// retries once.
+    /// Only the account signed in on this device can be deleted: the stored
+    /// handle must be `accountName`, and the stored token's `sub` names the
+    /// account to re-authenticate. A passkey sign-in scoped to that account
+    /// gets a fresh token, because the server accepts only one minted within
+    /// 300 s, then `DELETE /account` is sent. A 409 is retried once with the
+    /// same token; a 401 runs the sign-in once more and retries once.
+    ///
+    /// After `.deleted` or `.alreadyDeleted` the system is told that identity
+    /// accepts none of the account's passkeys, so they leave the device's list
+    /// (best effort, never thrown).
     ///
     /// - Returns: `.deleted` when the server accepted the deletion, or
     ///   `.alreadyDeleted` when the sign-in found no such account.
     /// - Throws: `ArkavoError.invalidState` while another deletion runs or the
     ///   client is connecting or authenticating; `ArkavoError.invalidURL` for an
     ///   empty name or one with leading or trailing whitespace (a padded name
-    ///   could find no account and be taken for an already deleted one); the
-    ///   ceremony's own error (`ASAuthorizationError.canceled` when the person
-    ///   cancels); otherwise `ArkavoError.authenticationFailed("Account deletion failed")`.
+    ///   could find no account and be taken for an already deleted one);
+    ///   `ArkavoError.notConnected`, with no sign-in, when this device holds no
+    ///   session of `accountName` (no stored token, a token without an account
+    ///   id, or another stored handle); the ceremony's own error
+    ///   (`ASAuthorizationError.canceled` when the person cancels); otherwise
+    ///   `ArkavoError.authenticationFailed("Account deletion failed")`.
     ///   Nothing is removed from this device when it throws.
     @MainActor
     public func deleteAccount(accountName: String) async throws -> AccountDeletionResult {
@@ -418,18 +428,43 @@ public final class ArkavoClient: NSObject {
         isDeletingAccount = true
         defer { isDeletingAccount = false }
 
-        // Read before the ceremony: the wipe decides from what was stored then.
+        // Read before the ceremony: the sign-in is scoped, and the wipe decides,
+        // from what was stored then.
         let storedToken = credentialStore.authenticationToken()
         let storedHandle = credentialStore.sharedHandle()
+        guard let account = Self.deletionAccount(named: accountName, storedToken: storedToken, storedHandle: storedHandle) else {
+            print("ArkavoClient.deleteAccount: no stored session of this account; refused without a sign-in")
+            throw ArkavoError.notConnected
+        }
 
-        let outcome = try await requestAccountDeletion(accountName: accountName)
+        let outcome = try await requestAccountDeletion(account: account)
         wipeLocalAccountState(
             after: outcome,
             accountName: accountName,
             storedToken: storedToken,
             storedHandle: storedHandle
         )
+        // After the wipe, so a stalled report cannot hold it up.
+        await credentialReporter.reportNoAcceptedCredentials(
+            relyingPartyID: relyingPartyID,
+            userHandle: withUnsafeBytes(of: account.uuid) { Data($0) }
+        )
         return outcome.result
+    }
+
+    /// The account a deletion of `accountName` re-authenticates: the stored
+    /// token's `sub` (read without a signature check; the passkey proves
+    /// control), and only while the stored handle is `accountName`. nil when
+    /// this device holds no session of that account, so a deletion never
+    /// signs in to some other account.
+    private static func deletionAccount(named accountName: String, storedToken: String?, storedHandle: String?) -> UUID? {
+        guard storedHandle == accountName,
+              let storedToken,
+              let subject = CWTSubject.sub(fromToken: storedToken)
+        else {
+            return nil
+        }
+        return UUID(uuidString: subject)
     }
 
     /// Removes this device's copy of a deleted account. Best effort: every step
@@ -531,9 +566,10 @@ public final class ArkavoClient: NSObject {
     private static let accountDeletionFailed = ArkavoError.authenticationFailed("Account deletion failed")
 
     /// The ceremony and `DELETE /account`, with one retry at most: a 409 again
-    /// with the same token, a 401 with a new one. Never logs the token or a body.
-    private func requestAccountDeletion(accountName: String) async throws -> DeletionOutcome {
-        guard var token = try await freshDeletionToken(accountName: accountName) else {
+    /// with the same token, a 401 with a new one. Both sign-ins re-authenticate
+    /// `account`. Never logs the token or a body.
+    private func requestAccountDeletion(account: UUID) async throws -> DeletionOutcome {
+        guard var token = try await freshDeletionToken(account: account) else {
             return DeletionOutcome(result: .alreadyDeleted, freshToken: nil)
         }
 
@@ -544,7 +580,7 @@ public final class ArkavoClient: NSObject {
         case 409:
             break // a concurrent change on the server: retry with the same token
         case 401:
-            guard let renewed = try await freshDeletionToken(accountName: accountName) else {
+            guard let renewed = try await freshDeletionToken(account: account) else {
                 return DeletionOutcome(result: .alreadyDeleted, freshToken: nil)
             }
             token = renewed
@@ -559,12 +595,13 @@ public final class ArkavoClient: NSObject {
         return DeletionOutcome(result: .deleted(AccountDeletionReceipt.decode(data)), freshToken: token)
     }
 
-    /// The passkey ceremony for a deletion. nil when the server has no account
-    /// by that name ("User Not Found"): it was already deleted. Every other
-    /// error, `ASAuthorizationError.canceled` included, is rethrown unchanged.
-    private func freshDeletionToken(accountName: String) async throws -> String? {
+    /// The passkey ceremony for a deletion, scoped to `account`. nil when the
+    /// server has no such account ("User Not Found"): it was already deleted.
+    /// Every other error, `ASAuthorizationError.canceled` included, is
+    /// rethrown unchanged.
+    private func freshDeletionToken(account: UUID) async throws -> String? {
         do {
-            return try await authenticator(accountName)
+            return try await authenticator(account)
         } catch let ArkavoError.authenticationFailed(message) where message == "User Not Found" {
             return nil
         }
@@ -886,9 +923,10 @@ public final class ArkavoClient: NSObject {
     /// `account` it re-authenticates that account, and the sheet offers only its passkeys.
     ///
     /// - Throws: `ArkavoError.authenticationFailed("User Not Found")` when the
-    ///   scoped account no longer exists; `ArkavoError.unknownPasskey` when identity
-    ///   does not know the picked passkey (reported to the system first);
-    ///   `ArkavoError.invalidResponse` for unusable options; the sheet's
+    ///   scoped account no longer exists (the start's 500 `User Not Found`);
+    ///   `ArkavoError.unknownPasskey` when identity does not know the picked
+    ///   passkey (reported to the system first); `ArkavoError.invalidResponse`
+    ///   for any other refused start or unusable options; the sheet's
     ///   `ASAuthorizationError` unchanged.
     func passkeyCeremony(account: UUID?) async throws -> AuthenticationReply {
         print("ArkavoClient.passkeyCeremony: start scoped=\(account != nil)")
@@ -908,7 +946,12 @@ public final class ArkavoClient: NSObject {
         }
         print("ArkavoClient.passkeyCeremony: start status=\(httpResponse.statusCode)")
         guard (200 ... 299).contains(httpResponse.statusCode) else {
-            if String(decoding: data, as: UTF8.self).contains("User Not Found") {
+            // "User Not Found" makes a deletion clear the account's passkeys from
+            // the device, so only identity's own answer for a missing account
+            // counts: a 500 with exactly that body, not a proxy's page or another route.
+            if httpResponse.statusCode == 500,
+               String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines) == "User Not Found"
+            {
                 throw ArkavoError.authenticationFailed("User Not Found")
             }
             throw ArkavoError.invalidResponse
@@ -971,89 +1014,6 @@ public final class ArkavoClient: NSObject {
             throw ArkavoError.authenticationFailed("No account handle received")
         }
         return AuthenticationReply(token: token, handle: handle)
-    }
-
-    private func authenticateUser(accountName: String) async throws -> String {
-        print("authenticateUser \(accountName) \(relyingPartyID)")
-        let provider = ASAuthorizationPlatformPublicKeyCredentialProvider(relyingPartyIdentifier: relyingPartyID)
-
-        // Fetch authentication options from server
-        let components = URLComponents(url: authURL.appendingPathComponent("authenticate/\(accountName)"), resolvingAgainstBaseURL: true)
-        guard let url = components?.url else {
-            throw ArkavoError.invalidURL
-        }
-
-        let (data, response) = try await Self.http3Data(from: url)
-
-        guard let httpResponse = response as? HTTPURLResponse,
-              (200 ... 299).contains(httpResponse.statusCode)
-        else {
-            let errorString = String(decoding: data, as: UTF8.self)
-            print("fetchAuthenticationOptions.invalidResponse \(errorString)")
-
-            // Check for specific error conditions
-            if errorString.contains("User Not Found") {
-                throw ArkavoError.authenticationFailed("User Not Found")
-            }
-
-            throw ArkavoError.invalidResponse
-        }
-
-        let decoder = JSONDecoder()
-        let authOptions = try decoder.decode(AuthenticationOptionsResponse.self, from: data)
-
-        let challengeData = Data(base64Encoded: authOptions.publicKey.challenge.base64URLToBase64())!
-
-        let assertionRequest = Self.passkeyAssertionRequest(
-            provider: provider,
-            challenge: challengeData,
-            allowCredentialIDs: authOptions.publicKey.publicKeyCredentialIDs
-        )
-
-        // Perform the authentication
-        let assertion = try await performAuthentication(request: assertionRequest)
-
-        // Complete the authentication with server
-        var completeRequest = URLRequest(url: authURL.appendingPathComponent("authenticate"))
-        completeRequest.httpMethod = "POST"
-        completeRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-
-        let parameters: [String: Any] = [
-            "id": assertion.credentialID.base64URLEncodedString(),
-            "rawId": assertion.credentialID.base64URLEncodedString(),
-            "response": [
-                "clientDataJSON": assertion.rawClientDataJSON.base64URLEncodedString(),
-                "authenticatorData": assertion.rawAuthenticatorData.base64URLEncodedString(),
-                "signature": assertion.signature.base64URLEncodedString(),
-                "userHandle": assertion.userID?.base64URLEncodedString() ?? "",
-            ],
-            "type": "public-key",
-        ]
-
-        completeRequest.httpBody = try JSONSerialization.data(withJSONObject: parameters)
-
-        let (responseData, completionResponse) = try await Self.http3Data(for: completeRequest)
-
-        guard let completionHttpResponse = completionResponse as? HTTPURLResponse,
-              (200 ... 299).contains(completionHttpResponse.statusCode)
-        else {
-            // If we got an error response, try to parse it
-            if let errorJson = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any],
-               let errorMessage = errorJson["error"] as? String
-            {
-                throw ArkavoError.authenticationFailed(errorMessage)
-            }
-            throw ArkavoError.authenticationFailed("Invalid response from server")
-        }
-
-        // Parse token from response body (server returns CWT under "token")
-        guard let json = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any],
-              let token = json["token"] as? String
-        else {
-            throw ArkavoError.authenticationFailed("No authentication token received")
-        }
-
-        return token
     }
 
     private func setupWebSocketConnection() async throws {
