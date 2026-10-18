@@ -1,3 +1,4 @@
+import AuthenticationServices
 import Foundation
 @testable import ArkavoSocial
 
@@ -67,6 +68,48 @@ final class ScriptedHTTP {
     }
 }
 
+/// Stands in for the system passkey sheet: records each assertion request and
+/// answers with the scripted assertion or error.
+@MainActor
+final class ScriptedAssertion {
+    private let outcome: Result<PasskeyAssertion, Error>
+    private(set) var requests: [ASAuthorizationPlatformPublicKeyCredentialAssertionRequest] = []
+
+    init(_ outcome: Result<PasskeyAssertion, Error>) {
+        self.outcome = outcome
+    }
+
+    func perform(_ request: ASAuthorizationPlatformPublicKeyCredentialAssertionRequest) async throws -> PasskeyAssertion {
+        requests.append(request)
+        return try outcome.get()
+    }
+}
+
+/// Records every passkey report instead of telling the system.
+@MainActor
+final class RecordingReporter: PasskeyCredentialReporting {
+    struct Unknown: Equatable {
+        let relyingPartyID: String
+        let credentialID: Data
+    }
+
+    struct NoAcceptedCredentials: Equatable {
+        let relyingPartyID: String
+        let userHandle: Data
+    }
+
+    private(set) var unknown: [Unknown] = []
+    private(set) var noAcceptedCredentials: [NoAcceptedCredentials] = []
+
+    func reportUnknown(relyingPartyID: String, credentialID: Data) async {
+        unknown.append(Unknown(relyingPartyID: relyingPartyID, credentialID: credentialID))
+    }
+
+    func reportNoAcceptedCredentials(relyingPartyID: String, userHandle: Data) async {
+        noAcceptedCredentials.append(NoAcceptedCredentials(relyingPartyID: relyingPartyID, userHandle: userHandle))
+    }
+}
+
 @MainActor
 func makeTestClient() -> ArkavoClient {
     ArkavoClient(
@@ -107,23 +150,52 @@ final class Gate {
     }
 }
 
-/// A client wired to a fake keychain, scripted ceremonies and scripted HTTP.
+/// A client wired to a fake keychain, scripted ceremonies, scripted HTTP and a
+/// recording passkey reporter.
+///
+/// The keychain starts signed in as "alice": the stored token's `sub` is
+/// `account`, so a deletion of "alice" re-authenticates `account`.
 @MainActor
 final class DeletionHarness {
+    /// The stored account's id, as identity mints it into the token's `sub` (lowercased).
+    static let account = UUID(uuidString: "3F2504E0-4F89-41D3-9A0C-0305E82C3301")!
+    /// An account other than `account`.
+    static let otherAccount = UUID(uuidString: "9B1DEB4D-3B7D-4BAD-9BDD-2B0D7B3DCB6D")!
+
+    /// A session token of `account`'s, as identity mints one.
+    static func token(of account: UUID) -> String {
+        TestCWT.token(sub: account.uuidString.lowercased())
+    }
+
+    /// `account`'s user handle: the UUID's 16 bytes.
+    static func userHandle(of account: UUID) -> Data {
+        withUnsafeBytes(of: account.uuid) { Data($0) }
+    }
+
     let client = makeTestClient()
-    let store = FakeCredentialStore()
-    /// The account name of every ceremony run, in order.
-    private(set) var ceremonies: [String] = []
+    let store = FakeCredentialStore(token: DeletionHarness.token(of: DeletionHarness.account), handle: "alice")
+    let reporter = RecordingReporter()
+    /// The account of every ceremony run, in order.
+    private(set) var ceremonies: [UUID] = []
 
     init() {
         client.credentialStore = store
+        client.credentialReporter = reporter
+        // No test presents the real passkey sheet.
+        client.assertionProvider = { _ in throw ASAuthorizationError(.failed) }
     }
 
-    /// Each ceremony returns the next token or throws the next error.
+    /// Each ceremony answers with the next token, for the account "alice", or
+    /// throws the next error.
     func stubCeremonies(_ outcomes: [Result<String, Error>]) {
+        stubReplies(outcomes.map { $0.map { AuthenticationReply(token: $0, handle: "alice") } })
+    }
+
+    /// Each ceremony returns the next reply or throws the next error.
+    func stubReplies(_ outcomes: [Result<AuthenticationReply, Error>]) {
         var remaining = outcomes
-        client.authenticator = { [unowned self] accountName in
-            ceremonies.append(accountName)
+        client.authenticator = { [unowned self] account in
+            ceremonies.append(account)
             guard !remaining.isEmpty else { throw ArkavoError.invalidResponse }
             return try remaining.removeFirst().get()
         }

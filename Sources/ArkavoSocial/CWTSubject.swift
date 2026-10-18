@@ -4,9 +4,13 @@ import Foundation
 /// base64url, CBOR tag 61 → COSE_Sign1 tag 18 → a 4-array whose third element
 /// is the claims map as a byte string.
 ///
-/// The signature is NOT verified: the server is the verifier. Account deletion
-/// only needs to tell whether two tokens name the same account. Ported from
-/// Creator's `ArkavoCreator/Patreon/CWTSubject.swift` (subject only).
+/// The signature is NOT verified: the server is the verifier. The callers only
+/// need to know which account a token names (its `sub`, an account UUID):
+/// account deletion scopes its sign-in to the stored token's `sub`, checks the
+/// fresh token's against it, and compares the two before removing the stored
+/// one; `connect(account:)` reuses a cached session only when its token's `sub`
+/// is `account`. Ported from Creator's `ArkavoCreator/Patreon/CWTSubject.swift`
+/// (subject only).
 enum CWTSubject {
     static func sub(fromToken token: String) -> String? {
         var b64 = token.replacingOccurrences(of: "-", with: "+")

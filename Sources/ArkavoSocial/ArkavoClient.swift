@@ -19,6 +19,11 @@ public enum ArkavoError: Error {
     case notConnected
     case invalidState
     case profileNotFound(String)
+    /// identity does not know the passkey the person picked: its account is gone.
+    /// The passkey is reported to the system first, so the sheet stops offering it.
+    /// The report is best effort: it needs iOS / macOS 26.2, and a failed report is
+    /// only logged.
+    case unknownPasskey
 }
 
 /// Represents the current state of the ArkavoClient
@@ -75,17 +80,35 @@ public final class ArkavoClient: NSObject {
 
     // MARK: - Test seams (internal; tests replace them through @testable import)
 
-    /// The passkey ceremony: account name → fresh auth CWT. Never stores the token.
-    lazy var authenticator: @MainActor (String) async throws -> String = { [unowned self] accountName in
-        try await self.authenticateUser(accountName: accountName)
+    /// The passkey ceremony that re-authenticates an account for its deletion:
+    /// account id → identity's reply (a fresh auth CWT and the account's
+    /// handle). Never stores the token.
+    lazy var authenticator: @MainActor (UUID) async throws -> AuthenticationReply = { [unowned self] account in
+        try await self.passkeyCeremony(account: account)
     }
 
-    /// Performs an identity REST request. Used by the account-deletion and
-    /// Apple-link requests.
+    /// Performs an identity REST request. Used by the passkey ceremony (both
+    /// `/authenticate` requests) and the account-deletion and Apple-link requests.
     var httpData: @MainActor (URLRequest) async throws -> (Data, URLResponse) = ArkavoClient.http3Data(for:)
 
     /// The keychain items account deletion and Apple linking touch.
     var credentialStore: any AccountCredentialStore = KeychainCredentialStore()
+
+    /// The system passkey sheet: an assertion request → the picked passkey's assertion.
+    /// A cancelled sheet throws `ASAuthorizationError` (`.canceled`) unchanged.
+    lazy var assertionProvider: @MainActor (ASAuthorizationPlatformPublicKeyCredentialAssertionRequest) async throws -> PasskeyAssertion = { [unowned self] request in
+        let assertion = try await self.performAuthentication(request: request)
+        return PasskeyAssertion(
+            credentialID: assertion.credentialID,
+            rawClientDataJSON: assertion.rawClientDataJSON,
+            rawAuthenticatorData: assertion.rawAuthenticatorData,
+            signature: assertion.signature,
+            userID: assertion.userID
+        )
+    }
+
+    /// Tells the system which passkeys identity no longer accepts.
+    var credentialReporter: any PasskeyCredentialReporting = SystemPasskeyCredentialReporter()
 
     /// Performs a request that opts into HTTP/3 on the first hop.
     ///
@@ -207,8 +230,53 @@ public final class ArkavoClient: NSObject {
 
     // MARK: - Public Methods
 
+    /// Whether the cached session (the stored token and handle) can be reused without a
+    /// passkey ceremony. It needs both, so a token alone never "signs in" with an empty
+    /// handle; and when an `account` is asked for, the token must be that account's.
+    nonisolated static func reusesCachedSession(token: String?, handle: String?, account: UUID?) -> Bool {
+        guard let token, !token.isEmpty, let handle, !handle.isEmpty else { return false }
+        return isSession(token: token, of: account)
+    }
+
+    /// Whether a connected client keeps its live socket. It needs a stored handle to
+    /// return; and when an `account` is asked for, the stored token must be that
+    /// account's. With no `account` the handle alone decides.
+    nonisolated static func keepsConnectedSession(token: String?, handle: String?, account: UUID?) -> Bool {
+        guard let handle, !handle.isEmpty else { return false }
+        return isSession(token: token, of: account)
+    }
+
+    /// true when no account is asked for. Otherwise whether the token's CWT `sub`
+    /// (read without a signature check; the server verifies the token) is `account`,
+    /// compared as a UUID. A missing or unreadable token is no account's session.
+    private nonisolated static func isSession(token: String?, of account: UUID?) -> Bool {
+        guard let account else { return true }
+        guard let token, let subject = CWTSubject.sub(fromToken: token) else { return false }
+        return UUID(uuidString: subject) == account
+    }
+
+    /// Signs in with a passkey (no account name) and opens the socket.
+    ///
+    /// A session already on this device (a live socket, or the stored token and
+    /// handle) is reused without a sheet when it fits:
+    /// - With no `account`, whichever account it is. With no session, the passkey
+    ///   the person picks names the account.
+    /// - With an `account`, a cached session of `account` (its token's `sub`) is
+    ///   reused without a sheet; one of another account, or one whose token names
+    ///   no readable account, is dropped and the scoped ceremony runs: a live
+    ///   socket is torn down, the stored token is deleted, and the sheet offers
+    ///   only `account`'s passkeys.
+    ///
+    /// Connected but with no stored handle to return, it likewise tears down the
+    /// live socket (pending message handlers fail), deletes the stored token and
+    /// shows a passkey sheet. A stored token the server refuses is deleted and the
+    /// ceremony runs.
+    ///
+    /// - Parameter account: the account to sign in; `nil` lets the passkey choose.
+    /// - Returns: the signed-in account's handle.
+    @discardableResult
     @MainActor
-    public func connect(accountName: String) async throws {
+    public func connect(account: UUID? = nil) async throws -> String {
         guard !isDeletingAccount else { throw ArkavoError.invalidState }
         print("ArkavoClient: Connecting...")
         // Check current state more thoroughly
@@ -220,8 +288,17 @@ public final class ArkavoClient: NSObject {
             // First disconnect if we're in error state
             await disconnect()
         case .connected:
-            print("Already connected, no need to reconnect")
-            return
+            let handle = KeychainManager.getArkavoHandle()
+            if Self.keepsConnectedSession(token: KeychainManager.getAuthenticationToken(), handle: handle, account: account),
+               let handle
+            {
+                print("Already connected, no need to reconnect")
+                return handle
+            }
+            // Connected, but no handle to return or not `account`'s session: drop
+            // it (disconnect() also deletes the stored token) and sign in again.
+            print("ArkavoClient: connected session does not fit this sign-in; dropping it")
+            await disconnect()
         case .connecting, .authenticating:
             throw ArkavoError.invalidState
         }
@@ -230,15 +307,17 @@ public final class ArkavoClient: NSObject {
         // Server is authoritative — if the handshake succeeds, we skip the
         // WebAuthn ceremony entirely. If it fails for any reason (expired,
         // revoked, network), we drop the cached token and fall through to the
-        // ceremony branch below.
-        if KeychainManager.getAuthenticationToken() != nil {
+        // ceremony branch below. A token without a stored handle is not a session,
+        // and neither is another account's when `account` is asked for.
+        let cachedToken = KeychainManager.getAuthenticationToken()
+        let cachedHandle = KeychainManager.getArkavoHandle()
+        if Self.reusesCachedSession(token: cachedToken, handle: cachedHandle, account: account), let cachedHandle {
             do {
                 currentState = .connecting
                 try await setupWebSocketConnection()
                 try await waitForConnection()
                 try await sendInitialMessages()
-                try? KeychainManager.saveArkavoHandle(accountName)
-                return
+                return cachedHandle
             } catch {
                 print("ArkavoClient: cached token rejected (\(error)); falling back to passkey ceremony")
                 KeychainManager.deleteAuthenticationToken()
@@ -251,15 +330,19 @@ public final class ArkavoClient: NSObject {
                 session = nil
                 currentState = .disconnected
             }
+        } else if cachedToken != nil {
+            print("ArkavoClient: cached token does not fit this sign-in; dropping it")
+            KeychainManager.deleteAuthenticationToken()
         }
 
         do {
             // First authenticate
             currentState = .authenticating
-            let token = try await authenticateUser(accountName: accountName)
-            try KeychainManager.saveAuthenticationToken(token)
-            // Save the account name (handle) for future sessions
-            try KeychainManager.saveArkavoHandle(accountName)
+            let reply = try await passkeyCeremony(account: account)
+            // The handle first: should the token's write fail, no token is left
+            // beside a stale handle, so the next connect runs the ceremony.
+            try KeychainManager.saveArkavoHandle(reply.handle)
+            try KeychainManager.saveAuthenticationToken(reply.token)
 
             // Then establish WebSocket connection
             currentState = .connecting
@@ -268,6 +351,7 @@ public final class ArkavoClient: NSObject {
             try await waitForConnection()
             // swap keys
             try await sendInitialMessages()
+            return reply.handle
         } catch {
             print("connect error: \(error)")
             if let kcError = error as? KeychainManager.KeychainError {
@@ -354,19 +438,31 @@ public final class ArkavoClient: NSObject {
 
     /// Deletes the Arkavo account `accountName` (App Store guideline 5.1.1(v)).
     ///
-    /// Runs a passkey sign-in for a fresh token, because the server accepts
-    /// only one minted within 300 s, then sends `DELETE /account`. A 409 is
-    /// retried once with the same token; a 401 runs the sign-in once more and
-    /// retries once.
+    /// Only the account signed in on this device can be deleted: the stored
+    /// handle must be `accountName`, and the stored token's `sub` names the
+    /// account to re-authenticate. A passkey sign-in scoped to that account
+    /// gets a fresh token, because the server accepts only one minted within
+    /// 300 s; identity's reply must name `accountName` (and the token's `sub`,
+    /// when readable, that account). Then `DELETE /account` is sent. A 409 is
+    /// retried once with the same token; a 401 runs the sign-in once more,
+    /// checked the same way, and retries once.
+    ///
+    /// After `.deleted` or `.alreadyDeleted` the system is told that identity
+    /// accepts none of the account's passkeys, so they leave the device's list
+    /// (best effort, never thrown).
     ///
     /// - Returns: `.deleted` when the server accepted the deletion, or
     ///   `.alreadyDeleted` when the sign-in found no such account.
     /// - Throws: `ArkavoError.invalidState` while another deletion runs or the
     ///   client is connecting or authenticating; `ArkavoError.invalidURL` for an
     ///   empty name or one with leading or trailing whitespace (a padded name
-    ///   could find no account and be taken for an already deleted one); the
-    ///   ceremony's own error (`ASAuthorizationError.canceled` when the person
-    ///   cancels); otherwise `ArkavoError.authenticationFailed("Account deletion failed")`.
+    ///   could find no account and be taken for an already deleted one);
+    ///   `ArkavoError.notConnected`, with no sign-in, when this device holds no
+    ///   session of `accountName` (no stored token, a token without an account
+    ///   id, no stored handle, or another stored handle), or before the next
+    ///   `DELETE` when a sign-in proved another account; the ceremony's own error
+    ///   (`ASAuthorizationError.canceled` when the person cancels); otherwise
+    ///   `ArkavoError.authenticationFailed("Account deletion failed")`.
     ///   Nothing is removed from this device when it throws.
     @MainActor
     public func deleteAccount(accountName: String) async throws -> AccountDeletionResult {
@@ -380,18 +476,43 @@ public final class ArkavoClient: NSObject {
         isDeletingAccount = true
         defer { isDeletingAccount = false }
 
-        // Read before the ceremony: the wipe decides from what was stored then.
+        // Read before the ceremony: the sign-in is scoped, and the wipe decides,
+        // from what was stored then.
         let storedToken = credentialStore.authenticationToken()
         let storedHandle = credentialStore.sharedHandle()
+        guard let account = Self.deletionAccount(named: accountName, storedToken: storedToken, storedHandle: storedHandle) else {
+            print("ArkavoClient.deleteAccount: no stored session of this account; refused without a sign-in")
+            throw ArkavoError.notConnected
+        }
 
-        let outcome = try await requestAccountDeletion(accountName: accountName)
+        let outcome = try await requestAccountDeletion(account: account, accountName: accountName)
         wipeLocalAccountState(
             after: outcome,
             accountName: accountName,
             storedToken: storedToken,
             storedHandle: storedHandle
         )
+        // After the wipe, so a stalled report cannot hold it up.
+        await credentialReporter.reportNoAcceptedCredentials(
+            relyingPartyID: relyingPartyID,
+            userHandle: withUnsafeBytes(of: account.uuid) { Data($0) }
+        )
         return outcome.result
+    }
+
+    /// The account a deletion of `accountName` re-authenticates: the stored
+    /// token's `sub` (read without a signature check; the passkey proves
+    /// control), and only while the stored handle is `accountName`. nil when
+    /// this device holds no session of that account, so a deletion never
+    /// signs in to some other account.
+    private static func deletionAccount(named accountName: String, storedToken: String?, storedHandle: String?) -> UUID? {
+        guard storedHandle == accountName,
+              let storedToken,
+              let subject = CWTSubject.sub(fromToken: storedToken)
+        else {
+            return nil
+        }
+        return UUID(uuidString: subject)
     }
 
     /// Removes this device's copy of a deleted account. Best effort: every step
@@ -403,8 +524,14 @@ public final class ArkavoClient: NSObject {
     /// they go only when they are this account's: the session token when its
     /// CWT `sub` is the fresh token's (or, when either `sub` is unreadable or
     /// there is no fresh token, under the handle condition); the shared handle,
-    /// DID, local identity pair and DID key when the stored shared handle is
-    /// nil or `accountName`.
+    /// DID, local identity pair and DID key under the handle condition (the
+    /// stored shared handle is nil or `accountName`).
+    ///
+    /// `deleteAccount` gets here only past its gate and its check of the
+    /// sign-in: the stored handle is `accountName`, the stored token's `sub` is
+    /// the deleted account, and so is the fresh token's when readable. So every
+    /// item goes; these conditions are a second line of defence, should those
+    /// checks change.
     private func wipeLocalAccountState(
         after outcome: DeletionOutcome,
         accountName: String,
@@ -493,9 +620,10 @@ public final class ArkavoClient: NSObject {
     private static let accountDeletionFailed = ArkavoError.authenticationFailed("Account deletion failed")
 
     /// The ceremony and `DELETE /account`, with one retry at most: a 409 again
-    /// with the same token, a 401 with a new one. Never logs the token or a body.
-    private func requestAccountDeletion(accountName: String) async throws -> DeletionOutcome {
-        guard var token = try await freshDeletionToken(accountName: accountName) else {
+    /// with the same token, a 401 with a new one. Both sign-ins re-authenticate
+    /// `account` and must prove it is `accountName`. Never logs the token or a body.
+    private func requestAccountDeletion(account: UUID, accountName: String) async throws -> DeletionOutcome {
+        guard var token = try await freshDeletionToken(account: account, accountName: accountName) else {
             return DeletionOutcome(result: .alreadyDeleted, freshToken: nil)
         }
 
@@ -506,7 +634,7 @@ public final class ArkavoClient: NSObject {
         case 409:
             break // a concurrent change on the server: retry with the same token
         case 401:
-            guard let renewed = try await freshDeletionToken(accountName: accountName) else {
+            guard let renewed = try await freshDeletionToken(account: account, accountName: accountName) else {
                 return DeletionOutcome(result: .alreadyDeleted, freshToken: nil)
             }
             token = renewed
@@ -521,15 +649,28 @@ public final class ArkavoClient: NSObject {
         return DeletionOutcome(result: .deleted(AccountDeletionReceipt.decode(data)), freshToken: token)
     }
 
-    /// The passkey ceremony for a deletion. nil when the server has no account
-    /// by that name ("User Not Found"): it was already deleted. Every other
-    /// error, `ASAuthorizationError.canceled` included, is rethrown unchanged.
-    private func freshDeletionToken(accountName: String) async throws -> String? {
+    /// The passkey ceremony for a deletion, scoped to `account`. nil when the
+    /// server has no such account ("User Not Found"): it was already deleted.
+    ///
+    /// The stored token and handle are separate keychain items that every
+    /// Arkavo app writes, so `account` may not be `accountName`'s. The sign-in
+    /// must prove it is: identity's handle is `accountName`, and the fresh
+    /// token's `sub`, when readable, is `account`. Otherwise it throws
+    /// `ArkavoError.notConnected` before any `DELETE`. Every other error,
+    /// `ASAuthorizationError.canceled` included, is rethrown unchanged.
+    private func freshDeletionToken(account: UUID, accountName: String) async throws -> String? {
+        let reply: AuthenticationReply
         do {
-            return try await authenticator(accountName)
+            reply = try await authenticator(account)
         } catch let ArkavoError.authenticationFailed(message) where message == "User Not Found" {
             return nil
         }
+        let freshSubjectIsAccount = CWTSubject.sub(fromToken: reply.token).map { UUID(uuidString: $0) == account } ?? true
+        guard reply.handle == accountName, freshSubjectIsAccount else {
+            print("ArkavoClient.deleteAccount: the sign-in proved another account; refused before the deletion")
+            throw ArkavoError.notConnected
+        }
+        return reply.token
     }
 
     /// Sends `DELETE /account` with `token` and returns the body and status.
@@ -823,11 +964,11 @@ public final class ArkavoClient: NSObject {
         )
     }
 
-    /// The passkey assertion request for one account. It is limited to the credentials
-    /// the server's options listed for `accountName`, so the system sheet offers only that
-    /// account's passkeys instead of every Arkavo passkey on the device. With no listed
-    /// credentials the request stays open (any passkey for the relying party), as before.
-    /// An id that is not base64url is skipped.
+    /// The passkey assertion request, limited to the credentials the server's options
+    /// list. A sign-in scoped to an account gets that account's, so the system sheet
+    /// offers only its passkeys instead of every Arkavo passkey on the device. With no
+    /// listed credentials (the name-free sign-in) the request stays open: any passkey
+    /// for the relying party. An id that is not base64url is skipped.
     nonisolated static func passkeyAssertionRequest(
         provider: ASAuthorizationPlatformPublicKeyCredentialProvider,
         challenge: Data,
@@ -840,51 +981,64 @@ public final class ArkavoClient: NSObject {
         return request
     }
 
-    private func authenticateUser(accountName: String) async throws -> String {
-        print("authenticateUser \(accountName) \(relyingPartyID)")
+    /// The passkey ceremony: `GET /authenticate`, the system sheet, then
+    /// `POST /authenticate` with the assertion. Never stores the token.
+    ///
+    /// With no `account` it is the name-free sign-in: the sheet offers every passkey
+    /// for the relying party, and identity names the account in its reply. With an
+    /// `account` it re-authenticates that account, and the sheet offers only its passkeys.
+    ///
+    /// - Throws: `ArkavoError.authenticationFailed("User Not Found")` when the
+    ///   scoped account no longer exists (the start's 500 `User Not Found`);
+    ///   `ArkavoError.unknownPasskey` when identity does not know the picked
+    ///   passkey (reported to the system first, best effort);
+    ///   `ArkavoError.invalidResponse` for any other refused start or unusable
+    ///   options; the sheet's `ASAuthorizationError` unchanged.
+    func passkeyCeremony(account: UUID?) async throws -> AuthenticationReply {
+        print("ArkavoClient.passkeyCeremony: start scoped=\(account != nil)")
         let provider = ASAuthorizationPlatformPublicKeyCredentialProvider(relyingPartyIdentifier: relyingPartyID)
 
-        // Fetch authentication options from server
-        let components = URLComponents(url: authURL.appendingPathComponent("authenticate/\(accountName)"), resolvingAgainstBaseURL: true)
+        var components = URLComponents(url: authURL.appendingPathComponent("authenticate"), resolvingAgainstBaseURL: true)
+        if let account {
+            components?.queryItems = [URLQueryItem(name: "account", value: account.uuidString.lowercased())]
+        }
         guard let url = components?.url else {
             throw ArkavoError.invalidURL
         }
 
-        let (data, response) = try await Self.http3Data(from: url)
-
-        guard let httpResponse = response as? HTTPURLResponse,
-              (200 ... 299).contains(httpResponse.statusCode)
-        else {
-            let errorString = String(decoding: data, as: UTF8.self)
-            print("fetchAuthenticationOptions.invalidResponse \(errorString)")
-
-            // Check for specific error conditions
-            if errorString.contains("User Not Found") {
+        let (data, response) = try await httpData(URLRequest(url: url))
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw ArkavoError.invalidResponse
+        }
+        print("ArkavoClient.passkeyCeremony: start status=\(httpResponse.statusCode)")
+        guard (200 ... 299).contains(httpResponse.statusCode) else {
+            // "User Not Found" makes a deletion clear the account's passkeys from
+            // the device, so only identity's own answer for a missing account
+            // counts: a 500 with exactly that body, not a proxy's page or another route.
+            if httpResponse.statusCode == 500,
+               String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines) == "User Not Found"
+            {
                 throw ArkavoError.authenticationFailed("User Not Found")
             }
-
             throw ArkavoError.invalidResponse
         }
 
-        let decoder = JSONDecoder()
-        let authOptions = try decoder.decode(AuthenticationOptionsResponse.self, from: data)
-
-        let challengeData = Data(base64Encoded: authOptions.publicKey.challenge.base64URLToBase64())!
+        guard let options = try? JSONDecoder().decode(AuthenticationOptionsResponse.self, from: data),
+              let challenge = Data(base64Encoded: options.publicKey.challenge.base64URLToBase64())
+        else {
+            throw ArkavoError.invalidResponse
+        }
 
         let assertionRequest = Self.passkeyAssertionRequest(
             provider: provider,
-            challenge: challengeData,
-            allowCredentialIDs: authOptions.publicKey.publicKeyCredentialIDs
+            challenge: challenge,
+            allowCredentialIDs: options.publicKey.publicKeyCredentialIDs
         )
+        let assertion = try await assertionProvider(assertionRequest)
 
-        // Perform the authentication
-        let assertion = try await performAuthentication(request: assertionRequest)
-
-        // Complete the authentication with server
-        var completeRequest = URLRequest(url: authURL.appendingPathComponent("authenticate"))
-        completeRequest.httpMethod = "POST"
-        completeRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-
+        var finishRequest = URLRequest(url: authURL.appendingPathComponent("authenticate"))
+        finishRequest.httpMethod = "POST"
+        finishRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         let parameters: [String: Any] = [
             "id": assertion.credentialID.base64URLEncodedString(),
             "rawId": assertion.credentialID.base64URLEncodedString(),
@@ -896,31 +1050,37 @@ public final class ArkavoClient: NSObject {
             ],
             "type": "public-key",
         ]
+        finishRequest.httpBody = try JSONSerialization.data(withJSONObject: parameters)
 
-        completeRequest.httpBody = try JSONSerialization.data(withJSONObject: parameters)
-
-        let (responseData, completionResponse) = try await Self.http3Data(for: completeRequest)
-
-        guard let completionHttpResponse = completionResponse as? HTTPURLResponse,
-              (200 ... 299).contains(completionHttpResponse.statusCode)
-        else {
-            // If we got an error response, try to parse it
-            if let errorJson = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any],
-               let errorMessage = errorJson["error"] as? String
-            {
-                throw ArkavoError.authenticationFailed(errorMessage)
-            }
+        let (replyData, finishResponse) = try await httpData(finishRequest)
+        guard let finishHTTPResponse = finishResponse as? HTTPURLResponse else {
+            throw ArkavoError.authenticationFailed("Invalid response from server")
+        }
+        print("ArkavoClient.passkeyCeremony: finish status=\(finishHTTPResponse.statusCode)")
+        let replyText = String(decoding: replyData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        switch finishHTTPResponse.statusCode {
+        case 200 ... 299:
+            break
+        // Only identity's own refusal reports the passkey: a 404 from anywhere
+        // else must not remove a passkey from the person's device.
+        case 404 where replyText == "Unknown Passkey":
+            await credentialReporter.reportUnknown(relyingPartyID: relyingPartyID, credentialID: assertion.credentialID)
+            throw ArkavoError.unknownPasskey
+        // Unreachable from this client: the start sends no X-Auth-Token, and a scoped finish answers a foreign handle with 400.
+        case 403:
+            throw ArkavoError.authenticationFailed("Passkey belongs to another account")
+        default:
             throw ArkavoError.authenticationFailed("Invalid response from server")
         }
 
-        // Parse token from response body (server returns CWT under "token")
-        guard let json = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any],
-              let token = json["token"] as? String
-        else {
+        let json = try? JSONSerialization.jsonObject(with: replyData) as? [String: Any]
+        guard let token = json?["token"] as? String, !token.isEmpty else {
             throw ArkavoError.authenticationFailed("No authentication token received")
         }
-
-        return token
+        guard let handle = json?["handle"] as? String, !handle.isEmpty else {
+            throw ArkavoError.authenticationFailed("No account handle received")
+        }
+        return AuthenticationReply(token: token, handle: handle)
     }
 
     private func setupWebSocketConnection() async throws {
@@ -2256,6 +2416,21 @@ struct PublicKeyAuthenticationOptions: Decodable {
 struct AllowCredential: Decodable {
     let id: String
     let type: String
+}
+
+/// The fields of the passkey sheet's assertion that `POST /authenticate` carries.
+struct PasskeyAssertion: Sendable, Equatable {
+    let credentialID: Data
+    let rawClientDataJSON: Data
+    let rawAuthenticatorData: Data
+    let signature: Data
+    let userID: Data?
+}
+
+/// identity's reply to a passkey ceremony: the auth CWT and the account's handle.
+struct AuthenticationReply: Equatable {
+    let token: String
+    let handle: String
 }
 
 public struct ArkavoProfile: Codable {

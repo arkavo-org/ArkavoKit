@@ -32,6 +32,28 @@ final class ArkavoSocialPublicAPITests: XCTestCase {
         // Compile-time shape check: the two-argument overload is public.
         let _: (ArkavoClient) -> (String, String?) async throws -> Void = ArkavoClient.linkAppleIdentity(idToken:authorizationCode:)
     }
+
+    /// Apps map a passkey the server does not know to a "create an account" path.
+    func testUnknownPasskeyIsMatchable() {
+        let error: any Error = ArkavoError.unknownPasskey
+        var matched = false
+        switch error as? ArkavoError {
+        case .unknownPasskey?:
+            matched = true
+        default:
+            break
+        }
+        XCTAssertTrue(matched, "ArkavoError.unknownPasskey must be matchable by consumers")
+    }
+
+    /// Sign-in returns the account handle; `account` is optional so existing callers compile.
+    @MainActor
+    func testConnectReturnsTheHandle() {
+        // Compile-time shape check only; the closure is never executed.
+        let _: (ArkavoClient) async throws -> String = { (c: ArkavoClient) async throws -> String in
+            try await c.connect()
+        }
+    }
 }
 
 /// The shape Creator's `ArkavoAuthState` declares (design sub-project C).
