@@ -185,8 +185,14 @@ final class DeletionHarness {
         client.assertionProvider = { _ in throw ASAuthorizationError(.failed) }
     }
 
-    /// Each ceremony returns the next token or throws the next error.
+    /// Each ceremony answers with the next token, for the account "alice", or
+    /// throws the next error.
     func stubCeremonies(_ outcomes: [Result<String, Error>]) {
+        stubReplies(outcomes.map { $0.map { AuthenticationReply(token: $0, handle: "alice") } })
+    }
+
+    /// Each ceremony returns the next reply or throws the next error.
+    func stubReplies(_ outcomes: [Result<AuthenticationReply, Error>]) {
         var remaining = outcomes
         client.authenticator = { [unowned self] account in
             ceremonies.append(account)

@@ -287,6 +287,73 @@ final class ArkavoClientDeletionTests: XCTestCase {
         XCTAssertTrue(harness.reporter.noAcceptedCredentials.isEmpty)
     }
 
+    // MARK: - The re-authenticated account
+
+    // The stored token and handle are separate keychain items that every Arkavo
+    // app writes, so they can disagree. Identity's reply says which account the
+    // sign-in proved; a deletion goes ahead only when that is the one named.
+
+    /// Review focus: alice's handle is stored beside bob's token. The sign-in
+    /// scoped to that token proves bob, so nothing is deleted.
+    func testDivergentStoredAccountRefusesBeforeTheDeletion() async {
+        harness.store.token = DeletionHarness.token(of: DeletionHarness.otherAccount)
+        harness.stubReplies([.success(AuthenticationReply(token: DeletionHarness.token(of: DeletionHarness.otherAccount), handle: "bob"))])
+        let http = harness.stubHTTP([.status(202, Self.receiptBody)])
+
+        await assertNotConnected { _ = try await self.client.deleteAccount(accountName: "alice") }
+
+        XCTAssertEqual(harness.ceremonies, [DeletionHarness.otherAccount])
+        XCTAssertTrue(http.requests.isEmpty, "no DELETE is sent")
+        XCTAssertTrue(harness.store.removals.isEmpty)
+        XCTAssertTrue(harness.reporter.noAcceptedCredentials.isEmpty)
+        XCTAssertFalse(client.isDeletingAccount)
+    }
+
+    /// The reply names alice, but its token is another account's (or its
+    /// readable `sub` is no account id): not the account the sign-in was scoped to.
+    func testFreshTokenOfAnotherAccountRefusesBeforeTheDeletion() async {
+        for freshToken in [DeletionHarness.token(of: DeletionHarness.otherAccount), TestCWT.token(sub: "user-1")] {
+            harness = DeletionHarness()
+            harness.stubReplies([.success(AuthenticationReply(token: freshToken, handle: "alice"))])
+            let http = harness.stubHTTP([.status(202, Self.receiptBody)])
+
+            await assertNotConnected { _ = try await self.client.deleteAccount(accountName: "alice") }
+
+            XCTAssertEqual(harness.ceremonies, [Self.account])
+            XCTAssertTrue(http.requests.isEmpty, "no DELETE is sent")
+            XCTAssertTrue(harness.store.removals.isEmpty)
+            XCTAssertTrue(harness.reporter.noAcceptedCredentials.isEmpty)
+        }
+    }
+
+    /// The fresh token's `sub` is readable and is the stored account: the deletion goes ahead.
+    func testFreshTokenOfTheStoredAccountIsAccepted() async throws {
+        harness.stubCeremonies([.success(DeletionHarness.token(of: Self.account))])
+        let http = harness.stubHTTP([.status(202, Self.receiptBody)])
+
+        let result = try await client.deleteAccount(accountName: "alice")
+
+        guard case .deleted(.some) = result else { return XCTFail("expected a receipt, got \(result)") }
+        XCTAssertEqual(http.requests.count, 1)
+    }
+
+    /// The sign-in after a 401 is checked the same way: its reply names bob, so
+    /// no second DELETE is sent.
+    func testReauthenticationAfterUnauthorizedIsCheckedToo() async {
+        harness.stubReplies([
+            .success(AuthenticationReply(token: "first-token", handle: "alice")),
+            .success(AuthenticationReply(token: "second-token", handle: "bob")),
+        ])
+        let http = harness.stubHTTP([.status(401, "{}"), .status(202, Self.receiptBody)])
+
+        await assertNotConnected { _ = try await self.client.deleteAccount(accountName: "alice") }
+
+        XCTAssertEqual(harness.ceremonies, [Self.account, Self.account])
+        XCTAssertEqual(http.requests.map { $0.value(forHTTPHeaderField: "X-Auth-Token") }, ["first-token"])
+        XCTAssertTrue(harness.store.removals.isEmpty)
+        XCTAssertTrue(harness.reporter.noAcceptedCredentials.isEmpty)
+    }
+
     // MARK: - The account's passkeys
 
     func testDeletionClearsTheAccountsPasskeys() async throws {
@@ -402,7 +469,7 @@ final class ArkavoClientDeletionTests: XCTestCase {
         defer { gate.open() } // a failing assertion must not leave the ceremony suspended
         client.authenticator = { _ in
             await gate.pass()
-            return "fresh-token"
+            return AuthenticationReply(token: "fresh-token", handle: "alice")
         }
         let http = harness.stubHTTP([.status(202, Self.receiptBody)])
 
