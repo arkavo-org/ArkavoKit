@@ -20,7 +20,9 @@ public enum ArkavoError: Error {
     case invalidState
     case profileNotFound(String)
     /// identity does not know the passkey the person picked: its account is gone.
-    /// The passkey has been reported to the system so the sheet stops offering it.
+    /// The passkey is reported to the system first, so the sheet stops offering it.
+    /// The report is best effort: it needs iOS / macOS 26.2, and a failed report is
+    /// only logged.
     case unknownPasskey
 }
 
@@ -85,8 +87,8 @@ public final class ArkavoClient: NSObject {
         try await self.passkeyCeremony(account: account)
     }
 
-    /// Performs an identity REST request. Used by the account-deletion and
-    /// Apple-link requests.
+    /// Performs an identity REST request. Used by the passkey ceremony (both
+    /// `/authenticate` requests) and the account-deletion and Apple-link requests.
     var httpData: @MainActor (URLRequest) async throws -> (Data, URLResponse) = ArkavoClient.http3Data(for:)
 
     /// The keychain items account deletion and Apple linking touch.
@@ -228,15 +230,49 @@ public final class ArkavoClient: NSObject {
 
     // MARK: - Public Methods
 
-    /// Whether a cached session can be reused without a passkey ceremony: it needs both
-    /// the token and the stored handle, so a token alone never "signs in" with an empty handle.
-    nonisolated static func usesCachedSession(token: String?, handle: String?) -> Bool {
+    /// Whether the cached session (the stored token and handle) can be reused without a
+    /// passkey ceremony. It needs both, so a token alone never "signs in" with an empty
+    /// handle; and when an `account` is asked for, the token must be that account's.
+    nonisolated static func reusesCachedSession(token: String?, handle: String?, account: UUID?) -> Bool {
         guard let token, !token.isEmpty, let handle, !handle.isEmpty else { return false }
-        return true
+        return isSession(token: token, of: account)
+    }
+
+    /// Whether a connected client keeps its live socket. It needs a stored handle to
+    /// return; and when an `account` is asked for, the stored token must be that
+    /// account's. With no `account` the handle alone decides.
+    nonisolated static func keepsConnectedSession(token: String?, handle: String?, account: UUID?) -> Bool {
+        guard let handle, !handle.isEmpty else { return false }
+        return isSession(token: token, of: account)
+    }
+
+    /// true when no account is asked for. Otherwise whether the token's CWT `sub`
+    /// (read without a signature check; the server verifies the token) is `account`,
+    /// compared as a UUID. A missing or unreadable token is no account's session.
+    private nonisolated static func isSession(token: String?, of account: UUID?) -> Bool {
+        guard let account else { return true }
+        guard let token, let subject = CWTSubject.sub(fromToken: token) else { return false }
+        return UUID(uuidString: subject) == account
     }
 
     /// Signs in with a passkey (no account name) and opens the socket.
-    /// - Parameter account: re-authenticates this account only; `nil` lets the passkey choose.
+    ///
+    /// A session already on this device (a live socket, or the stored token and
+    /// handle) is reused without a sheet when it fits:
+    /// - With no `account`, whichever account it is. With no session, the passkey
+    ///   the person picks names the account.
+    /// - With an `account`, a cached session of `account` (its token's `sub`) is
+    ///   reused without a sheet; one of another account, or one whose token names
+    ///   no readable account, is dropped and the scoped ceremony runs: a live
+    ///   socket is torn down, the stored token is deleted, and the sheet offers
+    ///   only `account`'s passkeys.
+    ///
+    /// Connected but with no stored handle to return, it likewise tears down the
+    /// live socket (pending message handlers fail), deletes the stored token and
+    /// shows a passkey sheet. A stored token the server refuses is deleted and the
+    /// ceremony runs.
+    ///
+    /// - Parameter account: the account to sign in; `nil` lets the passkey choose.
     /// - Returns: the signed-in account's handle.
     @discardableResult
     @MainActor
@@ -252,11 +288,16 @@ public final class ArkavoClient: NSObject {
             // First disconnect if we're in error state
             await disconnect()
         case .connected:
-            if let handle = KeychainManager.getArkavoHandle(), !handle.isEmpty {
+            let handle = KeychainManager.getArkavoHandle()
+            if Self.keepsConnectedSession(token: KeychainManager.getAuthenticationToken(), handle: handle, account: account),
+               let handle
+            {
                 print("Already connected, no need to reconnect")
                 return handle
             }
-            // Connected, but no handle to return: drop the session and sign in again.
+            // Connected, but no handle to return or not `account`'s session: drop
+            // it (disconnect() also deletes the stored token) and sign in again.
+            print("ArkavoClient: connected session does not fit this sign-in; dropping it")
             await disconnect()
         case .connecting, .authenticating:
             throw ArkavoError.invalidState
@@ -266,10 +307,11 @@ public final class ArkavoClient: NSObject {
         // Server is authoritative — if the handshake succeeds, we skip the
         // WebAuthn ceremony entirely. If it fails for any reason (expired,
         // revoked, network), we drop the cached token and fall through to the
-        // ceremony branch below. A token without a stored handle is not a session.
+        // ceremony branch below. A token without a stored handle is not a session,
+        // and neither is another account's when `account` is asked for.
         let cachedToken = KeychainManager.getAuthenticationToken()
         let cachedHandle = KeychainManager.getArkavoHandle()
-        if Self.usesCachedSession(token: cachedToken, handle: cachedHandle), let cachedHandle {
+        if Self.reusesCachedSession(token: cachedToken, handle: cachedHandle, account: account), let cachedHandle {
             do {
                 currentState = .connecting
                 try await setupWebSocketConnection()
@@ -289,6 +331,7 @@ public final class ArkavoClient: NSObject {
                 currentState = .disconnected
             }
         } else if cachedToken != nil {
+            print("ArkavoClient: cached token does not fit this sign-in; dropping it")
             KeychainManager.deleteAuthenticationToken()
         }
 
@@ -296,9 +339,10 @@ public final class ArkavoClient: NSObject {
             // First authenticate
             currentState = .authenticating
             let reply = try await passkeyCeremony(account: account)
-            try KeychainManager.saveAuthenticationToken(reply.token)
-            // Save the handle for future sessions
+            // The handle first: should the token's write fail, no token is left
+            // beside a stale handle, so the next connect runs the ceremony.
             try KeychainManager.saveArkavoHandle(reply.handle)
+            try KeychainManager.saveAuthenticationToken(reply.token)
 
             // Then establish WebSocket connection
             currentState = .connecting
@@ -415,8 +459,8 @@ public final class ArkavoClient: NSObject {
     ///   could find no account and be taken for an already deleted one);
     ///   `ArkavoError.notConnected`, with no sign-in, when this device holds no
     ///   session of `accountName` (no stored token, a token without an account
-    ///   id, or another stored handle), or before the next `DELETE` when a
-    ///   sign-in proved another account; the ceremony's own error
+    ///   id, no stored handle, or another stored handle), or before the next
+    ///   `DELETE` when a sign-in proved another account; the ceremony's own error
     ///   (`ASAuthorizationError.canceled` when the person cancels); otherwise
     ///   `ArkavoError.authenticationFailed("Account deletion failed")`.
     ///   Nothing is removed from this device when it throws.
@@ -920,11 +964,11 @@ public final class ArkavoClient: NSObject {
         )
     }
 
-    /// The passkey assertion request for one account. It is limited to the credentials
-    /// the server's options listed for `accountName`, so the system sheet offers only that
-    /// account's passkeys instead of every Arkavo passkey on the device. With no listed
-    /// credentials the request stays open (any passkey for the relying party), as before.
-    /// An id that is not base64url is skipped.
+    /// The passkey assertion request, limited to the credentials the server's options
+    /// list. A sign-in scoped to an account gets that account's, so the system sheet
+    /// offers only its passkeys instead of every Arkavo passkey on the device. With no
+    /// listed credentials (the name-free sign-in) the request stays open: any passkey
+    /// for the relying party. An id that is not base64url is skipped.
     nonisolated static func passkeyAssertionRequest(
         provider: ASAuthorizationPlatformPublicKeyCredentialProvider,
         challenge: Data,
@@ -947,9 +991,9 @@ public final class ArkavoClient: NSObject {
     /// - Throws: `ArkavoError.authenticationFailed("User Not Found")` when the
     ///   scoped account no longer exists (the start's 500 `User Not Found`);
     ///   `ArkavoError.unknownPasskey` when identity does not know the picked
-    ///   passkey (reported to the system first); `ArkavoError.invalidResponse`
-    ///   for any other refused start or unusable options; the sheet's
-    ///   `ASAuthorizationError` unchanged.
+    ///   passkey (reported to the system first, best effort);
+    ///   `ArkavoError.invalidResponse` for any other refused start or unusable
+    ///   options; the sheet's `ASAuthorizationError` unchanged.
     func passkeyCeremony(account: UUID?) async throws -> AuthenticationReply {
         print("ArkavoClient.passkeyCeremony: start scoped=\(account != nil)")
         let provider = ASAuthorizationPlatformPublicKeyCredentialProvider(relyingPartyIdentifier: relyingPartyID)
@@ -1022,6 +1066,7 @@ public final class ArkavoClient: NSObject {
         case 404 where replyText == "Unknown Passkey":
             await credentialReporter.reportUnknown(relyingPartyID: relyingPartyID, credentialID: assertion.credentialID)
             throw ArkavoError.unknownPasskey
+        // Unreachable from this client: the start sends no X-Auth-Token, and a scoped finish answers a foreign handle with 400.
         case 403:
             throw ArkavoError.authenticationFailed("Passkey belongs to another account")
         default:
