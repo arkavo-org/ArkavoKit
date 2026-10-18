@@ -105,7 +105,7 @@
 - Consumes: Task 1's `passkeyCeremony(account:)` and `AuthenticationReply`.
 - Produces: `@discardableResult public func connect(account: UUID? = nil) async throws -> String`.
   - **Fast path:** a cached token AND a stored handle (`KeychainManager.getArkavoHandle()`) open the socket and return the stored handle. A token without a handle is deleted, and the ceremony runs.
-  - **Ceremony path:** `passkeyCeremony(account:)`, then `saveAuthenticationToken(reply.token)`, then `saveArkavoHandle(reply.handle)`. Then the socket. Return `reply.handle`.
+  - **Ceremony path:** `passkeyCeremony(account:)`, then `saveArkavoHandle(reply.handle)`, then `saveAuthenticationToken(reply.token)` (handle first, so a partial write leaves no token). Then the socket. Return `reply.handle`.
 
 - [ ] **Step 1: Write the failing tests** in `ConnectTests.swift`.
   - `testCachedTokenWithoutAHandleRunsTheCeremony`. The socket path has no seam, so the fast-path decision is a pure function, `nonisolated static func usesCachedSession(token: String?, handle: String?) -> Bool`.
