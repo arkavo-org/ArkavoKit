@@ -117,7 +117,13 @@ public struct C2PASignRequest: Encodable, Sendable {
 public struct C2PASigningService: Sendable {
     public static let defaultServerURL = URL(string: "https://platform.arkavo.net")!
 
+    /// Returns the identity.arkavo.net passkey token (the one `ArkavoClient.currentToken`
+    /// holds), or nil to send the request without one
+    public typealias AccessTokenProvider = @Sendable () async throws -> String?
+
     public enum ServiceError: Error, LocalizedError {
+        /// The bearer token was missing or the server rejected it
+        case unauthenticated(String)
         /// The server's creator allowlist does not include `metadata.creator`
         case creatorNotAuthorized(String)
         case server(statusCode: Int, message: String)
@@ -125,6 +131,8 @@ public struct C2PASigningService: Sendable {
 
         public var errorDescription: String? {
             switch self {
+            case .unauthenticated(let message):
+                return "C2PA signing needs an Arkavo sign-in: \(message)"
             case .creatorNotAuthorized(let message):
                 return "C2PA signing denied: \(message)"
             case .server(let statusCode, let message):
@@ -137,10 +145,16 @@ public struct C2PASigningService: Sendable {
 
     public let serverURL: URL
     private let session: URLSession
+    private let accessToken: AccessTokenProvider?
 
-    public init(serverURL: URL = Self.defaultServerURL, session: URLSession = .shared) {
+    public init(
+        serverURL: URL = Self.defaultServerURL,
+        session: URLSession = .shared,
+        accessToken: AccessTokenProvider? = nil
+    ) {
         self.serverURL = serverURL
         self.session = session
+        self.accessToken = accessToken
     }
 
     /// Returns the signed manifest store (JUMBF) for the client to embed
@@ -149,6 +163,9 @@ public struct C2PASigningService: Sendable {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(signRequest)
+        if let token = try await accessToken?() {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
 
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else {
@@ -165,6 +182,8 @@ public struct C2PASigningService: Sendable {
                 throw ServiceError.invalidResponse("manifest is not base64")
             }
             return jumbf
+        case 401:
+            throw ServiceError.unauthenticated(body?.message ?? body?.error ?? "authentication required")
         case 403:
             throw ServiceError.creatorNotAuthorized(body?.error ?? "creator not authorized")
         default:
@@ -176,5 +195,6 @@ public struct C2PASigningService: Sendable {
     private struct SignResponse: Decodable {
         let manifest: String?
         let error: String?
+        let message: String?
     }
 }

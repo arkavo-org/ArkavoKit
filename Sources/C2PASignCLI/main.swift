@@ -7,7 +7,7 @@ import Foundation
 ///
 /// Usage:
 ///   c2pa-sign <input> <output> [--server URL] [--title T] [--creator C]
-///             [--trust-anchors ca.pem] [--force]
+///             [--token CWT] [--trust-anchors ca.pem] [--force]
 ///
 /// Checks:
 ///   1. c2patool reports validation_state Valid (Trusted with --trust-anchors),
@@ -38,10 +38,15 @@ struct C2PASignCLI {
         print("Input:    \(options.input.path)")
         print("Output:   \(options.output.path)")
         print("Server:   \(options.serverURL)")
+        print("Token:    \(options.token == nil ? "none" : "identity.arkavo.net bearer")")
         print("c2patool: \(c2patool.path)")
         print("============================================")
 
-        let signer = C2PAServerSigner(service: C2PASigningService(serverURL: options.serverURL))
+        let token = options.token
+        let signer = C2PAServerSigner(service: C2PASigningService(
+            serverURL: options.serverURL,
+            accessToken: { token }
+        ))
         let metadata = C2PASigningMetadata(
             title: options.title,
             creator: options.creator,
@@ -141,6 +146,8 @@ struct C2PASignCLI {
           --server URL          Signing server (default: \(C2PASigningService.defaultServerURL))
           --title TITLE         Manifest title (default: input file name)
           --creator NAME        Creator recorded in the manifest (default: Arkavo c2pa-sign)
+          --token CWT           identity.arkavo.net passkey token sent as the bearer
+                                (default: $ARKAVO_TOKEN)
           --trust-anchors PEM   Trust these CAs; expects Trusted instead of Valid
           --force               Replace the output file if it exists
         """)
@@ -164,6 +171,7 @@ struct Options {
     var serverURL = C2PASigningService.defaultServerURL
     var title: String
     var creator = "Arkavo c2pa-sign"
+    var token: String?
     var trustAnchors: URL?
     var force = false
 
@@ -172,6 +180,7 @@ struct Options {
         var serverURL: URL?
         var title: String?
         var creator: String?
+        var token = ProcessInfo.processInfo.environment["ARKAVO_TOKEN"]
         var trustAnchors: URL?
         var force = false
         var iterator = arguments.makeIterator()
@@ -186,6 +195,9 @@ struct Options {
             case "--creator":
                 guard let value = iterator.next() else { return nil }
                 creator = value
+            case "--token":
+                guard let value = iterator.next() else { return nil }
+                token = value
             case "--trust-anchors":
                 guard let value = iterator.next() else { return nil }
                 trustAnchors = URL(fileURLWithPath: value)
@@ -203,6 +215,7 @@ struct Options {
         self.title = title ?? input.lastPathComponent
         if let serverURL { self.serverURL = serverURL }
         if let creator { self.creator = creator }
+        self.token = token.flatMap { $0.isEmpty ? nil : $0 }
         self.trustAnchors = trustAnchors
         self.force = force
     }

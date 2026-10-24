@@ -76,6 +76,43 @@ final class C2PASigningServiceTests: XCTestCase {
         }
     }
 
+    func testSendsTheIdentityTokenAsABearer() async throws {
+        var authorization: String?
+        StubURLProtocol.handler = { request, _ in
+            authorization = request.value(forHTTPHeaderField: "Authorization")
+            return (200, Self.successBody(manifest: Data([1])))
+        }
+
+        _ = try await makeService(accessToken: { "passkey-cwt" }).signManifest(sampleRequest())
+
+        XCTAssertEqual(authorization, "Bearer passkey-cwt")
+    }
+
+    func testSendsNoAuthorizationWithoutAToken() async throws {
+        var authorization: String?
+        StubURLProtocol.handler = { request, _ in
+            authorization = request.value(forHTTPHeaderField: "Authorization")
+            return (200, Self.successBody(manifest: Data([1])))
+        }
+
+        _ = try await makeService(accessToken: { nil }).signManifest(sampleRequest())
+
+        XCTAssertNil(authorization)
+    }
+
+    func testUnauthorizedMeansTheTokenWasMissingOrRejected() async throws {
+        StubURLProtocol.handler = { _, _ in
+            (401, Data(#"{"error":"authentication_failed","message":"missing bearer token"}"#.utf8))
+        }
+
+        do {
+            _ = try await makeService().signManifest(sampleRequest())
+            XCTFail("expected unauthenticated")
+        } catch C2PASigningService.ServiceError.unauthenticated(let message) {
+            XCTAssertEqual(message, "missing bearer token")
+        }
+    }
+
     func testRejectsASuccessResponseWithoutAManifest() async throws {
         StubURLProtocol.handler = { _, _ in (200, Data(#"{"status":"success"}"#.utf8)) }
 
@@ -88,12 +125,15 @@ final class C2PASigningServiceTests: XCTestCase {
 
     // MARK: - Fixtures
 
-    private func makeService() -> C2PASigningService {
+    private func makeService(
+        accessToken: C2PASigningService.AccessTokenProvider? = nil
+    ) -> C2PASigningService {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [StubURLProtocol.self]
         return C2PASigningService(
             serverURL: URL(string: "https://signer.test")!,
-            session: URLSession(configuration: configuration)
+            session: URLSession(configuration: configuration),
+            accessToken: accessToken
         )
     }
 
