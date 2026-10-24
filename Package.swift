@@ -50,6 +50,10 @@ let package = Package(
             name: "c2pa-test",
             targets: ["C2PATestCLI"]
         ),
+        .executable(
+            name: "c2pa-sign",
+            targets: ["C2PASignCLI"]
+        ),
     ],
     dependencies: [
         .package(url: "https://github.com/arkavo-org/OpenTDFKit", from: "5.0.1"),
@@ -125,6 +129,11 @@ let package = Package(
             dependencies: [],
             swiftSettings: sharedSwiftSettings
         ),
+        .testTarget(
+            name: "ArkavoC2PATests",
+            dependencies: ["ArkavoC2PA"],
+            swiftSettings: sharedSwiftSettings
+        ),
         .target(
             name: "ArkavoStore",
             dependencies: [],
@@ -161,6 +170,11 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("SystemConfiguration"),
             ]
+        ),
+        .executableTarget(
+            name: "C2PASignCLI",
+            dependencies: ["ArkavoC2PA"],
+            swiftSettings: sharedSwiftSettings
         ),
     ]
 )
