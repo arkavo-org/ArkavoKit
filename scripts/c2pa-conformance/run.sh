@@ -24,9 +24,12 @@ if [ "$(git -C "$repo" rev-parse HEAD 2>/dev/null)" != "$CONFORMANCE_COMMIT" ]; 
     git clone --quiet --filter=blob:none https://github.com/c2pa-org/conformance-public.git "$repo"
     git -C "$repo" checkout --quiet "$CONFORMANCE_COMMIT"
 fi
-if [ ! -x "$venv/bin/python" ]; then
+# The marker is written only after a complete install, so an interrupted one is redone
+if [ ! -f "$venv/.installed" ]; then
+    rm -rf "$venv"
     python3 -m venv "$venv"
     "$venv/bin/pip" install --quiet -r "$repo/asset-rubrics/requirements.txt"
+    touch "$venv/.installed"
 fi
 
 args=()
