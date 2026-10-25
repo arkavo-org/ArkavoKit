@@ -8,6 +8,10 @@ import Foundation
 /// past 4 GiB turns its table into `co64`, which grows `moov`; when `moov` comes
 /// before the media, that growth moves the chunks again, so the plan repeats until
 /// the offsets settle.
+///
+/// Only the boxes on the way to the chunk-offset tables are parsed; everything else in
+/// `moov` is copied as is. Media in other files (`dref` entries that are not
+/// self-contained) is refused, since its chunk offsets are not offsets into this file.
 struct BMFFManifestLayout {
     typealias SigningError = C2PAServerSigner.SigningError
 
@@ -28,8 +32,17 @@ struct BMFFManifestLayout {
 
     /// Top-level boxes whose absolute offsets this layout does not rewrite
     private static let unsupportedTopLevel: Set<String> = ["moof", "mfra", "sidx", "ssix", "styp", "meta"]
-    /// Containers on the path to the chunk-offset tables
-    private static let chunkTablePath: Set<String> = ["moov", "trak", "mdia", "minf", "stbl"]
+    /// The boxes on the way to the chunk-offset tables and data references, by parent
+    private static let pathChildren: [String: Set<String>] = [
+        "moov": ["trak"],
+        "trak": ["mdia"],
+        "mdia": ["minf"],
+        "minf": ["dinf", "stbl"],
+        "dinf": ["dref"],
+        "stbl": ["stco", "co64"],
+    ]
+    /// Each pass that doesn't settle turns at least one more `stco` table into `co64`
+    private static let maxPasses = 64
 
     /// - Parameters:
     ///   - boxes: the input's top-level boxes, `ftyp` first
@@ -54,9 +67,14 @@ struct BMFFManifestLayout {
         let boxOffset = ftyp.offset + ftyp.size
 
         var growth: UInt64 = 0
-        for _ in 0..<4 {
-            let shift = { (offset: UInt64) -> UInt64 in
-                offset + UInt64(boxSize) + (offset >= moovRange.upperBound ? growth : 0)
+        for _ in 0..<maxPasses {
+            let shift = { (offset: UInt64) throws -> UInt64 in
+                let moved = offset.addingReportingOverflow(UInt64(boxSize))
+                let grown = moved.partialValue.addingReportingOverflow(offset >= moovRange.upperBound ? growth : 0)
+                guard !moved.overflow, !grown.overflow else {
+                    throw SigningError.unsupportedContainer("chunk offset \(offset) is out of range")
+                }
+                return grown.partialValue
             }
             let rewritten = try rewrite(moov, box: try parseHeader(moov, at: 0, limit: moov.count), shift: shift)
             let newGrowth = UInt64(rewritten.count - moov.count)
@@ -112,27 +130,15 @@ struct BMFFManifestLayout {
         return result
     }
 
-    private static func rewrite(_ data: Data, box: Header, shift: (UInt64) -> UInt64) throws -> Data {
+    private static func rewrite(_ data: Data, box: Header, shift: (UInt64) throws -> UInt64) throws -> Data {
         switch box.type {
-        case _ where chunkTablePath.contains(box.type):
-            var body = Data()
-            for child in try children(data, of: box) {
-                if child.type == "mvex" {
-                    throw SigningError.unsupportedContainer("fragmented movies are not supported")
-                }
-                if child.type == "saio" {
-                    throw SigningError.unsupportedContainer("'saio' auxiliary offsets are not supported")
-                }
-                body.append(try rewrite(data, box: child, shift: shift))
-            }
-            return header(box.type, bodySize: body.count, large: box.headerSize == 16) + body
         case "stco", "co64":
             let width = box.type == "stco" ? 4 : 8
             let start = box.body.lowerBound
             guard box.body.count >= 8 else { throw malformed() }
             let count = Int(data.bigEndianInteger(at: start + 4, width: 4))
             guard box.body.count == 8 + count * width else { throw malformed() }
-            let offsets = (0..<count).map { shift(data.bigEndianInteger(at: start + 8 + $0 * width, width: width)) }
+            let offsets = try (0..<count).map { try shift(data.bigEndianInteger(at: start + 8 + $0 * width, width: width)) }
             let fits32 = width == 4 && offsets.allSatisfy { $0 <= UInt64(UInt32.max) }
             var body = Data(data[data.startIndex + start..<data.startIndex + start + 8]) // version, flags, count
             for offset in offsets {
@@ -143,9 +149,43 @@ struct BMFFManifestLayout {
                 }
             }
             return header(fits32 ? "stco" : "co64", bodySize: body.count, large: box.headerSize == 16) + body
+        case "dref":
+            try checkSelfContained(data, dref: box)
+            return bytes(data, box)
         default:
-            return Data(data[data.startIndex + box.range.lowerBound..<data.startIndex + box.range.upperBound])
+            // A container on the path: moov, trak, mdia, minf, dinf or stbl
+            let path = pathChildren[box.type] ?? []
+            var body = Data()
+            for child in try children(data, of: box) {
+                if child.type == "mvex" {
+                    throw SigningError.unsupportedContainer("fragmented movies are not supported")
+                }
+                if child.type == "saio" {
+                    throw SigningError.unsupportedContainer("'saio' auxiliary offsets are not supported")
+                }
+                body.append(path.contains(child.type) ? try rewrite(data, box: child, shift: shift) : bytes(data, child))
+            }
+            return header(box.type, bodySize: body.count, large: box.headerSize == 16) + body
         }
+    }
+
+    /// Refuses data references to media in other files. Each `dref` entry is a full box
+    /// whose flag 1 means the media is in this file.
+    private static func checkSelfContained(_ data: Data, dref: Header) throws {
+        guard dref.body.count >= 8 else { throw malformed() }
+        var offset = dref.body.lowerBound + 8 // version, flags, entry count
+        while offset < dref.body.upperBound {
+            let entry = try parseHeader(data, at: offset, limit: dref.body.upperBound)
+            guard entry.body.count >= 4 else { throw malformed() }
+            if data.bigEndianInteger(at: entry.body.lowerBound, width: 4) & 1 == 0 {
+                throw SigningError.unsupportedContainer("media in other files ('\(entry.type)' data reference) is not supported")
+            }
+            offset = entry.range.upperBound
+        }
+    }
+
+    private static func bytes(_ data: Data, _ box: Header) -> Data {
+        Data(data[data.startIndex + box.range.lowerBound..<data.startIndex + box.range.upperBound])
     }
 
     private static func header(_ type: String, bodySize: Int, large: Bool) -> Data {

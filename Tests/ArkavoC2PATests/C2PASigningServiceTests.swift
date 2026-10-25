@@ -14,7 +14,7 @@ final class C2PASigningServiceTests: XCTestCase {
         StubURLProtocol.handler = { request, body in
             captured = request
             capturedBody = body
-            return (200, Self.successBody(manifest: Data([1, 2, 3])))
+            return (200, Self.successBody(manifest: Self.manifestStore))
         }
 
         _ = try await makeService().signManifest(sampleRequest())
@@ -42,7 +42,7 @@ final class C2PASigningServiceTests: XCTestCase {
     }
 
     func testReturnsTheDecodedManifestBytes() async throws {
-        let manifest = Data((0..<64).map { UInt8($0) })
+        let manifest = box("jumb", Data((0..<64).map { UInt8($0) }))
         StubURLProtocol.handler = { _, _ in (200, Self.successBody(manifest: manifest)) }
 
         let result = try await makeService().signManifest(sampleRequest())
@@ -81,7 +81,7 @@ final class C2PASigningServiceTests: XCTestCase {
         var authorization: String?
         StubURLProtocol.handler = { request, _ in
             authorization = request.value(forHTTPHeaderField: "Authorization")
-            return (200, Self.successBody(manifest: Data([1])))
+            return (200, Self.successBody(manifest: Self.manifestStore))
         }
 
         _ = try await makeService(accessToken: { "passkey-cwt" }).signManifest(sampleRequest())
@@ -93,7 +93,7 @@ final class C2PASigningServiceTests: XCTestCase {
         var authorization: String?
         StubURLProtocol.handler = { request, _ in
             authorization = request.value(forHTTPHeaderField: "Authorization")
-            return (200, Self.successBody(manifest: Data([1])))
+            return (200, Self.successBody(manifest: Self.manifestStore))
         }
 
         _ = try await makeService(accessToken: { nil }).signManifest(sampleRequest())
@@ -141,6 +141,46 @@ final class C2PASigningServiceTests: XCTestCase {
         }
     }
 
+    func testRejectsAnEmptyManifest() async throws {
+        StubURLProtocol.handler = { _, _ in (200, Self.successBody(manifest: Data())) }
+        try await assertInvalidResponse()
+    }
+
+    func testRejectsAManifestThatIsNotAJUMBFSuperbox() async throws {
+        StubURLProtocol.handler = { _, _ in (200, Self.successBody(manifest: box("free", Data(count: 16)))) }
+        try await assertInvalidResponse()
+    }
+
+    func testRejectsAManifestWhoseBoxSizeDoesNotMatchItsLength() async throws {
+        StubURLProtocol.handler = { _, _ in (200, Self.successBody(manifest: Self.manifestStore + Data([0]))) }
+        try await assertInvalidResponse()
+    }
+
+    func testIgnoresARetryAfterThatIsNotAnIntegerNumberOfSeconds() async throws {
+        for value in ["100000000000000000000", "inf", "-5", "Wed, 21 Oct 2026 07:28:00 GMT"] {
+            StubURLProtocol.responseHeaders = ["Retry-After": value]
+            StubURLProtocol.handler = { _, _ in (429, Data(#"{"error":"Too many signing requests"}"#.utf8)) }
+
+            do {
+                _ = try await makeService().signManifest(sampleRequest())
+                XCTFail("expected rateLimited")
+            } catch C2PASigningService.ServiceError.rateLimited(let retryAfter) {
+                XCTAssertNil(retryAfter, value)
+            }
+        }
+    }
+
+    func testRateLimitedDescribesAnyDelay() {
+        for delay in [TimeInterval.infinity, .nan, -1, 1e30, 30] {
+            let description = C2PASigningService.ServiceError.rateLimited(retryAfter: delay).errorDescription ?? ""
+            XCTAssertTrue(description.hasPrefix("Too many C2PA sign requests"), description)
+        }
+        XCTAssertEqual(
+            C2PASigningService.ServiceError.rateLimited(retryAfter: 30).errorDescription,
+            "Too many C2PA sign requests; retry in 30 s"
+        )
+    }
+
     func testRejectsASuccessResponseWithoutAManifest() async throws {
         StubURLProtocol.handler = { _, _ in (200, Data(#"{"status":"success"}"#.utf8)) }
 
@@ -152,6 +192,17 @@ final class C2PASigningServiceTests: XCTestCase {
     }
 
     // MARK: - Fixtures
+
+    /// A minimal JUMBF manifest store: one `jumb` superbox
+    private static let manifestStore = box("jumb", Data(repeating: 0x11, count: 24))
+
+    private func assertInvalidResponse(file: StaticString = #filePath, line: UInt = #line) async throws {
+        do {
+            _ = try await makeService().signManifest(sampleRequest())
+            XCTFail("expected invalidResponse", file: file, line: line)
+        } catch C2PASigningService.ServiceError.invalidResponse {
+        }
+    }
 
     private func makeService(
         accessToken: C2PASigningService.AccessTokenProvider? = nil

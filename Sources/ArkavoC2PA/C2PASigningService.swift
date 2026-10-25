@@ -143,8 +143,8 @@ public struct C2PASigningService: Sendable {
             case .exclusionLengthMismatch(let requiredLength):
                 return "C2PA signing needs a \(requiredLength)-byte manifest range"
             case .rateLimited(let retryAfter):
-                return "Too many C2PA sign requests"
-                    + (retryAfter.map { "; retry in \(Int($0)) s" } ?? "")
+                let seconds = retryAfter.flatMap { $0 >= 0 && $0 < Double(Int.max) ? Int($0.rounded(.up)) : nil }
+                return "Too many C2PA sign requests" + (seconds.map { "; retry in \($0) s" } ?? "")
             case .server(let statusCode, let message):
                 return "C2PA signing server error (HTTP \(statusCode)): \(message)"
             case .invalidResponse(let message):
@@ -191,6 +191,9 @@ public struct C2PASigningService: Sendable {
             guard let jumbf = Data(base64Encoded: manifest) else {
                 throw ServiceError.invalidResponse("manifest is not base64")
             }
+            guard Self.isManifestStore(jumbf) else {
+                throw ServiceError.invalidResponse("manifest is not a JUMBF manifest store")
+            }
             return jumbf
         case 401:
             throw ServiceError.unauthenticated(body?.message ?? body?.error ?? "authentication required")
@@ -199,12 +202,27 @@ public struct C2PASigningService: Sendable {
         case 422 where body?.requiredExclusionLength != nil:
             throw ServiceError.exclusionLengthMismatch(requiredLength: body?.requiredExclusionLength ?? 0)
         case 429:
-            let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap(TimeInterval.init)
+            // Delay-seconds only; an HTTP date or anything out of range is ignored
+            let retryAfter = http.value(forHTTPHeaderField: "Retry-After")
+                .flatMap { Int($0) }
+                .flatMap { $0 >= 0 ? TimeInterval($0) : nil }
             throw ServiceError.rateLimited(retryAfter: retryAfter)
         default:
             let message = body?.error ?? String(decoding: data, as: UTF8.self)
             throw ServiceError.server(statusCode: http.statusCode, message: message)
         }
+    }
+
+    /// A C2PA manifest store is one JUMBF superbox (`jumb`) spanning the whole manifest
+    static func isManifestStore(_ data: Data) -> Bool {
+        let bytes = [UInt8](data.prefix(16))
+        guard bytes.count >= 8, bytes[4..<8].elementsEqual("jumb".utf8) else { return false }
+        var size = bytes[0..<4].reduce(UInt64(0)) { $0 << 8 | UInt64($1) }
+        if size == 1 {
+            guard bytes.count == 16 else { return false }
+            size = bytes[8..<16].reduce(UInt64(0)) { $0 << 8 | UInt64($1) }
+        }
+        return size == UInt64(data.count)
     }
 
     private struct SignResponse: Decodable {
