@@ -14,7 +14,7 @@ CONFORMANCE_COMMIT=da71a7231fd6c86d308771dbb5557fabc920997a
 here="$(cd "$(dirname "$0")" && pwd)"
 cache="${C2PA_CONFORMANCE_CACHE:-$here/../../.build/c2pa-conformance}"
 repo="$cache/conformance-public"
-venv="$cache/venv"
+venv="$cache/venv-${CONFORMANCE_COMMIT:0:12}"  # rebuilt when the pinned commit changes
 
 command -v c2patool >/dev/null || { echo "error: c2patool not found (brew install c2patool)" >&2; exit 2; }
 
