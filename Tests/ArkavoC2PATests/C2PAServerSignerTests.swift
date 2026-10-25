@@ -92,6 +92,49 @@ final class C2PAServerSignerTests: XCTestCase {
         XCTAssertEqual(signed.suffix(100), Data(repeating: 2, count: 100))
     }
 
+    func testSignRetriesWithTheLengthTheServerRequires() async throws {
+        let input = try writeFile("in.mov", makeBMFF(payloadSize: 64))
+        let output = directory.appendingPathComponent("out.mov")
+        let recorder = RequestRecorder()
+        let signer = C2PAServerSigner { request in
+            let call = await recorder.record(request)
+            guard call > 1 else {
+                throw C2PASigningService.ServiceError.exclusionLengthMismatch(
+                    requiredLength: C2PAManifestBox.headerSize + 100
+                )
+            }
+            return Data(repeating: 9, count: 100)
+        }
+
+        let result = try await signer.sign(inputFile: input, outputFile: output, metadata: metadata())
+
+        let requests = await recorder.requests
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(result.requestCount, 2)
+        let range = try XCTUnwrap(requests.last?.exclusionRanges.first)
+        XCTAssertEqual(range.end - range.start, UInt64(C2PAManifestBox.headerSize + 100))
+        XCTAssertEqual(try Data(contentsOf: output).suffix(100), Data(repeating: 9, count: 100))
+    }
+
+    func testSignStopsWhenTheRequiredLengthKeepsChanging() async throws {
+        let input = try writeFile("in.mov", makeBMFF(payloadSize: 64))
+        let output = directory.appendingPathComponent("out.mov")
+        let recorder = RequestRecorder()
+        let signer = C2PAServerSigner { request in
+            let call = await recorder.record(request)
+            throw C2PASigningService.ServiceError.exclusionLengthMismatch(requiredLength: 200 + call)
+        }
+
+        do {
+            _ = try await signer.sign(inputFile: input, outputFile: output, metadata: metadata())
+            XCTFail("expected manifestSizeDidNotSettle")
+        } catch C2PAServerSigner.SigningError.manifestSizeDidNotSettle {
+        }
+        let count = await recorder.requests.count
+        XCTAssertEqual(count, C2PAServerSigner.maxRequests)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+    }
+
     func testSignFailsWithoutWritingWhenManifestSizeNeverSettles() async throws {
         let input = try writeFile("in.mov", makeBMFF(payloadSize: 64))
         let output = directory.appendingPathComponent("out.mov")

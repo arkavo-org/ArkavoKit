@@ -21,10 +21,13 @@ public struct C2PAEmbeddedManifest: Sendable {
 ///
 /// The exclusion range must be the exact size of the box, which is only known once
 /// the server has signed. The signer therefore requests a manifest for a reserved
-/// size, and repeats with the returned size until the two match (normally on the
-/// second request, or the third when the range end crosses a CBOR integer width
-/// such as 65,536). If the end sits within a few bytes of such a boundary there may
-/// be no size that fits, and signing fails with `manifestSizeDidNotSettle`.
+/// size, and repeats with the size the server reports until the two match (normally
+/// on the second request, or the third when the range end crosses a CBOR integer
+/// width such as 65,536). The server either answers 422 with the length it needs
+/// (`ServiceError.exclusionLengthMismatch`) or, if it predates that check, returns a
+/// manifest of a different size. If the end sits within a few bytes of such a
+/// boundary there may be no size that fits, and signing fails with
+/// `manifestSizeDidNotSettle`.
 public struct C2PAServerSigner: Sendable {
     typealias SignManifest = @Sendable (C2PASignRequest) async throws -> Data
 
@@ -80,12 +83,18 @@ public struct C2PAServerSigner: Sendable {
         var reserved = Self.initialReservation
         for attempt in 1...Self.maxRequests {
             let range = C2PAExclusionRange(start: fileSize, end: fileSize + UInt64(reserved), boxType: "uuid")
-            let jumbf = try await signManifest(C2PASignRequest(
-                contentHash: contentHash,
-                exclusionRanges: [range],
-                containerFormat: format,
-                metadata: metadata
-            ))
+            let jumbf: Data
+            do {
+                jumbf = try await signManifest(C2PASignRequest(
+                    contentHash: contentHash,
+                    exclusionRanges: [range],
+                    containerFormat: format,
+                    metadata: metadata
+                ))
+            } catch C2PASigningService.ServiceError.exclusionLengthMismatch(let requiredLength) {
+                reserved = requiredLength
+                continue
+            }
             let box = C2PAManifestBox.make(jumbf: jumbf)
             if box.count == reserved {
                 try Self.write(inputFile, appending: box, to: outputFile)

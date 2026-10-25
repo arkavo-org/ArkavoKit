@@ -5,6 +5,7 @@ import XCTest
 final class C2PASigningServiceTests: XCTestCase {
     override func tearDown() {
         StubURLProtocol.handler = nil
+        StubURLProtocol.responseHeaders = [:]
     }
 
     func testPostsTheSignRequestAsSnakeCaseJSON() async throws {
@@ -113,6 +114,33 @@ final class C2PASigningServiceTests: XCTestCase {
         }
     }
 
+    func testUnprocessableReportsTheExclusionLengthTheServerRequires() async throws {
+        StubURLProtocol.handler = { _, _ in
+            (422, Data(#"{"error":"exclusion range length must equal the C2PA manifest box length","status":"error","required_exclusion_length":14032}"#.utf8))
+        }
+
+        do {
+            _ = try await makeService().signManifest(sampleRequest())
+            XCTFail("expected exclusionLengthMismatch")
+        } catch C2PASigningService.ServiceError.exclusionLengthMismatch(let requiredLength) {
+            XCTAssertEqual(requiredLength, 14032)
+        }
+    }
+
+    func testTooManyRequestsCarriesRetryAfter() async throws {
+        StubURLProtocol.responseHeaders = ["Retry-After": "30"]
+        StubURLProtocol.handler = { _, _ in
+            (429, Data(#"{"error":"Too many signing requests","status":"error"}"#.utf8))
+        }
+
+        do {
+            _ = try await makeService().signManifest(sampleRequest())
+            XCTFail("expected rateLimited")
+        } catch C2PASigningService.ServiceError.rateLimited(let retryAfter) {
+            XCTAssertEqual(retryAfter, 30)
+        }
+    }
+
     func testRejectsASuccessResponseWithoutAManifest() async throws {
         StubURLProtocol.handler = { _, _ in (200, Data(#"{"status":"success"}"#.utf8)) }
 
@@ -165,6 +193,7 @@ final class C2PASigningServiceTests: XCTestCase {
 final class StubURLProtocol: URLProtocol {
     /// Receives the request and its body (URLSession moves `httpBody` into a stream).
     nonisolated(unsafe) static var handler: ((URLRequest, Data?) -> (Int, Data))?
+    nonisolated(unsafe) static var responseHeaders: [String: String] = [:]
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -175,7 +204,9 @@ final class StubURLProtocol: URLProtocol {
             return
         }
         let (status, body) = handler(request, Self.readBody(of: request))
-        let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!
+        let response = HTTPURLResponse(
+            url: request.url!, statusCode: status, httpVersion: nil, headerFields: Self.responseHeaders
+        )!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: body)
         client?.urlProtocolDidFinishLoading(self)

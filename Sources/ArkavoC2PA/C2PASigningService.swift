@@ -126,6 +126,11 @@ public struct C2PASigningService: Sendable {
         case unauthenticated(String)
         /// The server's creator allowlist does not include `metadata.creator`
         case creatorNotAuthorized(String)
+        /// The exclusion range was not the size of the signed manifest box. The server
+        /// discarded the manifest; ask again with a range of `requiredLength` bytes.
+        case exclusionLengthMismatch(requiredLength: Int)
+        /// Too many sign requests for this account; `retryAfter` is in seconds
+        case rateLimited(retryAfter: TimeInterval?)
         case server(statusCode: Int, message: String)
         case invalidResponse(String)
 
@@ -135,6 +140,11 @@ public struct C2PASigningService: Sendable {
                 return "C2PA signing needs an Arkavo sign-in: \(message)"
             case .creatorNotAuthorized(let message):
                 return "C2PA signing denied: \(message)"
+            case .exclusionLengthMismatch(let requiredLength):
+                return "C2PA signing needs a \(requiredLength)-byte manifest range"
+            case .rateLimited(let retryAfter):
+                return "Too many C2PA sign requests"
+                    + (retryAfter.map { "; retry in \(Int($0)) s" } ?? "")
             case .server(let statusCode, let message):
                 return "C2PA signing server error (HTTP \(statusCode)): \(message)"
             case .invalidResponse(let message):
@@ -186,6 +196,11 @@ public struct C2PASigningService: Sendable {
             throw ServiceError.unauthenticated(body?.message ?? body?.error ?? "authentication required")
         case 403:
             throw ServiceError.creatorNotAuthorized(body?.error ?? "creator not authorized")
+        case 422 where body?.requiredExclusionLength != nil:
+            throw ServiceError.exclusionLengthMismatch(requiredLength: body?.requiredExclusionLength ?? 0)
+        case 429:
+            let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap(TimeInterval.init)
+            throw ServiceError.rateLimited(retryAfter: retryAfter)
         default:
             let message = body?.error ?? String(decoding: data, as: UTF8.self)
             throw ServiceError.server(statusCode: http.statusCode, message: message)
@@ -196,5 +211,13 @@ public struct C2PASigningService: Sendable {
         let manifest: String?
         let error: String?
         let message: String?
+        let requiredExclusionLength: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case manifest
+            case error
+            case message
+            case requiredExclusionLength = "required_exclusion_length"
+        }
     }
 }

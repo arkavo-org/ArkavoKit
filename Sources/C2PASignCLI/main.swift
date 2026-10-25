@@ -145,7 +145,8 @@ struct C2PASignCLI {
         Options:
           --server URL          Signing server (default: \(C2PASigningService.defaultServerURL))
           --title TITLE         Manifest title (default: input file name)
-          --creator NAME        Creator recorded in the manifest (default: Arkavo c2pa-sign)
+          --creator NAME        Creator sent in the metadata (default: Arkavo c2pa-sign);
+                                platform.arkavo.net records the token's subject instead
           --token CWT           identity.arkavo.net passkey token sent as the bearer
                                 (default: $ARKAVO_TOKEN)
           --trust-anchors PEM   Trust these CAs; expects Trusted instead of Valid
