@@ -57,13 +57,19 @@ final class C2PAVerifierTests: XCTestCase {
         XCTAssertEqual(request.httpMethod, "POST")
         XCTAssertEqual(request.url?.absoluteString, "https://signer.test/c2pa/v1/validate")
         XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
-        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(body)) as? [String: String])
-        XCTAssertEqual(json["manifest"].flatMap { Data(base64Encoded: $0) }, jumbf)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(body)) as? [String: Any])
+        XCTAssertEqual((json["manifest"] as? String).flatMap { Data(base64Encoded: $0) }, jumbf)
 
         let bytes = try Data(contentsOf: signed)
         let box = try XCTUnwrap(Self.manifestBoxRange(in: bytes))
         XCTAssertEqual(box.count, C2PAManifestBox.headerSize + jumbf.count)
-        XCTAssertEqual(json["content_hash"], Self.sha256Hex(bytes, excluding: box))
+        XCTAssertEqual(json["content_hash"] as? String, Self.sha256Hex(bytes, excluding: box))
+        // The server checks the box is where, and the size, it was signed (arkavo-rs#123)
+        let ranges = try XCTUnwrap(json["exclusion_ranges"] as? [[String: Any]])
+        XCTAssertEqual(ranges.count, 1)
+        XCTAssertEqual(ranges.first?["start"] as? Int, box.lowerBound)
+        XCTAssertEqual(ranges.first?["end"] as? Int, box.upperBound)
+        XCTAssertEqual(ranges.first?["box_type"] as? String, "uuid")
     }
 
     // MARK: - The box must be where and how it was signed
@@ -275,8 +281,8 @@ final class C2PAVerifierTests: XCTestCase {
     }
 
     private func contentHash(of request: (URLRequest, Data?)) throws -> String? {
-        let json = try JSONSerialization.jsonObject(with: XCTUnwrap(request.1)) as? [String: String]
-        return json?["content_hash"]
+        let json = try JSONSerialization.jsonObject(with: XCTUnwrap(request.1)) as? [String: Any]
+        return json?["content_hash"] as? String
     }
 
     private func mdatPayloadRange(_ data: Data) -> Range<Int>? {

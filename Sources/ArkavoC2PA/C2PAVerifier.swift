@@ -86,7 +86,8 @@ public struct C2PAVerifier: Sendable {
     /// bytes. Only the box arks signs is accepted: right after `ftyp`, holding exactly
     /// the manifest store (arks negotiates the box to the manifest's size). Anything
     /// else, a damaged file, or a box with no manifest store is `.invalid` without a
-    /// network call.
+    /// network call. The box's range is also sent, so the server can check it is the
+    /// exclusion the manifest was signed with.
     public func verify(_ file: URL) async throws -> C2PAVerification {
         let handle = try FileHandle(forReadingFrom: file)
         defer { try? handle.close() }
@@ -112,8 +113,9 @@ public struct C2PAVerifier: Sendable {
             return Self.malformed("the C2PA box is not the size it was signed at")
         }
 
-        let contentHash = try Self.sha256Hex(of: handle, size: scan.fileSize, excluding: box.offset..<box.offset + box.size)
-        return try await validate(manifestStore: manifestStore, contentHash: contentHash)
+        let boxRange = box.offset..<box.offset + box.size
+        let contentHash = try Self.sha256Hex(of: handle, size: scan.fileSize, excluding: boxRange)
+        return try await validate(manifestStore: manifestStore, contentHash: contentHash, boxRange: boxRange)
     }
 
     // MARK: - Box
@@ -169,14 +171,18 @@ public struct C2PAVerifier: Sendable {
 
     // MARK: - Server
 
-    private func validate(manifestStore: Data, contentHash: String) async throws -> C2PAVerification {
+    /// The box range goes with the request so the server can check it is the exclusion the
+    /// manifest was signed with (arkavo-rs#123). A store that grew inside the box passes
+    /// the local checks above; only the signed exclusion catches it.
+    private func validate(manifestStore: Data, contentHash: String, boxRange: Range<UInt64>) async throws -> C2PAVerification {
         var request = URLRequest(url: serverURL.appendingPathComponent("c2pa/v1/validate"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONEncoder().encode([
-            "manifest": manifestStore.base64EncodedString(),
-            "content_hash": contentHash,
-        ])
+        request.httpBody = try JSONEncoder().encode(ValidateRequest(
+            manifest: manifestStore.base64EncodedString(),
+            contentHash: contentHash,
+            exclusionRanges: [C2PAExclusionRange(start: boxRange.lowerBound, end: boxRange.upperBound, boxType: "uuid")]
+        ))
 
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else {
@@ -212,6 +218,19 @@ public struct C2PAVerifier: Sendable {
         if let date = formatter.date(from: text) { return date }
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter.date(from: text)
+    }
+
+    /// arkavo-rs `C2paValidateRequest`
+    private struct ValidateRequest: Encodable {
+        let manifest: String
+        let contentHash: String
+        let exclusionRanges: [C2PAExclusionRange]
+
+        enum CodingKeys: String, CodingKey {
+            case manifest
+            case contentHash = "content_hash"
+            case exclusionRanges = "exclusion_ranges"
+        }
     }
 
     /// arkavo-rs `C2paValidateResponse`
