@@ -28,9 +28,22 @@ struct C2PASignCLI {
             printError("c2patool not found in PATH (brew install c2patool)")
             exit(1)
         }
-        if options.force {
-            try? FileManager.default.removeItem(at: options.output)
+        if isSameFile(options.input, options.output) {
+            printError("input and output are the same file")
+            exit(1)
         }
+        var isDirectory: ObjCBool = false
+        let outputExists = FileManager.default.fileExists(atPath: options.output.path, isDirectory: &isDirectory)
+        if isDirectory.boolValue {
+            printError("output is a directory: \(options.output.path)")
+            exit(1)
+        }
+        // With --force, sign to a temporary file and replace the output only once signing
+        // succeeds, so a failed run leaves the old output in place
+        let destination = options.force
+            ? options.output.deletingLastPathComponent()
+                .appendingPathComponent(".\(options.output.lastPathComponent).\(UUID().uuidString).c2pa-sign")
+            : options.output
 
         print("============================================")
         print("C2PA Sign CLI")
@@ -57,7 +70,19 @@ struct C2PASignCLI {
         print("\n--- Sign ---")
         let embedded: C2PAEmbeddedManifest
         do {
-            embedded = try await signer.sign(inputFile: options.input, outputFile: options.output, metadata: metadata)
+            embedded = try await signer.sign(inputFile: options.input, outputFile: destination, metadata: metadata)
+            if destination != options.output {
+                do {
+                    if outputExists {
+                        _ = try FileManager.default.replaceItemAt(options.output, withItemAt: destination)
+                    } else {
+                        try FileManager.default.moveItem(at: destination, to: options.output)
+                    }
+                } catch {
+                    try? FileManager.default.removeItem(at: destination)
+                    throw error
+                }
+            }
         } catch {
             print("  FAIL: \(error.localizedDescription)")
             exit(1)
@@ -152,12 +177,23 @@ struct C2PASignCLI {
           --token CWT           identity.arkavo.net passkey token sent as the bearer
                                 (default: $ARKAVO_TOKEN)
           --trust-anchors PEM   Trust these CAs; expects Trusted instead of Valid
-          --force               Replace the output file if it exists
+          --force               Replace the output file if it exists, once signing succeeds
         """)
     }
 
     static func printError(_ message: String) {
         fputs("Error: \(message)\n", stderr)
+    }
+
+    /// Whether two paths name the same file, including through hard links and
+    /// case-insensitive names
+    static func isSameFile(_ a: URL, _ b: URL) -> Bool {
+        let keys: Set<URLResourceKey> = [.fileResourceIdentifierKey]
+        guard let first = try? a.resourceValues(forKeys: keys).fileResourceIdentifier,
+              let second = try? b.resourceValues(forKeys: keys).fileResourceIdentifier else {
+            return a.standardizedFileURL.resolvingSymlinksInPath() == b.standardizedFileURL.resolvingSymlinksInPath()
+        }
+        return first.isEqual(second)
     }
 
     static func findExecutable(_ name: String) -> URL? {

@@ -55,6 +55,9 @@ public struct C2PAServerSigner: Sendable {
     /// change between the two requests, so the second one fits.
     static let defaultReservation = 48 * 1024
     static let maxRequests = 4
+    /// Largest `moov` the signer reads into memory. An hour of 60 fps video with audio
+    /// has a `moov` of a few MiB.
+    static let maxMoovSize = 128 * 1024 * 1024
     static let readChunkSize = 1024 * 1024
 
     private let signManifest: SignManifest
@@ -115,6 +118,7 @@ public struct C2PAServerSigner: Sendable {
                 inputFile,
                 layout: layout,
                 box: C2PAManifestBox.make(jumbf: jumbf, size: boxSize),
+                contentHash: contentHash,
                 to: outputFile
             )
             return C2PAEmbeddedManifest(
@@ -153,6 +157,9 @@ public struct C2PAServerSigner: Sendable {
         guard ranges.count == 1, let range = ranges.first else {
             throw SigningError.unsupportedContainer("expected exactly one 'moov' box, found \(ranges.count)")
         }
+        guard range.count <= UInt64(maxMoovSize) else {
+            throw SigningError.unsupportedContainer("'moov' box is too large (\(range.count) bytes)")
+        }
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
         try handle.seek(toOffset: range.lowerBound)
@@ -165,12 +172,24 @@ public struct C2PAServerSigner: Sendable {
     /// SHA-256 of the output the layout describes, without the manifest box
     private static func sha256Hex(of input: URL, layout: BMFFManifestLayout) throws -> String {
         var hasher = SHA256()
-        try stream(input, layout: layout, box: nil) { hasher.update(data: $0) }
-        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        try stream(input, layout: layout, box: nil) { chunk, _ in hasher.update(data: chunk) }
+        return hex(hasher)
     }
 
-    /// Writes the output to a temporary file next to `output`, then moves it into place
-    private static func write(_ input: URL, layout: BMFFManifestLayout, box: Data, to output: URL) throws {
+    private static func hex(_ hasher: SHA256) -> String {
+        hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Writes the output to a temporary file next to `output`, then moves it into place.
+    /// The bytes written are hashed again, so an input that changed after it was hashed
+    /// for the sign request fails instead of producing a manifest that doesn't verify.
+    private static func write(
+        _ input: URL,
+        layout: BMFFManifestLayout,
+        box: Data,
+        contentHash: String,
+        to output: URL
+    ) throws {
         let temporary = output.deletingLastPathComponent()
             .appendingPathComponent(".\(output.lastPathComponent).\(UUID().uuidString).c2pa-tmp")
         guard FileManager.default.createFile(atPath: temporary.path, contents: nil) else {
@@ -178,12 +197,19 @@ public struct C2PAServerSigner: Sendable {
         }
         do {
             let handle = try FileHandle(forWritingTo: temporary)
+            var hasher = SHA256()
             do {
-                try stream(input, layout: layout, box: box) { try handle.write(contentsOf: $0) }
+                try stream(input, layout: layout, box: box) { chunk, isManifestBox in
+                    if !isManifestBox { hasher.update(data: chunk) }
+                    try handle.write(contentsOf: chunk)
+                }
                 try handle.close()
             } catch {
                 try? handle.close()
                 throw error
+            }
+            guard hex(hasher) == contentHash else {
+                throw SigningError.unsupportedContainer("the input file changed while signing")
             }
             try FileManager.default.moveItem(at: temporary, to: output)
         } catch {
@@ -192,21 +218,22 @@ public struct C2PAServerSigner: Sendable {
         }
     }
 
-    /// Feeds the layout's bytes in order; the manifest box only when `box` is given
+    /// Feeds the layout's bytes in order, each with whether it is the manifest box;
+    /// the box only when `box` is given
     private static func stream(
         _ input: URL,
         layout: BMFFManifestLayout,
         box: Data?,
-        body: (Data) throws -> Void
+        body: (Data, Bool) throws -> Void
     ) throws {
         let handle = try FileHandle(forReadingFrom: input)
         defer { try? handle.close() }
         for segment in layout.segments {
             switch segment {
             case .manifestBox:
-                if let box { try body(box) }
+                if let box { try body(box, true) }
             case .bytes(let data):
-                try body(data)
+                try body(data, false)
             case .input(let range):
                 try handle.seek(toOffset: range.lowerBound)
                 var remaining = range.upperBound - range.lowerBound
@@ -217,7 +244,7 @@ public struct C2PAServerSigner: Sendable {
                     guard let chunk, !chunk.isEmpty else {
                         throw SigningError.unsupportedContainer("the input file changed while signing")
                     }
-                    try body(chunk)
+                    try body(chunk, false)
                     remaining -= UInt64(chunk.count)
                 }
             }

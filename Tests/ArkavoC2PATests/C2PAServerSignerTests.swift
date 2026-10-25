@@ -376,7 +376,135 @@ final class C2PAServerSignerTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: output), Data("keep me".utf8))
     }
 
+    // MARK: - Untrusted input
+
+    func testSignRefusesAChunkOffsetThatWouldOverflow() async throws {
+        let movie = makeMovie(payloadSize: 32, moovFirst: false, table: .co64, extraOffsets: [UInt64.max - 100])
+        try await assertUnsupported(movie.bytes)
+    }
+
+    func testSignDoesNotRecurseIntoBoxesOffTheChunkTablePath() async throws {
+        // 100,000 `moov` boxes nested in one another inside the real `moov`. Only
+        // trak/mdia/minf/stbl lead to chunk tables, so these are copied, not walked.
+        let depth = 100_000
+        var nested = Data(capacity: depth * 8)
+        for level in 0..<depth {
+            nested.append(bigEndian: UInt32(8 * (depth - level)))
+            nested.append(contentsOf: Array("moov".utf8))
+        }
+        let chunk = UInt64(ftypBox().count + 8)
+        let trak = { (offset: UInt64) in box("trak", box("mdia", box("minf", box("stbl", chunkTable(.stco, [offset]))))) }
+        let input = try writeFile("in.mov", ftypBox() + box("mdat", Data(repeating: 7, count: 32)) + box("moov", nested + trak(chunk)))
+        let output = directory.appendingPathComponent("out.mov")
+        let signer = C2PAServerSigner(reservation: 4096) { _ in Data(count: 100) }
+
+        _ = try await signer.sign(inputFile: input, outputFile: output, metadata: metadata())
+
+        let expectedMoov = box("moov", nested + trak(chunk + 4096))
+        XCTAssertEqual(try Data(contentsOf: output).suffix(expectedMoov.count), expectedMoov)
+    }
+
+    func testSignRefusesAnOversizedMoovBeforeReadingIt() async throws {
+        // A sparse file whose `moov` claims more than the signer will hold in memory
+        let size = UInt64(C2PAServerSigner.maxMoovSize) + 1
+        var header = ftypBox()
+        header.append(bigEndian: UInt32(1))
+        header.append(contentsOf: Array("moov".utf8))
+        header.append(bigEndian: size)
+        let input = try writeFile("in.mov", header)
+        let handle = try FileHandle(forWritingTo: input)
+        try handle.truncate(atOffset: UInt64(ftypBox().count) + size)
+        try handle.close()
+        let output = directory.appendingPathComponent("out.mov")
+        let signer = C2PAServerSigner { _ in
+            XCTFail("server should not be called")
+            return Data()
+        }
+
+        do {
+            _ = try await signer.sign(inputFile: input, outputFile: output, metadata: metadata())
+            XCTFail("expected unsupportedContainer")
+        } catch C2PAServerSigner.SigningError.unsupportedContainer(let reason) {
+            XCTAssertTrue(reason.contains("too large"), reason)
+        }
+    }
+
+    func testSignFailsWhenTheInputChangesWhileTheServerSigns() async throws {
+        let movie = makeMovie(payloadSize: 1000, moovFirst: false)
+        let input = try writeFile("in.mov", movie.bytes)
+        let output = directory.appendingPathComponent("out.mov")
+        var changed = movie.bytes
+        changed[changed.startIndex + Int(movie.chunkOffsets[1])] ^= 0xFF
+        let signer = C2PAServerSigner(reservation: 4096) { [changed] _ in
+            try changed.write(to: input)
+            return Data(count: 100)
+        }
+
+        do {
+            _ = try await signer.sign(inputFile: input, outputFile: output, metadata: metadata())
+            XCTFail("expected unsupportedContainer")
+        } catch C2PAServerSigner.SigningError.unsupportedContainer(let reason) {
+            XCTAssertTrue(reason.contains("changed"), reason)
+        }
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), ["in.mov"])
+    }
+
+    func testSignRefusesMoviesWithExternalMediaReferences() async throws {
+        // A data reference without the self-contained flag points at media in another
+        // file, so its chunk offsets are not offsets into this one.
+        try await assertUnsupported(movieWithDataReference(fullBox("url ", Data("file:///elsewhere.mov\0".utf8))))
+    }
+
+    func testSignAcceptsSelfContainedDataReferences() async throws {
+        let input = try writeFile("in.mov", movieWithDataReference(box("url ", Data([0, 0, 0, 1]))))
+        let output = directory.appendingPathComponent("out.mov")
+        let signer = C2PAServerSigner(reservation: 4096) { _ in Data(count: 100) }
+
+        _ = try await signer.sign(inputFile: input, outputFile: output, metadata: metadata())
+
+        XCTAssertEqual(try chunkOffsets(Data(contentsOf: output)), .stco([28 + 4096]))
+    }
+
+    func testSignSettlesChunkOffsetsThatCrossFourGiBOneTrackAtATime() async throws {
+        // `moov` comes first. Each track's chunk crosses 4 GiB only after the tracks
+        // before it turned co64 and grew `moov` by 4 bytes each: five layout passes.
+        let reservation: UInt64 = 8192
+        let limit = UInt64(UInt32.max)
+        let offsets = [limit - reservation + 1, limit - reservation - 3, limit - reservation - 7, limit - reservation - 11]
+        let traks = offsets.map { box("trak", box("mdia", box("minf", box("stbl", chunkTable(.stco, [$0]))))) }
+        let input = try writeFile("in.mov", ftypBox() + box("moov", traks.reduce(Data(), +)) + box("mdat", Data(count: 32)))
+        let output = directory.appendingPathComponent("out.mov")
+        let signer = C2PAServerSigner(reservation: Int(reservation)) { _ in Data(count: 100) }
+
+        _ = try await signer.sign(inputFile: input, outputFile: output, metadata: metadata())
+
+        let signed = try Data(contentsOf: output)
+        guard let moov = parseBoxes(signed, in: 0..<signed.count).first(where: { $0.type == "moov" }) else {
+            return XCTFail("no moov")
+        }
+        let tables = parseBoxes(signed, in: moov.payload).map { trak -> ChunkOffsets? in
+            var level = parseBoxes(signed, in: trak.payload)
+            for type in ["mdia", "minf", "stbl"] {
+                guard let parent = level.first(where: { $0.type == type }) else { return nil }
+                level = parseBoxes(signed, in: parent.payload)
+            }
+            guard let table = level.first, table.type == "co64" else { return nil }
+            return .co64([signed.subdata(in: table.payload.lowerBound + 8..<table.payload.lowerBound + 16)
+                .reduce(0) { $0 << 8 | UInt64($1) }])
+        }
+        XCTAssertEqual(tables, offsets.map { .co64([$0 + reservation + 16]) })
+    }
+
     // MARK: - Helpers
+
+    /// `ftyp`, `mdat` with a chunk at 28, and a `moov` whose `dinf/dref` holds `entry`
+    private func movieWithDataReference(_ entry: Data) -> Data {
+        var dref = Data()
+        dref.append(bigEndian: UInt32(1))
+        dref.append(entry)
+        let minf = box("minf", box("dinf", fullBox("dref", dref)) + box("stbl", chunkTable(.stco, [28])))
+        return ftypBox() + box("mdat", Data(repeating: 1, count: 32)) + box("moov", box("trak", box("mdia", minf)))
+    }
 
     private func assertUnsupported(_ bytes: Data, file: StaticString = #filePath, line: UInt = #line) async throws {
         try await assertRefused(bytes, file: file, line: line) { error in
