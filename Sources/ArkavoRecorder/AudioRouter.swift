@@ -7,6 +7,8 @@ public class AudioRouter {
 
     private var sources: [String: AudioSource] = [:]
     private var converters: [String: AudioFormatConverter] = [:]
+    /// Guards `converters` and `sampleCount`: each source delivers on its own capture queue
+    private let lock = NSLock()
 
     /// Target output format (48kHz stereo PCM for AAC encoding)
     private let targetSampleRate: Double = 48000.0
@@ -36,7 +38,7 @@ public class AudioRouter {
         )
 
         sources[sourceID] = source
-        converters[sourceID] = converter
+        lock.lock(); converters[sourceID] = converter; lock.unlock()
 
         // Set up callback to receive samples from this source
         source.onSample = { [weak self] sampleBuffer in
@@ -51,7 +53,7 @@ public class AudioRouter {
     public func removeSource(_ sourceID: String) {
         sources[sourceID]?.onSample = nil
         sources.removeValue(forKey: sourceID)
-        converters.removeValue(forKey: sourceID)
+        lock.lock(); converters.removeValue(forKey: sourceID); lock.unlock()
 
         print("🎛️ AudioRouter: Removed source [\(sourceID)]")
     }
@@ -110,16 +112,18 @@ public class AudioRouter {
     private var sampleCount: [String: Int] = [:]
 
     private func processSample(_ sampleBuffer: CMSampleBuffer, from sourceID: String) {
+        lock.lock()
+        let isFirstSample = sampleCount[sourceID] == nil
+        sampleCount[sourceID, default: 0] += 1
+        let converter = converters[sourceID]
+        lock.unlock()
+
         // Log first sample from each source
-        if sampleCount[sourceID] == nil {
+        if isFirstSample {
             print("🎵 AudioRouter: First sample received from [\(sourceID)]")
-            sampleCount[sourceID] = 0
         }
-        sampleCount[sourceID]! += 1
 
-        // Removed excessive logging - sample count tracking still maintained for debugging if needed
-
-        guard let converter = converters[sourceID] else {
+        guard let converter else {
             print("⚠️ AudioRouter: No converter for source [\(sourceID)]")
             return
         }
