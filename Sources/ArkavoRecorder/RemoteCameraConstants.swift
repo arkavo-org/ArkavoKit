@@ -14,6 +14,14 @@ public enum RemoteCameraConstants {
     /// Maximum receive buffer size (1 MB)
     public static let maxReceiveBufferSize = 1_048_576
 
+    /// Largest newline-delimited message the server holds for a peer (4 MiB). A connection
+    /// that sends more without a newline is closed. At the 3 Mbps default with a keyframe
+    /// every 2 s, a keyframe is a few hundred KiB, about a third more as base64 in JSON.
+    public static let maxMessageSize = 4 * 1_048_576
+
+    /// Most peers the server accepts at once; further connections are refused
+    public static let maxConnections = 8
+
     // MARK: - Timeouts & Intervals
 
     /// Discovery timeout in seconds (10 seconds)

@@ -29,7 +29,7 @@ public final class RemoteCameraServer: NSObject, @unchecked Sendable {
     private struct ConnectionState {
         let id: UUID
         let connection: NWConnection
-        var buffer = Data()
+        var framer = NDJSONFramer(maxMessageSize: RemoteCameraConstants.maxMessageSize)
         var sourceID: String?
     }
 
@@ -116,6 +116,12 @@ public final class RemoteCameraServer: NSObject, @unchecked Sendable {
     }
 
     private func handleNewConnection(_ connection: NWConnection) {
+        // Peers are unauthenticated, so bound how many the server holds state for
+        guard connections.count < RemoteCameraConstants.maxConnections else {
+            print("⚠️ RemoteCameraServer: refusing connection, \(RemoteCameraConstants.maxConnections) already open")
+            connection.cancel()
+            return
+        }
         let id = UUID()
         var state = ConnectionState(id: id, connection: connection)
         connections[id] = state
@@ -163,17 +169,24 @@ public final class RemoteCameraServer: NSObject, @unchecked Sendable {
                 return
             }
 
+            // `append` closes a connection that broke the message limit
+            guard self.connections[id] != nil else { return }
             self.receive(on: connection, id: id)
         }
     }
 
     private func append(data: Data, to id: UUID) {
         guard var state = connections[id] else { return }
-        state.buffer.append(data)
+        let packets: [Data]
+        do {
+            packets = try state.framer.append(data)
+        } catch {
+            print("⚠️ RemoteCameraServer: closing connection, a message exceeded \(RemoteCameraConstants.maxMessageSize) bytes")
+            cleanupConnection(id: id)
+            return
+        }
 
-        while let newlineRange = state.buffer.firstRange(of: Data([0x0A])) {
-            let packet = state.buffer.subdata(in: 0 ..< newlineRange.lowerBound)
-            state.buffer.removeSubrange(0 ... newlineRange.lowerBound)
+        for packet in packets {
             processPacket(packet, from: id, state: &state)
         }
 
