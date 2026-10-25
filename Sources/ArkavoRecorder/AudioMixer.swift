@@ -62,6 +62,16 @@ public final class AudioMixer: @unchecked Sendable {
         lock.lock(); registeredSourceIDs.insert(sourceID); lock.unlock()
     }
 
+    /// Forgets a source the router removed, with its queued audio, so it no longer
+    /// keeps the voice from becoming the clock.
+    func unregisterSource(_ sourceID: String) {
+        lock.lock()
+        registeredSourceIDs.remove(sourceID)
+        fifos.removeValue(forKey: sourceID)
+        if clockSourceID == sourceID { clockSourceID = nil }
+        lock.unlock()
+    }
+
     public func setGain(_ gain: Float, for sourceID: String) {
         lock.lock(); sourceGains[sourceID] = max(0, min(1, gain)); lock.unlock()
     }

@@ -201,6 +201,25 @@ public final class RecordingSession: Sendable {
         routerSourceIDs.isEmpty ? [] : [AudioMixer.outputSourceID]
     }
 
+    /// Router sources the current settings no longer want. The microphone and screen audio
+    /// follow the settings; other sources (the Muse voice) belong to whoever added them.
+    nonisolated static func unwantedAudioSourceIDs(in routerSourceIDs: [String], microphone: Bool, screenAudio: Bool) -> [String] {
+        routerSourceIDs.filter { ($0 == "microphone" && !microphone) || ($0 == "screen" && !screenAudio) }
+    }
+
+    /// Stops and removes the microphone or screen audio when the settings turned it off.
+    /// A session is reused, so a source added for an earlier recording or stream would
+    /// otherwise be started again and captured.
+    private func removeUnwantedAudioSources(microphone: Bool) async {
+        let unwanted = Self.unwantedAudioSourceIDs(
+            in: audioRouter.allSourceIDs, microphone: microphone, screenAudio: enableScreenAudio
+        )
+        for sourceID in unwanted {
+            await audioRouter.stopAndRemoveSource(sourceID)
+            audioMixer.unregisterSource(sourceID)
+        }
+    }
+
     /// Drops queued audio and the clock choice so nothing carries over between sessions.
     private func resetAudioMixer() {
         audioMixer.reset()
@@ -334,6 +353,7 @@ public final class RecordingSession: Sendable {
         }
 
         // STEP 2: Add audio sources to audio router (but don't start yet)
+        await removeUnwantedAudioSources(microphone: mode.needsMicrophone)
         resetAudioMixer()
         if mode.needsMicrophone {
             print("🎙️ RecordingSession: Adding microphone to audio router")
@@ -454,12 +474,14 @@ public final class RecordingSession: Sendable {
         try? await audioRouter.stopAll()
         if !_streamingActive.withLock({ $0 }) { resetAudioMixer() }
 
+        // The recording is over even when finishing the file fails
+        defer {
+            _isRecording = false
+            recordingStartTime = nil
+        }
+
         // Finish encoding
         let result = try await encoder.finishRecording()
-
-        // Update local recording state
-        _isRecording = false
-        recordingStartTime = nil
 
         print("🛑 [RecordingSession] Recording stopped")
 
@@ -749,6 +771,7 @@ public final class RecordingSession: Sendable {
 
         // Add audio sources if not already added (streaming without recording)
         Task { @MainActor in
+            await removeUnwantedAudioSources(microphone: mode.needsMicrophone)
             if mode.needsMicrophone && !audioRouter.allSourceIDs.contains("microphone") {
                 let micSource = audioRouter.addMicrophone()
                 micSource.onLevelUpdate = { @Sendable [weak self] level in
