@@ -263,6 +263,36 @@ final class C2PAServerSignerTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), ["in.mov"])
     }
 
+    func testSignRefusesAnOutOfRangeLengthFromTheServer() async throws {
+        for bad in [-1, 0, C2PAManifestBox.headerSize - 1, C2PAManifestBox.maxSize + 1, Int.max] {
+            let input = try writeFile("in-\(UUID().uuidString).mov", makeMovie(payloadSize: 64, moovFirst: false).bytes)
+            let output = directory.appendingPathComponent("out-\(UUID().uuidString).mov")
+            let signer = C2PAServerSigner(reservation: 4096) { _ in
+                throw C2PASigningService.ServiceError.exclusionLengthMismatch(requiredLength: bad)
+            }
+
+            do {
+                _ = try await signer.sign(inputFile: input, outputFile: output, metadata: metadata())
+                XCTFail("expected invalidResponse for \(bad)")
+            } catch C2PASigningService.ServiceError.invalidResponse {
+            }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+        }
+    }
+
+    func testSignRefusesAManifestTooLargeForAnyBox() async throws {
+        let input = try writeFile("in.mov", makeMovie(payloadSize: 64, moovFirst: false).bytes)
+        let output = directory.appendingPathComponent("out.mov")
+        let signer = C2PAServerSigner(reservation: 4096) { _ in Data(count: C2PAManifestBox.maxSize) }
+
+        do {
+            _ = try await signer.sign(inputFile: input, outputFile: output, metadata: metadata())
+            XCTFail("expected invalidResponse")
+        } catch C2PASigningService.ServiceError.invalidResponse {
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+    }
+
     func testSignMapsM4AToTheMP4ContainerFormat() async throws {
         let input = try writeFile("voice.m4a", makeMovie(payloadSize: 16, moovFirst: false).bytes)
         let output = directory.appendingPathComponent("voice-signed.m4a")

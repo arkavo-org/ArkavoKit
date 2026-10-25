@@ -103,10 +103,10 @@ public struct C2PAServerSigner: Sendable {
                     metadata: metadata
                 ))
             } catch C2PASigningService.ServiceError.exclusionLengthMismatch(let requiredLength) {
-                boxSize = requiredLength
+                boxSize = try Self.checkedBoxSize(requiredLength, from: "required_exclusion_length")
                 continue
             }
-            let needed = C2PAManifestBox.headerSize + jumbf.count
+            let needed = try Self.checkedBoxSize(C2PAManifestBox.headerSize + jumbf.count, from: "signed manifest size")
             guard needed <= boxSize else {
                 boxSize = needed
                 continue
@@ -124,6 +124,15 @@ public struct C2PAServerSigner: Sendable {
             )
         }
         throw SigningError.manifestSizeDidNotSettle(attempts: Self.maxRequests)
+    }
+
+    /// A box size that came from the server, refused unless it can hold the box header
+    /// and stays within `C2PAManifestBox.maxSize`
+    private static func checkedBoxSize(_ size: Int, from source: String) throws -> Int {
+        guard (C2PAManifestBox.headerSize...C2PAManifestBox.maxSize).contains(size) else {
+            throw C2PASigningService.ServiceError.invalidResponse("\(source) \(size) is out of range")
+        }
+        return size
     }
 
     /// The input's top-level boxes, checked for a manifest box to be written into
