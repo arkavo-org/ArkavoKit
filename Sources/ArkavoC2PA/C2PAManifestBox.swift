@@ -47,41 +47,57 @@ struct BMFFBox: Equatable {
         type == "uuid" && userType == C2PAManifestBox.c2paUUID
     }
 
+    /// The top-level boxes of a file, read up to the first one that doesn't parse
+    struct Scan {
+        let boxes: [BMFFBox]
+        let fileSize: UInt64
+        /// Whether the boxes run exactly to the end of the file
+        let isComplete: Bool
+    }
+
     /// Reads the top-level box headers. Returns nil when the file does not parse
     /// as a sequence of boxes that ends exactly at end of file.
     static func topLevelBoxes(in url: URL) throws -> [BMFFBox]? {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
+        let scan = try scan(handle)
+        return scan.isComplete ? scan.boxes : nil
+    }
+
+    /// Reads the top-level box headers through `handle`, keeping the boxes before any
+    /// damage, so a damaged file still shows what it held
+    static func scan(_ handle: FileHandle) throws -> Scan {
         let fileSize = try handle.seekToEnd()
 
         var boxes: [BMFFBox] = []
         var offset: UInt64 = 0
+        let damaged = { Scan(boxes: boxes, fileSize: fileSize, isComplete: false) }
         while offset < fileSize {
             try handle.seek(toOffset: offset)
-            guard let header = try handle.read(upToCount: 8), header.count == 8 else { return nil }
+            guard let header = try handle.read(upToCount: 8), header.count == 8 else { return damaged() }
             var size = UInt64(header.bigEndianUInt32(at: 0))
-            guard let type = String(bytes: header[4..<8], encoding: .ascii) else { return nil }
+            guard let type = String(bytes: header[4..<8], encoding: .ascii) else { return damaged() }
             var headerLength: UInt64 = 8
             if size == 1 {
-                guard let large = try handle.read(upToCount: 8), large.count == 8 else { return nil }
+                guard let large = try handle.read(upToCount: 8), large.count == 8 else { return damaged() }
                 size = large.bigEndianUInt64(at: 0)
                 headerLength = 16
             }
             var userType: Data?
             if type == "uuid" {
-                guard let extended = try handle.read(upToCount: 16), extended.count == 16 else { return nil }
+                guard let extended = try handle.read(upToCount: 16), extended.count == 16 else { return damaged() }
                 userType = extended
                 headerLength += 16
             }
             if size == 0 {
                 boxes.append(BMFFBox(type: type, offset: offset, size: 0, userType: userType))
-                return boxes
+                return Scan(boxes: boxes, fileSize: fileSize, isComplete: true)
             }
-            guard size >= headerLength, size <= fileSize - offset else { return nil }
+            guard size >= headerLength, size <= fileSize - offset else { return damaged() }
             boxes.append(BMFFBox(type: type, offset: offset, size: size, userType: userType))
             offset += size
         }
-        return boxes
+        return Scan(boxes: boxes, fileSize: fileSize, isComplete: true)
     }
 }
 

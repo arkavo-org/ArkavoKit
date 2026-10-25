@@ -47,9 +47,8 @@ final class C2PAVerifierTests: XCTestCase {
     // MARK: - Request
 
     func testVerifySendsTheManifestStoreAndTheHashOfTheBytesOutsideTheBox() async throws {
-        // The signer pads the store to its 4096-byte reservation; only the store is sent.
         let jumbf = Self.manifestStore(200)
-        let signed = try await sign("in.mov", jumbf: jumbf, reservation: 4096)
+        let signed = try await sign("in.mov", jumbf: jumbf)
 
         _ = try await verifier().verify(signed)
 
@@ -63,8 +62,66 @@ final class C2PAVerifierTests: XCTestCase {
 
         let bytes = try Data(contentsOf: signed)
         let box = try XCTUnwrap(Self.manifestBoxRange(in: bytes))
-        XCTAssertEqual(box.count, 4096)
+        XCTAssertEqual(box.count, C2PAManifestBox.headerSize + jumbf.count)
         XCTAssertEqual(json["content_hash"], Self.sha256Hex(bytes, excluding: box))
+    }
+
+    // MARK: - The box must be where and how it was signed
+
+    // The hash covers the bytes outside the box, wherever the box is. A box that grew or
+    // moved leaves those bytes unchanged while the media offsets point elsewhere, so the
+    // box must be exactly the one arks signs: right after ftyp, holding only the manifest.
+
+    func testAManifestBoxEnlargedWithPaddingIsInvalidWithoutARequest() async throws {
+        let bytes = try Data(contentsOf: try await sign("in.mov", jumbf: Self.manifestStore(200)))
+        let box = try XCTUnwrap(Self.manifestBoxRange(in: bytes))
+        var grown = Data(bytes[box])
+        grown.append(Data(count: 16))
+        grown.replaceSubrange(0..<4, with: Self.bigEndian(UInt32(grown.count)))
+
+        try await assertInvalidWithoutARequest(bytes[..<box.lowerBound] + grown + bytes[box.upperBound...])
+    }
+
+    func testAManifestBoxMovedAwayFromFtypIsInvalidWithoutARequest() async throws {
+        let bytes = try Data(contentsOf: try await sign("in.mov", jumbf: Self.manifestStore(200)))
+        let box = try XCTUnwrap(Self.manifestBoxRange(in: bytes))
+
+        try await assertInvalidWithoutARequest(bytes[..<box.lowerBound] + bytes[box.upperBound...] + bytes[box])
+    }
+
+    func testAManifestBoxRewrittenWithA64BitSizeIsInvalidWithoutARequest() async throws {
+        let bytes = try Data(contentsOf: try await sign("in.mov", jumbf: Self.manifestStore(200)))
+        let box = try XCTUnwrap(Self.manifestBoxRange(in: bytes))
+        var large = Self.bigEndian(UInt32(1)) + Data("uuid".utf8) + Self.bigEndian(UInt64(box.count + 8))
+        large.append(bytes[(box.lowerBound + 8)..<box.upperBound])
+
+        try await assertInvalidWithoutARequest(bytes[..<box.lowerBound] + large + bytes[box.upperBound...])
+    }
+
+    func testAPaddedManifestBoxIsInvalidWithoutARequest() async throws {
+        // arks always negotiates the exact box size, so a padded box was not signed by it
+        let signed = try await sign("in.mov", jumbf: Self.manifestStore(200), reservation: 4096)
+
+        try await assertInvalidWithoutARequest(try Data(contentsOf: signed))
+    }
+
+    // MARK: - Damaged files
+
+    func testASignedFileWithABytePastTheLastBoxIsInvalidNotNoManifest() async throws {
+        var bytes = try Data(contentsOf: try await sign("in.mov", jumbf: Self.manifestStore(200)))
+        bytes.append(0)
+        let damaged = try write("damaged.mov", bytes)
+
+        XCTAssertTrue(try C2PAVerifier.hasManifest(damaged))
+        try await assertInvalidWithoutARequest(bytes)
+    }
+
+    func testATruncatedSignedFileIsInvalidNotNoManifest() async throws {
+        let bytes = try Data(contentsOf: try await sign("in.mov", jumbf: Self.manifestStore(200)))
+        let truncated = try write("truncated.mov", bytes.dropLast(10))
+
+        XCTAssertTrue(try C2PAVerifier.hasManifest(truncated))
+        try await assertInvalidWithoutARequest(bytes.dropLast(10))
     }
 
     func testATamperedMediaByteChangesTheHashSent() async throws {
@@ -182,10 +239,27 @@ final class C2PAVerifierTests: XCTestCase {
         return C2PAVerifier(serverURL: URL(string: "https://signer.test")!, session: URLSession(configuration: configuration))
     }
 
-    private func sign(_ name: String, jumbf: Data, reservation: Int = 2048) async throws -> URL {
+    private func assertInvalidWithoutARequest(
+        _ bytes: Data,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let url = try write("altered-\(UUID().uuidString).mov", Data(bytes))
+        let result = try await verifier().verify(url)
+        guard case .invalid(let errors, _) = result else {
+            return XCTFail("expected .invalid, got \(result)", file: file, line: line)
+        }
+        XCTAssertFalse(errors.isEmpty, file: file, line: line)
+        XCTAssertTrue(requests.isEmpty, "decided locally, without a network call", file: file, line: line)
+    }
+
+    /// Signs with a box of exactly the manifest's size, as arks negotiates, unless a
+    /// larger `reservation` is given
+    private func sign(_ name: String, jumbf: Data, reservation: Int? = nil) async throws -> URL {
         let input = try write(name, makeMovie(payloadSize: 300, moovFirst: false).bytes)
         let output = directory.appendingPathComponent("signed-\(name)")
-        _ = try await C2PAServerSigner(reservation: reservation) { _ in jumbf }
+        let size = reservation ?? C2PAManifestBox.headerSize + jumbf.count
+        _ = try await C2PAServerSigner(reservation: size) { _ in jumbf }
             .sign(inputFile: input, outputFile: output, metadata: metadata())
         return output
     }
@@ -230,6 +304,10 @@ final class C2PAVerifierTests: XCTestCase {
         hasher.update(data: data.prefix(range.lowerBound))
         hasher.update(data: data.dropFirst(range.upperBound))
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func bigEndian<T: FixedWidthInteger>(_ value: T) -> Data {
+        withUnsafeBytes(of: value.bigEndian) { Data($0) }
     }
 
     /// A JUMBF manifest store: one `jumb` superbox with `payload` bytes

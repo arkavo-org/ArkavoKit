@@ -70,41 +70,57 @@ public struct C2PAVerifier: Sendable {
     /// `C2PAManifestBox.maxSize`; manifests from other signers can carry thumbnails.
     static let maxBoxSize: UInt64 = 16 * 1024 * 1024
 
-    /// Whether the file has a C2PA manifest box. Reads only box headers; no network.
+    /// Whether the file has a C2PA manifest box, even if the file is damaged after it.
+    /// Reads only box headers; no network.
     public static func hasManifest(_ file: URL) throws -> Bool {
-        try BMFFBox.topLevelBoxes(in: file)?.contains(where: \.isC2PAManifest) ?? false
+        let handle = try FileHandle(forReadingFrom: file)
+        defer { try? handle.close() }
+        return try BMFFBox.scan(handle).boxes.contains(where: \.isC2PAManifest)
     }
 
     /// Verifies the file's manifest with the signing server. Only the manifest and a
-    /// SHA-256 of the rest of the file are sent. A file without a manifest box, or
-    /// with a box that holds no manifest store, is answered without a network call.
+    /// SHA-256 of the rest of the file are sent.
+    ///
+    /// The hash covers the bytes outside the box wherever the box is, so a box that
+    /// grew or moved would leave it unchanged while the media offsets point at other
+    /// bytes. Only the box arks signs is accepted: right after `ftyp`, holding exactly
+    /// the manifest store (arks negotiates the box to the manifest's size). Anything
+    /// else, a damaged file, or a box with no manifest store is `.invalid` without a
+    /// network call.
     public func verify(_ file: URL) async throws -> C2PAVerification {
-        guard let box = try BMFFBox.topLevelBoxes(in: file)?.first(where: \.isC2PAManifest) else {
-            return .noManifest
-        }
         let handle = try FileHandle(forReadingFrom: file)
         defer { try? handle.close() }
-        let fileSize = try handle.seekToEnd()
-        let boxRange = box.offset..<(box.size == 0 ? fileSize : box.offset + box.size)
-
-        guard UInt64(boxRange.count) <= Self.maxBoxSize else {
-            return Self.malformed("the C2PA manifest box is \(boxRange.count) bytes")
+        let scan = try BMFFBox.scan(handle)
+        guard let box = scan.boxes.first(where: \.isC2PAManifest) else {
+            return .noManifest
         }
-        try handle.seek(toOffset: boxRange.lowerBound)
-        guard let boxData = try handle.read(upToCount: Int(boxRange.count)),
+        guard scan.isComplete else {
+            return Self.malformed("the file is damaged: its boxes don't end at the end of the file")
+        }
+        guard scan.boxes.count > 1, scan.boxes[0].type == "ftyp", scan.boxes[1] == box, box.size != 0 else {
+            return Self.malformed("the C2PA manifest box is not right after ftyp")
+        }
+        guard box.size <= Self.maxBoxSize else {
+            return Self.malformed("the C2PA manifest box is \(box.size) bytes")
+        }
+        try handle.seek(toOffset: box.offset)
+        guard let boxData = try handle.read(upToCount: Int(box.size)), boxData.count == Int(box.size),
               let manifestStore = Self.manifestStore(inBox: boxData) else {
             return Self.malformed("the C2PA box holds no manifest store")
         }
+        guard boxData == C2PAManifestBox.make(jumbf: manifestStore) else {
+            return Self.malformed("the C2PA box is not the size it was signed at")
+        }
 
-        let contentHash = try Self.sha256Hex(of: handle, size: fileSize, excluding: boxRange)
+        let contentHash = try Self.sha256Hex(of: handle, size: scan.fileSize, excluding: box.offset..<box.offset + box.size)
         return try await validate(manifestStore: manifestStore, contentHash: contentHash)
     }
 
     // MARK: - Box
 
     /// The manifest store in a C2PA box: the JUMBF after the box header, purpose
-    /// `manifest` and Merkle offset, cut to the store's own size because the box may
-    /// be zero-padded (spec A.5.3). Nil when the box doesn't hold one.
+    /// `manifest` and Merkle offset, cut to the store's own size. `verify` then requires
+    /// the box to hold nothing else. Nil when the box doesn't hold one.
     static func manifestStore(inBox box: Data) -> Data? {
         let bytes = [UInt8](box)
         var offset = 8
