@@ -24,9 +24,10 @@
 // )
 // ```
 //
-// Only the file's SHA-256 is sent; the server returns a signed manifest that
-// is appended to the file. Check the result with `c2patool <file>` or the
-// `c2pa-sign` CLI in this package.
+// Only a SHA-256 of the file leaves the device. The signed manifest goes in a
+// C2PA box right after `ftyp`, and the chunk offsets in `moov` are moved to
+// match. Check the result with `c2patool <file>` or the `c2pa-sign` CLI in this
+// package.
 //
 // ## Native signing usage
 //
