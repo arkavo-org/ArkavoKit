@@ -3,31 +3,28 @@ import Foundation
 
 /// Where a server-signed manifest was embedded
 public struct C2PAEmbeddedManifest: Sendable {
-    /// Hex SHA-256 of the asset with the manifest box left out
+    /// Hex SHA-256 of the signed file with the manifest box left out
     public let contentHash: String
-    /// Byte range of the appended C2PA manifest box in the output file
+    /// Byte range of the C2PA manifest box in the output file
     public let manifestRange: Range<UInt64>
-    /// Sign requests needed before the manifest fit its reserved range
+    /// Sign requests needed before the manifest fit its box
     public let requestCount: Int
 }
 
 /// Signs MOV, MP4 and M4A files with a C2PA manifest from the arkavo-rs signing server.
 ///
-/// The manifest box is appended at the end of the file. Inserting it after `ftyp`
-/// (where c2pa-rs writes it) would shift every `stco`/`co64` chunk offset and break
-/// playback unless the sample tables were rewritten. At the end, the original bytes
-/// are untouched, so the content hash is the SHA-256 of the input file and the box
-/// is the manifest's only hash exclusion.
+/// The manifest box goes right after `ftyp`, as the spec requires (A.5.3: before
+/// `moov` and the first `mdat`). Everything after it moves down by the box size, so
+/// the chunk offsets in `moov` are rewritten to match (`BMFFManifestLayout`). The
+/// content hash covers the output file except the box, which is the manifest's only
+/// hash exclusion.
 ///
-/// The exclusion range must be the exact size of the box, which is only known once
-/// the server has signed. The signer therefore requests a manifest for a reserved
-/// size, and repeats with the size the server reports until the two match (normally
-/// on the second request, or the third when the range end crosses a CBOR integer
-/// width such as 65,536). The server either answers 422 with the length it needs
-/// (`ServiceError.exclusionLengthMismatch`) or, if it predates that check, returns a
-/// manifest of a different size. If the end sits within a few bytes of such a
-/// boundary there may be no size that fits, and signing fails with
-/// `manifestSizeDidNotSettle`.
+/// The box has a fixed reserved size and the manifest is zero-padded to fill it, so
+/// the media moves once and, with a server that accepts padding, one sign request
+/// is enough. A server that wants a different box size answers 422 with the length
+/// it needs (`ServiceError.exclusionLengthMismatch`); the signer then lays the file
+/// out again with that size, hashes it again and asks once more. A manifest larger
+/// than the box gets the same treatment.
 public struct C2PAServerSigner: Sendable {
     typealias SignManifest = @Sendable (C2PASignRequest) async throws -> Data
 
@@ -51,21 +48,29 @@ public struct C2PAServerSigner: Sendable {
         }
     }
 
-    static let initialReservation = 16 * 1024
+    /// Room for the manifest store: a signed manifest with the Arkavo certificate
+    /// chain and an RFC 3161 timestamp is about 20 KiB. Kept under 64 KiB so the box
+    /// end stays below 65,536 like the exact size does: if a server without padding
+    /// support asks for the exact length, the CBOR width of the range end doesn't
+    /// change between the two requests, so the second one fits.
+    static let defaultReservation = 48 * 1024
     static let maxRequests = 4
-    static let hashChunkSize = 1024 * 1024
+    static let readChunkSize = 1024 * 1024
 
     private let signManifest: SignManifest
+    private let reservation: Int
 
     public init(service: C2PASigningService = C2PASigningService()) {
         self.signManifest = { try await service.signManifest($0) }
+        self.reservation = Self.defaultReservation
     }
 
-    init(signManifest: @escaping SignManifest) {
+    init(reservation: Int = defaultReservation, signManifest: @escaping SignManifest) {
         self.signManifest = signManifest
+        self.reservation = reservation
     }
 
-    /// Writes `inputFile` plus its C2PA manifest box to `outputFile`, which must not exist
+    /// Writes `inputFile` with its C2PA manifest box to `outputFile`, which must not exist
     public func sign(
         inputFile: URL,
         outputFile: URL,
@@ -77,12 +82,18 @@ public struct C2PAServerSigner: Sendable {
         guard !FileManager.default.fileExists(atPath: outputFile.path) else {
             throw SigningError.outputExists(outputFile)
         }
-        let fileSize = try Self.appendOffset(for: inputFile)
-        let contentHash = try Self.sha256Hex(of: inputFile)
+        let (boxes, fileSize) = try Self.topLevelBoxes(of: inputFile)
+        let moov = try Self.read(inputFile, ranges: boxes.filter { $0.type == "moov" }.map { $0.offset..<$0.offset + $0.size })
 
-        var reserved = Self.initialReservation
+        var boxSize = reservation
         for attempt in 1...Self.maxRequests {
-            let range = C2PAExclusionRange(start: fileSize, end: fileSize + UInt64(reserved), boxType: "uuid")
+            let layout = try BMFFManifestLayout.plan(boxes: boxes, fileSize: fileSize, moov: moov, boxSize: boxSize)
+            let contentHash = try Self.sha256Hex(of: inputFile, layout: layout)
+            let range = C2PAExclusionRange(
+                start: layout.boxOffset,
+                end: layout.boxOffset + UInt64(boxSize),
+                boxType: "uuid"
+            )
             let jumbf: Data
             do {
                 jumbf = try await signManifest(C2PASignRequest(
@@ -92,25 +103,40 @@ public struct C2PAServerSigner: Sendable {
                     metadata: metadata
                 ))
             } catch C2PASigningService.ServiceError.exclusionLengthMismatch(let requiredLength) {
-                reserved = requiredLength
+                boxSize = try Self.checkedBoxSize(requiredLength, from: "required_exclusion_length")
                 continue
             }
-            let box = C2PAManifestBox.make(jumbf: jumbf)
-            if box.count == reserved {
-                try Self.write(inputFile, appending: box, to: outputFile)
-                return C2PAEmbeddedManifest(
-                    contentHash: contentHash,
-                    manifestRange: range.start..<range.end,
-                    requestCount: attempt
-                )
+            let needed = try Self.checkedBoxSize(C2PAManifestBox.headerSize + jumbf.count, from: "signed manifest size")
+            guard needed <= boxSize else {
+                boxSize = needed
+                continue
             }
-            reserved = box.count
+            try Self.write(
+                inputFile,
+                layout: layout,
+                box: C2PAManifestBox.make(jumbf: jumbf, size: boxSize),
+                to: outputFile
+            )
+            return C2PAEmbeddedManifest(
+                contentHash: contentHash,
+                manifestRange: range.start..<range.end,
+                requestCount: attempt
+            )
         }
         throw SigningError.manifestSizeDidNotSettle(attempts: Self.maxRequests)
     }
 
-    /// Checks the file can take an appended manifest box and returns its size
-    private static func appendOffset(for url: URL) throws -> UInt64 {
+    /// A box size that came from the server, refused unless it can hold the box header
+    /// and stays within `C2PAManifestBox.maxSize`
+    private static func checkedBoxSize(_ size: Int, from source: String) throws -> Int {
+        guard (C2PAManifestBox.headerSize...C2PAManifestBox.maxSize).contains(size) else {
+            throw C2PASigningService.ServiceError.invalidResponse("\(source) \(size) is out of range")
+        }
+        return size
+    }
+
+    /// The input's top-level boxes, checked for a manifest box to be written into
+    private static func topLevelBoxes(of url: URL) throws -> ([BMFFBox], UInt64) {
         guard let boxes = try BMFFBox.topLevelBoxes(in: url), boxes.first?.type == "ftyp" else {
             throw SigningError.unsupportedContainer("not an ISO BMFF file")
         }
@@ -120,31 +146,81 @@ public struct C2PAServerSigner: Sendable {
         guard let last = boxes.last, last.size != 0 else {
             throw SigningError.unsupportedContainer("the last box runs to end of file")
         }
-        return last.offset + last.size
+        return (boxes, last.offset + last.size)
     }
 
-    private static func sha256Hex(of url: URL) throws -> String {
+    private static func read(_ url: URL, ranges: [Range<UInt64>]) throws -> Data {
+        guard ranges.count == 1, let range = ranges.first else {
+            throw SigningError.unsupportedContainer("expected exactly one 'moov' box, found \(ranges.count)")
+        }
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
-        var hasher = SHA256()
-        while true {
-            let chunk = try autoreleasepool { try handle.read(upToCount: hashChunkSize) }
-            guard let chunk, !chunk.isEmpty else { break }
-            hasher.update(data: chunk)
+        try handle.seek(toOffset: range.lowerBound)
+        guard let data = try handle.read(upToCount: Int(range.count)), data.count == range.count else {
+            throw SigningError.unsupportedContainer("truncated 'moov' box")
         }
+        return data
+    }
+
+    /// SHA-256 of the output the layout describes, without the manifest box
+    private static func sha256Hex(of input: URL, layout: BMFFManifestLayout) throws -> String {
+        var hasher = SHA256()
+        try stream(input, layout: layout, box: nil) { hasher.update(data: $0) }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
-    private static func write(_ input: URL, appending box: Data, to output: URL) throws {
-        try FileManager.default.copyItem(at: input, to: output)
+    /// Writes the output to a temporary file next to `output`, then moves it into place
+    private static func write(_ input: URL, layout: BMFFManifestLayout, box: Data, to output: URL) throws {
+        let temporary = output.deletingLastPathComponent()
+            .appendingPathComponent(".\(output.lastPathComponent).\(UUID().uuidString).c2pa-tmp")
+        guard FileManager.default.createFile(atPath: temporary.path, contents: nil) else {
+            throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: temporary.path])
+        }
         do {
-            let handle = try FileHandle(forWritingTo: output)
-            defer { try? handle.close() }
-            try handle.seekToEnd()
-            try handle.write(contentsOf: box)
+            let handle = try FileHandle(forWritingTo: temporary)
+            do {
+                try stream(input, layout: layout, box: box) { try handle.write(contentsOf: $0) }
+                try handle.close()
+            } catch {
+                try? handle.close()
+                throw error
+            }
+            try FileManager.default.moveItem(at: temporary, to: output)
         } catch {
-            try? FileManager.default.removeItem(at: output)
+            try? FileManager.default.removeItem(at: temporary)
             throw error
+        }
+    }
+
+    /// Feeds the layout's bytes in order; the manifest box only when `box` is given
+    private static func stream(
+        _ input: URL,
+        layout: BMFFManifestLayout,
+        box: Data?,
+        body: (Data) throws -> Void
+    ) throws {
+        let handle = try FileHandle(forReadingFrom: input)
+        defer { try? handle.close() }
+        for segment in layout.segments {
+            switch segment {
+            case .manifestBox:
+                if let box { try body(box) }
+            case .bytes(let data):
+                try body(data)
+            case .input(let range):
+                try handle.seek(toOffset: range.lowerBound)
+                var remaining = range.upperBound - range.lowerBound
+                while remaining > 0 {
+                    let chunk = try autoreleasepool {
+                        try handle.read(upToCount: Swift.min(readChunkSize, Int(remaining)))
+                    }
+                    guard let chunk, !chunk.isEmpty else {
+                        throw SigningError.unsupportedContainer("the input file changed while signing")
+                    }
+                    try body(chunk)
+                    remaining -= UInt64(chunk.count)
+                }
+            }
         }
     }
 }

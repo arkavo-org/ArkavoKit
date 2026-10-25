@@ -103,7 +103,9 @@ struct C2PASignCLI {
                 .appendingPathComponent("c2pa-sign-tampered-\(UUID().uuidString).\(options.output.pathExtension)")
             defer { try? FileManager.default.removeItem(at: tampered) }
             try FileManager.default.copyItem(at: options.output, to: tampered)
-            let offset = embedded.manifestRange.lowerBound / 2
+            // Halfway between the manifest box and the end of the file: media, not ftyp.
+            let fileSize = try FileManager.default.attributesOfItem(atPath: tampered.path)[.size] as? UInt64 ?? 0
+            let offset = (embedded.manifestRange.upperBound + fileSize) / 2
             let handle = try FileHandle(forUpdating: tampered)
             try handle.seek(toOffset: offset)
             let byte = try handle.read(upToCount: 1) ?? Data([0])

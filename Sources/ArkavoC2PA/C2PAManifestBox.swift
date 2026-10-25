@@ -11,15 +11,25 @@ enum C2PAManifestBox {
     /// size + `uuid` + extended type + version/flags + "manifest\0" + merkle offset
     static let headerSize = 4 + 4 + 16 + 4 + 9 + 8
 
-    static func make(jumbf: Data) -> Data {
-        var box = Data(capacity: headerSize + jumbf.count)
-        withUnsafeBytes(of: UInt32(headerSize + jumbf.count).bigEndian) { box.append(contentsOf: $0) }
+    /// Largest box the signer writes. A signed manifest with its certificate chain and
+    /// timestamp is about 20 KiB; a size from the server beyond this is refused rather
+    /// than shifting the media by it.
+    static let maxSize = 1024 * 1024
+
+    /// A box of `size` bytes (default: just large enough). The spec (A.5.3) allows
+    /// unused zero padding after the manifest store inside the box.
+    static func make(jumbf: Data, size: Int? = nil) -> Data {
+        let size = size ?? headerSize + jumbf.count
+        precondition(size >= headerSize + jumbf.count, "manifest larger than its box")
+        var box = Data(capacity: size)
+        withUnsafeBytes(of: UInt32(size).bigEndian) { box.append(contentsOf: $0) }
         box.append(contentsOf: Array("uuid".utf8))
         box.append(c2paUUID)
         box.append(contentsOf: [0, 0, 0, 0])
         box.append(contentsOf: Array("manifest".utf8) + [0])
         box.append(contentsOf: [UInt8](repeating: 0, count: 8))
         box.append(jumbf)
+        box.append(Data(count: size - box.count))
         return box
     }
 }
