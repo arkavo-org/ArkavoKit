@@ -454,12 +454,14 @@ public final class RecordingSession: Sendable {
         try? await audioRouter.stopAll()
         if !_streamingActive.withLock({ $0 }) { resetAudioMixer() }
 
+        // The recording is over even when finishing the file fails
+        defer {
+            _isRecording = false
+            recordingStartTime = nil
+        }
+
         // Finish encoding
         let result = try await encoder.finishRecording()
-
-        // Update local recording state
-        _isRecording = false
-        recordingStartTime = nil
 
         print("🛑 [RecordingSession] Recording stopped")
 
