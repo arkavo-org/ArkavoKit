@@ -63,6 +63,20 @@ final class C2PASigningServiceTests: XCTestCase {
         }
     }
 
+    func testForbiddenWithARequiredEntitlementMeansAMembershipIsNeeded() async throws {
+        let entitlement = "https://patreon.arkavo.com/attr/arkavo-creator/value/publish"
+        StubURLProtocol.handler = { _, _ in
+            (403, Data(#"{"error":"signing entitlement required","status":"error","required_entitlement":"\#(entitlement)"}"#.utf8))
+        }
+
+        do {
+            _ = try await makeService().signManifest(sampleRequest())
+            XCTFail("expected membershipRequired")
+        } catch C2PASigningService.ServiceError.membershipRequired(let required) {
+            XCTAssertEqual(required, entitlement)
+        }
+    }
+
     func testServerErrorsCarryTheStatusAndMessage() async throws {
         StubURLProtocol.handler = { _, _ in
             (500, Data(#"{"error":"Signing failed: boom","status":"error"}"#.utf8))
