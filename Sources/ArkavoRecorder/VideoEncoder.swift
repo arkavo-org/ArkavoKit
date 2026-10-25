@@ -26,8 +26,11 @@ public actor VideoEncoder {
     private var startTime: CMTime?
     private var lastVideoTimestamp: CMTime = .zero
     private var isPaused: Bool = false
-    private var pauseStartTime: CMTime?
+    /// Set by `resume()`: the next sample measures how long the pause lasted
+    private var resumePending: Bool = false
     private var totalPausedDuration: CMTime = .zero
+    /// End of the latest media appended to the file, on the file's timeline
+    private var appendedMediaEnd: CMTime = .zero
     private var sessionStarted: Bool = false
     /// Whether the file got at least one video frame or audio sample
     private var appendedMedia: Bool = false
@@ -261,8 +264,9 @@ public actor VideoEncoder {
         startTime = nil
         lastVideoTimestamp = .zero
         isPaused = false
-        pauseStartTime = nil
+        resumePending = false
         totalPausedDuration = .zero
+        appendedMediaEnd = .zero
         sessionStarted = false
         appendedMedia = false
     }
@@ -379,23 +383,33 @@ public actor VideoEncoder {
     public func pause() {
         guard isRecording, !isPaused else { return }
         isPaused = true
-        pauseStartTime = lastVideoTimestamp
     }
 
     /// Resumes recording
     public func resume() {
-        guard isRecording, isPaused, let pauseStart = pauseStartTime else { return }
+        guard isRecording, isPaused else { return }
         isPaused = false
-        totalPausedDuration = CMTimeAdd(totalPausedDuration, CMTimeSubtract(lastVideoTimestamp, pauseStart))
-        pauseStartTime = nil
+        resumePending = true
+    }
+
+    /// After a resume, moves the rest of the recording back so it continues where the
+    /// media before the pause ended. Frames are dropped while paused, so the pause is
+    /// measured from the first sample after it; `recordingTime` is that sample's time
+    /// since the recording started. Both tracks share the offset, so they stay in sync.
+    private func closePauseGap(at recordingTime: CMTime) {
+        guard resumePending else { return }
+        resumePending = false
+        let paused = CMTimeSubtract(recordingTime, appendedMediaEnd)
+        if CMTimeCompare(paused, totalPausedDuration) > 0 {
+            totalPausedDuration = paused
+        }
     }
 
     /// Current recording duration
     public var duration: TimeInterval {
         guard startTime != nil else { return 0 }
-        // lastVideoTimestamp is already normalized to start at zero
-        let finalDuration = CMTimeSubtract(lastVideoTimestamp, totalPausedDuration)
-        return CMTimeGetSeconds(finalDuration)
+        // lastVideoTimestamp is already normalized to start at zero, without pauses
+        return CMTimeGetSeconds(lastVideoTimestamp)
     }
 
     // MARK: - Frame Encoding
@@ -465,6 +479,7 @@ public actor VideoEncoder {
             }
 
             // Adjust for pauses
+            closePauseGap(at: adjustedTimestamp)
             if !totalPausedDuration.seconds.isZero {
                 adjustedTimestamp = CMTimeSubtract(adjustedTimestamp, totalPausedDuration)
             }
@@ -490,6 +505,7 @@ public actor VideoEncoder {
             }
             appendedMedia = true
             lastVideoTimestamp = adjustedTimestamp
+            appendedMediaEnd = CMTimeMaximum(appendedMediaEnd, CMTimeAdd(adjustedTimestamp, CMTime(value: 1, timescale: frameRate)))
         } else if isStreaming || isNTDFStreaming {
             // Streaming-only mode: initialize stream timing on first frame
             if !sessionStarted {
@@ -585,6 +601,7 @@ public actor VideoEncoder {
             }
 
             // Adjust for pauses
+            closePauseGap(at: adjustedTimestamp)
             if !totalPausedDuration.seconds.isZero {
                 adjustedTimestamp = CMTimeSubtract(adjustedTimestamp, totalPausedDuration)
             }
@@ -617,6 +634,7 @@ public actor VideoEncoder {
                 return
             }
             appendedMedia = true
+            appendedMediaEnd = CMTimeMaximum(appendedMediaEnd, CMTimeAdd(adjustedTimestamp, CMSampleBufferGetDuration(sampleBuffer)))
         }
 
         // Stream audio for RTMP — accept mixed output (from AudioMixer) or direct microphone
