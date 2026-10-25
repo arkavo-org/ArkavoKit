@@ -195,6 +195,12 @@ public final class RecordingSession: Sendable {
         if ids.contains("microphone") { audioMixer.setClockSource("microphone") }
     }
 
+    /// The audio inputs the encoder pre-creates for a recording whose router holds `routerSourceIDs`.
+    /// Every router source reaches the encoder through the mixer, so the file gets one track: the mix.
+    nonisolated static func encoderAudioTrackIDs(forRouterSources routerSourceIDs: [String]) -> [String] {
+        routerSourceIDs.isEmpty ? [] : [AudioMixer.outputSourceID]
+    }
+
     /// Drops queued audio and the clock choice so nothing carries over between sessions.
     private func resetAudioMixer() {
         audioMixer.reset()
@@ -262,7 +268,7 @@ public final class RecordingSession: Sendable {
         // Wire mixer output to encoder
         audioMixer.onMixedSample = { @Sendable [weak self] mixedSample in
             Task {
-                await self?.processAudioSampleSync(mixedSample, sourceID: "mixed")
+                await self?.processAudioSampleSync(mixedSample, sourceID: AudioMixer.outputSourceID)
             }
         }
     }
@@ -348,7 +354,7 @@ public final class RecordingSession: Sendable {
         }
 
         // STEP 3: Start encoder FIRST with pre-created audio tracks for all sources
-        let audioSourceIDs = audioRouter.allSourceIDs
+        let audioSourceIDs = Self.encoderAudioTrackIDs(forRouterSources: audioRouter.allSourceIDs)
         print("🎙️ RecordingSession: Creating encoder with audio tracks for: \(audioSourceIDs)")
         try await encoder.startRecording(to: outputURL, title: title, audioSourceIDs: audioSourceIDs, videoEnabled: mode.needsVideo)
         print("🎙️ RecordingSession: Encoder started and ready")

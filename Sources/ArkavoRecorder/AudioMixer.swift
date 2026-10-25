@@ -35,6 +35,9 @@ public final class AudioMixer: @unchecked Sendable {
     /// Longest a non-clock source may queue, in seconds. Older samples are dropped.
     public let maxQueuedSeconds: Double = 0.2
 
+    /// The source ID the mix reaches the encoder under.
+    public static let outputSourceID = "mixed"
+
     public var onMixedSample: ((CMSampleBuffer) -> Void)?
 
     public init(sampleRate: Double = 48000, channels: UInt32 = 2, voiceSourceID: String? = nil) {
