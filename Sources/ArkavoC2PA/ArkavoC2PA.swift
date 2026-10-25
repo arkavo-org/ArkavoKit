@@ -8,6 +8,8 @@
 //
 // - `C2PAServerSigner`: Signs MOV/MP4/M4A through the arkavo-rs signing server
 // - `C2PASigningService`: Client for the server's `POST /c2pa/v1/sign`
+// - `C2PAVerifier`: Reads a signed file back: a local manifest check, and
+//   `POST /c2pa/v1/validate` for the full result
 // - `C2PAManifest`: Structured manifest for provenance metadata
 // - `C2PAManifestBuilder`: Fluent API for building manifests
 // - `C2PASigner`: Signs content (pending native implementation)
@@ -28,6 +30,20 @@
 // C2PA box right after `ftyp`, and the chunk offsets in `moov` are moved to
 // match. Check the result with `c2patool <file>` or the `c2pa-sign` CLI in this
 // package.
+//
+// ## Verifying
+//
+// ```swift
+// if try C2PAVerifier.hasManifest(recordingURL) { /* show the badge */ }
+// switch try await C2PAVerifier().verify(recordingURL) {
+// case .valid(let provenance): print(provenance.creator ?? "", provenance.signedAt ?? "")
+// case .invalid(let errors, _): print("Not verified: \(errors)")
+// case .noManifest: print("Unsigned")
+// }
+// ```
+//
+// `verify` sends the manifest and a SHA-256 of the rest of the file; the
+// endpoint needs no sign-in.
 //
 // ## Native signing usage
 //
