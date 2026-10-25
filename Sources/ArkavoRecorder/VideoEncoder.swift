@@ -343,6 +343,7 @@ public actor VideoEncoder {
             }
         }
 
+        var failure: Error?
         if assetWriter.status == .failed {
             let errorMessage = assetWriter.error?.localizedDescription ?? "Unknown error"
             let underlyingError = (assetWriter.error as NSError?)?.userInfo[NSUnderlyingErrorKey] as? NSError
@@ -350,7 +351,7 @@ public actor VideoEncoder {
             if let underlyingError = underlyingError {
                 print("   Underlying error: Domain=\(underlyingError.domain) Code=\(underlyingError.code)")
             }
-            throw assetWriter.error ?? RecorderError.encodingFailed
+            failure = assetWriter.error ?? RecorderError.encodingFailed
         }
 
         // Clean up
@@ -359,10 +360,15 @@ public actor VideoEncoder {
         self.audioInputs = [:]
         self.pixelBufferAdaptor = nil
 
+        // An empty file is removed even when the writer failed; the writer's error
+        // says more than "empty", so it wins
         guard appendedMedia else {
             try? FileManager.default.removeItem(at: outputURL)
             print("❌ Recording is empty, removed: \(outputURL.path)")
-            throw RecorderError.noMediaWritten
+            throw failure ?? RecorderError.noMediaWritten
+        }
+        if let failure {
+            throw failure
         }
 
         print("✅ Recording finished successfully at: \(outputURL.path)")
