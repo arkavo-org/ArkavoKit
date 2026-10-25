@@ -36,6 +36,8 @@ public actor VideoEncoder {
     private var appendedMedia: Bool = false
 
     public private(set) var isRecording: Bool = false
+    /// True while `finishRecording()` waits for the file to be finished
+    private var isFinishing: Bool = false
 
     // Streaming support — per-destination state for simulcast fan-out
     struct StreamDestination {
@@ -150,6 +152,8 @@ public actor VideoEncoder {
     ///   - videoEnabled: Whether to include video track (false for audio-only recording)
     public func startRecording(to url: URL, title: String, audioSourceIDs: [String] = [], videoEnabled: Bool = true) async throws {
         guard !isRecording else { return }
+        // The recording being finished still owns the writer state until it is done
+        guard !isFinishing else { throw RecorderError.recordingFailed }
 
         outputURL = url
 
@@ -291,6 +295,8 @@ public actor VideoEncoder {
         }
 
         isRecording = false
+        isFinishing = true
+        defer { isFinishing = false }
 
         print("📊 Media appended: \(appendedMedia), Asset writer status: \(assetWriter.status.rawValue)")
 
