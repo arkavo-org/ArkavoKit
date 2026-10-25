@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// Result of waiting for capture sources to become ready
 public enum CaptureReadinessResult: Sendable {
@@ -72,23 +73,7 @@ public actor CaptureSourceRegistry {
             for (id, source) in sources {
                 group.addTask {
                     do {
-                        // Create a task that races with the timeout
-                        try await withThrowingTaskGroup(of: Void.self) { innerGroup in
-                            // Start capture task
-                            innerGroup.addTask {
-                                try await source.start()
-                            }
-
-                            // Timeout task
-                            innerGroup.addTask {
-                                try await Task.sleep(for: .seconds(timeout))
-                                throw CaptureSourceError.timeout(sourceID: id, after: timeout)
-                            }
-
-                            // First to complete wins
-                            try await innerGroup.next()
-                            innerGroup.cancelAll()
-                        }
+                        try await Self.start(source, timeout: timeout)
                         return (id, .success(()))
                     } catch {
                         return (id, .failure(error))
@@ -116,6 +101,34 @@ public actor CaptureSourceRegistry {
         } else {
             print("⚠️ [CaptureSourceRegistry] \(successSources.count)/\(sources.count) sources ready, \(failedSources.count) failed")
             return .partialReady(failed: failedSources)
+        }
+    }
+
+    /// Starts `source`, giving up after `timeout`. The start runs in its own task, so a
+    /// first-frame wait that ignores cancellation (e.g. a camera that never delivers a
+    /// frame) is cancelled and left behind instead of holding up recording startup.
+    private static func start(_ source: RegisteredSource, timeout: TimeInterval) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let pending = OSAllocatedUnfairLock<CheckedContinuation<Void, Error>?>(initialState: continuation)
+            let finish: @Sendable (Result<Void, Error>) -> Void = { result in
+                pending.withLock { continuation in
+                    defer { continuation = nil }
+                    return continuation
+                }?.resume(with: result)
+            }
+            let work = Task {
+                do {
+                    try await source.start()
+                    finish(.success(()))
+                } catch {
+                    finish(.failure(error))
+                }
+            }
+            Task {
+                try? await Task.sleep(for: .seconds(timeout))
+                work.cancel()
+                finish(.failure(CaptureSourceError.timeout(sourceID: source.sourceID, after: timeout)))
+            }
         }
     }
 }
