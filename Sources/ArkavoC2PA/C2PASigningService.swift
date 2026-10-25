@@ -203,7 +203,8 @@ public struct C2PASigningService: Sendable {
         case 401:
             throw ServiceError.unauthenticated(body?.message ?? body?.error ?? "authentication required")
         case 403:
-            if let entitlement = body?.requiredEntitlement {
+            // Decoded on its own, so a field of the wrong type elsewhere can't hide it
+            if let entitlement = (try? JSONDecoder().decode(EntitlementRefusal.self, from: data))?.requiredEntitlement {
                 throw ServiceError.membershipRequired(entitlement: entitlement)
             }
             throw ServiceError.creatorNotAuthorized(body?.error ?? "creator not authorized")
@@ -238,13 +239,20 @@ public struct C2PASigningService: Sendable {
         let error: String?
         let message: String?
         let requiredExclusionLength: Int?
-        let requiredEntitlement: String?
 
         enum CodingKeys: String, CodingKey {
             case manifest
             case error
             case message
             case requiredExclusionLength = "required_exclusion_length"
+        }
+    }
+
+    /// The 403 arkavo-rs sends when signing needs a creator membership
+    private struct EntitlementRefusal: Decodable {
+        let requiredEntitlement: String
+
+        enum CodingKeys: String, CodingKey {
             case requiredEntitlement = "required_entitlement"
         }
     }

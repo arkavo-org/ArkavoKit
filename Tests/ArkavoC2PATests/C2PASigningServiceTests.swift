@@ -77,6 +77,32 @@ final class C2PASigningServiceTests: XCTestCase {
         }
     }
 
+    func testARequiredEntitlementSurvivesOtherFieldsOfTheWrongType() async throws {
+        StubURLProtocol.handler = { _, _ in
+            (403, Data(#"{"error":{"code":7},"required_entitlement":"publish"}"#.utf8))
+        }
+
+        do {
+            _ = try await makeService().signManifest(sampleRequest())
+            XCTFail("expected membershipRequired")
+        } catch C2PASigningService.ServiceError.membershipRequired(let required) {
+            XCTAssertEqual(required, "publish")
+        }
+    }
+
+    func testANonStringRequiredEntitlementLeavesTheErrorMessage() async throws {
+        StubURLProtocol.handler = { _, _ in
+            (403, Data(#"{"error":"Creator not authorized","required_entitlement":42}"#.utf8))
+        }
+
+        do {
+            _ = try await makeService().signManifest(sampleRequest())
+            XCTFail("expected creatorNotAuthorized")
+        } catch C2PASigningService.ServiceError.creatorNotAuthorized(let message) {
+            XCTAssertEqual(message, "Creator not authorized")
+        }
+    }
+
     func testServerErrorsCarryTheStatusAndMessage() async throws {
         StubURLProtocol.handler = { _, _ in
             (500, Data(#"{"error":"Signing failed: boom","status":"error"}"#.utf8))
