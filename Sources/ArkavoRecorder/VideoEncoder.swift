@@ -29,6 +29,8 @@ public actor VideoEncoder {
     private var pauseStartTime: CMTime?
     private var totalPausedDuration: CMTime = .zero
     private var sessionStarted: Bool = false
+    /// Whether the file got at least one video frame or audio sample
+    private var appendedMedia: Bool = false
 
     public private(set) var isRecording: Bool = false
 
@@ -262,9 +264,12 @@ public actor VideoEncoder {
         pauseStartTime = nil
         totalPausedDuration = .zero
         sessionStarted = false
+        appendedMedia = false
     }
 
-    /// Finishes recording and returns the output URL
+    /// Finishes recording and returns the output URL.
+    /// Throws `RecorderError.noMediaWritten`, and removes the file, when no video frame
+    /// or audio sample reached it.
     public func finishRecording() async throws -> URL {
         guard isRecording else {
             print("❌ finishRecording: Not currently recording")
@@ -283,14 +288,14 @@ public actor VideoEncoder {
 
         isRecording = false
 
-        // Check if a session was actually started (at least one frame was written)
-        let sessionStarted = startTime != nil
-        print("📊 Session started: \(sessionStarted), Asset writer status: \(assetWriter.status.rawValue)")
+        print("📊 Media appended: \(appendedMedia), Asset writer status: \(assetWriter.status.rawValue)")
 
         // Handle based on session and writer state
-        if !sessionStarted {
-            print("⚠️ No frames were written (session never started), cancelling asset writer")
-            assetWriter.cancelWriting()
+        if !appendedMedia {
+            if assetWriter.status == .writing {
+                print("⚠️ No media was written, cancelling asset writer")
+                assetWriter.cancelWriting()
+            }
         } else if assetWriter.status == .writing {
             print("📝 Marking inputs as finished...")
 
@@ -353,6 +358,12 @@ public actor VideoEncoder {
         self.videoInput = nil
         self.audioInputs = [:]
         self.pixelBufferAdaptor = nil
+
+        guard appendedMedia else {
+            try? FileManager.default.removeItem(at: outputURL)
+            print("❌ Recording is empty, removed: \(outputURL.path)")
+            throw RecorderError.noMediaWritten
+        }
 
         print("✅ Recording finished successfully at: \(outputURL.path)")
         return outputURL
@@ -471,6 +482,7 @@ public actor VideoEncoder {
                 }
                 return
             }
+            appendedMedia = true
             lastVideoTimestamp = adjustedTimestamp
         } else if isStreaming || isNTDFStreaming {
             // Streaming-only mode: initialize stream timing on first frame
@@ -529,18 +541,9 @@ public actor VideoEncoder {
                 return
             }
 
-            // For audio-only mode (no video input), start session on first audio sample
+            // With video, the first video frame starts the session
             let isAudioOnly = videoInput == nil
-            if isAudioOnly && !sessionStarted {
-                let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-                sessionStarted = true
-                startTime = timestamp
-                writer.startSession(atSourceTime: .zero)
-                print("🎵 VideoEncoder: Audio-only session started, base timestamp \(timestamp.seconds)")
-            }
-
-            // Wait for session to start (video will start it normally, or audio-only above)
-            guard startTime != nil else {
+            guard isAudioOnly || startTime != nil else {
                 return
             }
 
@@ -553,6 +556,16 @@ public actor VideoEncoder {
             // Wait if input is not ready
             if !audioInput.isReadyForMoreMediaData {
                 return
+            }
+
+            // Audio-only: start the session with the first sample that can be appended,
+            // so a dropped sample can't set the start time
+            if isAudioOnly && !sessionStarted {
+                let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+                sessionStarted = true
+                startTime = timestamp
+                writer.startSession(atSourceTime: .zero)
+                print("🎵 VideoEncoder: Audio-only session started, base timestamp \(timestamp.seconds)")
             }
 
             // Normalize audio timestamp relative to recording start (same as video)
@@ -597,6 +610,7 @@ public actor VideoEncoder {
                 print("⚠️ Audio input [\(sourceID)] rejected sample buffer; dropping frame")
                 return
             }
+            appendedMedia = true
         }
 
         // Stream audio for RTMP — accept mixed output (from AudioMixer) or direct microphone

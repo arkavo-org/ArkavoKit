@@ -12,6 +12,8 @@ public enum RecorderError: Error, Sendable {
     /// Every requested camera failed to start; per-source details were delivered through
     /// `RecordingSession.cameraStartFailureHandler`.
     case allCameraSourcesFailed
+    /// The recording stopped before any audio or video reached the file, so no file was kept.
+    case noMediaWritten
 }
 
 extension RecorderError: LocalizedError {
@@ -35,6 +37,8 @@ extension RecorderError: LocalizedError {
             return "Required permissions were denied"
         case .allCameraSourcesFailed:
             return "No camera could be started"
+        case .noMediaWritten:
+            return "The recording is empty: no audio or video reached the file"
         }
     }
 }
