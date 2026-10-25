@@ -126,6 +126,9 @@ public struct C2PASigningService: Sendable {
         case unauthenticated(String)
         /// The server's creator allowlist does not include `metadata.creator`
         case creatorNotAuthorized(String)
+        /// Signing needs a creator membership: the token lacks the `entitlement` attribute
+        /// the server requires (arkavo-rs#120)
+        case membershipRequired(entitlement: String)
         /// The exclusion range was not the size of the signed manifest box. The server
         /// discarded the manifest; ask again with a range of `requiredLength` bytes.
         case exclusionLengthMismatch(requiredLength: Int)
@@ -140,6 +143,8 @@ public struct C2PASigningService: Sendable {
                 return "C2PA signing needs an Arkavo sign-in: \(message)"
             case .creatorNotAuthorized(let message):
                 return "C2PA signing denied: \(message)"
+            case .membershipRequired:
+                return "C2PA signing needs an Arkavo creator membership"
             case .exclusionLengthMismatch(let requiredLength):
                 return "C2PA signing needs a \(requiredLength)-byte manifest range"
             case .rateLimited(let retryAfter):
@@ -198,6 +203,10 @@ public struct C2PASigningService: Sendable {
         case 401:
             throw ServiceError.unauthenticated(body?.message ?? body?.error ?? "authentication required")
         case 403:
+            // Decoded on its own, so a field of the wrong type elsewhere can't hide it
+            if let entitlement = (try? JSONDecoder().decode(EntitlementRefusal.self, from: data))?.requiredEntitlement {
+                throw ServiceError.membershipRequired(entitlement: entitlement)
+            }
             throw ServiceError.creatorNotAuthorized(body?.error ?? "creator not authorized")
         case 422 where body?.requiredExclusionLength != nil:
             throw ServiceError.exclusionLengthMismatch(requiredLength: body?.requiredExclusionLength ?? 0)
@@ -236,6 +245,15 @@ public struct C2PASigningService: Sendable {
             case error
             case message
             case requiredExclusionLength = "required_exclusion_length"
+        }
+    }
+
+    /// The 403 arkavo-rs sends when signing needs a creator membership
+    private struct EntitlementRefusal: Decodable {
+        let requiredEntitlement: String
+
+        enum CodingKeys: String, CodingKey {
+            case requiredEntitlement = "required_entitlement"
         }
     }
 }
