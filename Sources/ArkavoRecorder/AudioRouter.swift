@@ -56,6 +56,12 @@ public class AudioRouter {
         print("🎛️ AudioRouter: Removed source [\(sourceID)]")
     }
 
+    /// Stops an audio source, then removes it
+    func stopAndRemoveSource(_ sourceID: String) async {
+        try? await sources[sourceID]?.stop()
+        removeSource(sourceID)
+    }
+
     /// Start all audio sources
     public func startAll() async throws {
         print("🎛️ AudioRouter: Starting all sources...")

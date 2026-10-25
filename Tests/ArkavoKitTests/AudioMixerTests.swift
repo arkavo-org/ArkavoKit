@@ -134,6 +134,18 @@ struct AudioMixerTests {
         #expect(Self.samples(out[0]).first == 150)
     }
 
+    @Test("Once the other source is unregistered, the voice alone becomes the clock")
+    func voiceIsClockAfterTheOtherSourceIsUnregistered() {
+        let mixer = AudioMixer(voiceSourceID: "muse-voice")
+        mixer.registerSource("microphone")
+        mixer.registerSource("muse-voice")
+        mixer.unregisterSource("microphone")
+        var out: [CMSampleBuffer] = []
+        mixer.onMixedSample = { out.append($0) }
+        mixer.addSample(Self.buffer(frames: 960, value: 50, pts: .zero), from: "muse-voice")
+        #expect(out.count == 1)
+    }
+
     @Test("An unpinned voice is queued, not the clock, while another source is registered")
     func voiceIsNotAutoClockWhenOthersRegistered() {
         let mixer = AudioMixer(voiceSourceID: "muse-voice")
