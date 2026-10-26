@@ -26,6 +26,8 @@ public struct C2PAProvenance: Sendable, Equatable {
     /// `signedAt` as the server reported it, kept in case it doesn't parse
     public let signedAtText: String?
     public let aiGenerated: Bool?
+    /// The `c2pa.created` action's source type; nil when absent or not a term this kit lists
+    public let digitalSourceType: C2PADigitalSourceType?
     public let actions: [C2PAProvenanceAction]
 
     public init(
@@ -33,12 +35,14 @@ public struct C2PAProvenance: Sendable, Equatable {
         signedAt: Date? = nil,
         signedAtText: String? = nil,
         aiGenerated: Bool? = nil,
+        digitalSourceType: C2PADigitalSourceType? = nil,
         actions: [C2PAProvenanceAction] = []
     ) {
         self.creator = creator
         self.signedAt = signedAt
         self.signedAtText = signedAtText
         self.aiGenerated = aiGenerated
+        self.digitalSourceType = digitalSourceType
         self.actions = actions
     }
 }
@@ -205,6 +209,7 @@ public struct C2PAVerifier: Sendable {
             signedAt: body.signedAt.flatMap(Self.date(rfc3339:)),
             signedAtText: body.signedAt,
             aiGenerated: body.aiGenerated,
+            digitalSourceType: body.digitalSourceType.flatMap(C2PADigitalSourceType.init(rawValue:)),
             actions: (body.provenanceChain ?? []).map {
                 C2PAProvenanceAction(action: $0.action, actor: $0.actor, timestamp: $0.timestamp, software: $0.software)
             }
@@ -240,6 +245,7 @@ public struct C2PAVerifier: Sendable {
         let creator: String?
         let provenanceChain: [Entry]?
         let aiGenerated: Bool?
+        let digitalSourceType: String?
         let signedAt: String?
 
         struct Entry: Decodable {
@@ -255,6 +261,7 @@ public struct C2PAVerifier: Sendable {
             case creator
             case provenanceChain = "provenance_chain"
             case aiGenerated = "ai_generated"
+            case digitalSourceType = "digital_source_type"
             case signedAt = "signed_at"
         }
     }

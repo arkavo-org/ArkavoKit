@@ -37,12 +37,100 @@ final class C2PASigningServiceTests: XCTestCase {
         XCTAssertEqual(metadata["creator"] as? String, "tester@arkavo.net")
         XCTAssertEqual(metadata["timestamp"] as? String, "2027-01-15T08:00:00Z")
         XCTAssertEqual(metadata["software"] as? String, "ArkavoC2PATests")
+        XCTAssertEqual(metadata["digital_source_type"] as? String, "digitalCapture")
         XCTAssertEqual(metadata["ai_generated"] as? Bool, false)
         XCTAssertNil(metadata["description"])
     }
 
+    // MARK: - Digital source type (arkavo-rs#129)
+
+    func testSendsTheSourceTypeWithTheAIFlagItImplies() async throws {
+        for (sourceType, aiGenerated) in [
+            (C2PADigitalSourceType.screenCapture, false),
+            (.virtualRecording, false),
+            (.trainedAlgorithmicMedia, true),
+            (.compositeWithTrainedAlgorithmicMedia, true),
+        ] {
+            var capturedBody: Data?
+            StubURLProtocol.handler = { _, body in
+                capturedBody = body
+                return (200, Self.successBody(manifest: Self.manifest(carrying: sourceType)))
+            }
+
+            _ = try await makeService().signManifest(sampleRequest(sourceType))
+
+            let json = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(capturedBody)) as? [String: Any])
+            let metadata = try XCTUnwrap(json["metadata"] as? [String: Any])
+            XCTAssertEqual(metadata["digital_source_type"] as? String, sourceType.rawValue)
+            XCTAssertEqual(metadata["ai_generated"] as? Bool, aiGenerated, sourceType.rawValue)
+        }
+    }
+
+    /// An older server ignores `digital_source_type` and signs a camera capture; the
+    /// result must not pass as a screen recording
+    func testRejectsAManifestWithoutTheRequestedSourceType() async throws {
+        StubURLProtocol.handler = { _, _ in
+            (200, Self.successBody(manifest: Self.manifest(carrying: .digitalCapture)))
+        }
+
+        do {
+            _ = try await makeService().signManifest(sampleRequest(.screenCapture))
+            XCTFail("expected invalidResponse")
+        } catch C2PASigningService.ServiceError.invalidResponse(let message) {
+            XCTAssertTrue(message.contains("screenCapture"), message)
+        }
+    }
+
+    /// `composite`'s URI is a prefix of `compositeSynthetic`'s
+    func testDoesNotTakeALongerSourceTypeForTheRequestedOne() async throws {
+        StubURLProtocol.handler = { _, _ in
+            (200, Self.successBody(manifest: Self.manifest(carrying: .compositeSynthetic)))
+        }
+
+        do {
+            _ = try await makeService().signManifest(sampleRequest(.composite))
+            XCTFail("expected invalidResponse")
+        } catch C2PASigningService.ServiceError.invalidResponse {
+        }
+    }
+
+    /// Callers that still pass `aiGenerated` keep today's request: the flag alone, with
+    /// the source type left to the server
+    @available(*, deprecated)
+    func testTheAIFlagAloneLeavesTheSourceTypeToTheServer() async throws {
+        var capturedBody: Data?
+        StubURLProtocol.handler = { _, body in
+            capturedBody = body
+            return (200, Self.successBody(manifest: Self.manifest(carrying: nil)))
+        }
+        let metadata = C2PASigningMetadata(title: "Muse", creator: "tester@arkavo.net", aiGenerated: true)
+        XCTAssertNil(metadata.digitalSourceType)
+        XCTAssertEqual(metadata.aiGenerated, true)
+
+        _ = try await makeService().signManifest(C2PASignRequest(
+            contentHash: String(repeating: "ab", count: 32),
+            exclusionRanges: [C2PAExclusionRange(start: 100, end: 245, boxType: "uuid")],
+            containerFormat: .mov,
+            metadata: metadata
+        ))
+
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(capturedBody)) as? [String: Any])
+        let sent = try XCTUnwrap(json["metadata"] as? [String: Any])
+        XCTAssertEqual(sent["ai_generated"] as? Bool, true)
+        XCTAssertNil(sent["digital_source_type"])
+    }
+
+    func testTheSourceTypeSetsTheAIFlag() {
+        for sourceType in C2PADigitalSourceType.allCases {
+            let metadata = C2PASigningMetadata(title: "T", creator: "c", digitalSourceType: sourceType)
+            let expected = sourceType == .trainedAlgorithmicMedia || sourceType == .compositeWithTrainedAlgorithmicMedia
+            XCTAssertEqual(metadata.aiGenerated, expected, sourceType.rawValue)
+        }
+    }
+
     func testReturnsTheDecodedManifestBytes() async throws {
-        let manifest = box("jumb", Data((0..<64).map { UInt8($0) }))
+        let uri = Data("http://cv.iptc.org/newscodes/digitalsourcetype/digitalCapture".utf8)
+        let manifest = box("jumb", Data((0..<64).map { UInt8($0) }) + Data([0x78, UInt8(uri.count)]) + uri)
         StubURLProtocol.handler = { _, _ in (200, Self.successBody(manifest: manifest)) }
 
         let result = try await makeService().signManifest(sampleRequest())
@@ -234,7 +322,18 @@ final class C2PASigningServiceTests: XCTestCase {
     // MARK: - Fixtures
 
     /// A minimal JUMBF manifest store: one `jumb` superbox
-    private static let manifestStore = box("jumb", Data(repeating: 0x11, count: 24))
+    private static let manifestStore = manifest(carrying: .digitalCapture)
+
+    /// A manifest store whose claim names `sourceType`, the way c2pa-rs encodes it: the
+    /// full IPTC URI as a CBOR text string
+    private static func manifest(carrying sourceType: C2PADigitalSourceType?) -> Data {
+        var payload = Data(repeating: 0x11, count: 24)
+        if let sourceType {
+            let uri = Data("http://cv.iptc.org/newscodes/digitalsourcetype/\(sourceType.rawValue)".utf8)
+            payload += Data([0x78, UInt8(uri.count)]) + uri + Data(repeating: 0x11, count: 8)
+        }
+        return box("jumb", payload)
+    }
 
     private func assertInvalidResponse(file: StaticString = #filePath, line: UInt = #line) async throws {
         do {
@@ -256,7 +355,7 @@ final class C2PASigningServiceTests: XCTestCase {
         )
     }
 
-    private func sampleRequest() -> C2PASignRequest {
+    private func sampleRequest(_ sourceType: C2PADigitalSourceType = .digitalCapture) -> C2PASignRequest {
         C2PASignRequest(
             contentHash: String(repeating: "ab", count: 32),
             exclusionRanges: [C2PAExclusionRange(start: 100, end: 245, boxType: "uuid")],
@@ -265,7 +364,7 @@ final class C2PASigningServiceTests: XCTestCase {
                 title: "Test Recording",
                 creator: "tester@arkavo.net",
                 timestamp: Date(timeIntervalSince1970: 1_800_000_000),
-                aiGenerated: false,
+                digitalSourceType: sourceType,
                 software: "ArkavoC2PATests"
             )
         )
