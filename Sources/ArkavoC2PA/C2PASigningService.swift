@@ -247,13 +247,22 @@ public struct C2PASigningService: Sendable {
         }
     }
 
+    /// The session signing and validation use unless the caller passes one. It refuses
+    /// TLS below 1.3, which the C2PA conformance program's Level 1 (O.5) asks for
+    /// between Creator and arks.
+    public static let defaultSession: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.tlsMinimumSupportedProtocolVersion = .TLSv13
+        return URLSession(configuration: configuration)
+    }()
+
     public let serverURL: URL
-    private let session: URLSession
+    let session: URLSession
     private let accessToken: AccessTokenProvider?
 
     public init(
         serverURL: URL = Self.defaultServerURL,
-        session: URLSession = .shared,
+        session: URLSession = Self.defaultSession,
         accessToken: AccessTokenProvider? = nil
     ) {
         self.serverURL = serverURL

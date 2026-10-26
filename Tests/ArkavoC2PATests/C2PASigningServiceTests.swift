@@ -319,6 +319,14 @@ final class C2PASigningServiceTests: XCTestCase {
         }
     }
 
+    // MARK: - Transport
+
+    /// The C2PA conformance program's Level 1 (O.5) asks for TLS 1.3 between Creator and arks
+    func testTheDefaultSessionRefusesTLSBelow1_3() {
+        XCTAssertEqual(C2PASigningService.defaultSession.configuration.tlsMinimumSupportedProtocolVersion, .TLSv13)
+        XCTAssertTrue(C2PASigningService().session === C2PASigningService.defaultSession)
+    }
+
     // MARK: - Fixtures
 
     /// A minimal JUMBF manifest store: one `jumb` superbox

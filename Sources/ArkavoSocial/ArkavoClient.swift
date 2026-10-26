@@ -115,8 +115,8 @@ public final class ArkavoClient: NSObject {
     /// `URLRequest.assumesHTTP3Capable` lets the first request negotiate HTTP/3
     /// without waiting for an `Alt-Svc` advertisement — `identity.arkavo.net`
     /// advertises `alt-svc: h3=":443"`. URLSession falls back to HTTP/2 when a
-    /// server is not h3-capable. Calls stay on `URLSession.shared` so the Apple-link
-    /// nonce→link session cookie (HTTPCookieStorage.shared) is replayed unchanged.
+    /// server is not h3-capable. Calls share `identitySession`, which keeps
+    /// HTTPCookieStorage.shared, so the Apple-link nonce→link session cookie is replayed unchanged.
     ///
     /// Used for every identity REST call site, which spans `identity.arkavo.net`
     /// (WebAuthn/OAuth) and `xrpc.arkavo.net` (profile fetches). The flag is safe
@@ -124,8 +124,18 @@ public final class ArkavoClient: NSObject {
     private static func http3Data(for request: URLRequest) async throws -> (Data, URLResponse) {
         var request = request
         request.assumesHTTP3Capable = true
-        return try await URLSession.shared.data(for: request)
+        return try await identitySession.data(for: request)
     }
+
+    /// The session for identity and profile calls. It refuses TLS below 1.3: the passkey
+    /// token C2PA signing sends comes from here, and the C2PA conformance program's
+    /// Level 1 (O.5) asks for TLS 1.3 on that path. It keeps the shared cookie store.
+    nonisolated static let identitySession: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.tlsMinimumSupportedProtocolVersion = .TLSv13
+        configuration.httpCookieStorage = .shared
+        return URLSession(configuration: configuration)
+    }()
 
     private static func http3Data(from url: URL) async throws -> (Data, URLResponse) {
         try await http3Data(for: URLRequest(url: url))
@@ -1587,7 +1597,7 @@ public final class ArkavoClient: NSObject {
     // them, so for now this persist only preserves the option.
     //
     // Like the Apple-link flow above, these calls stay on `Self.http3Data`
-    // (URLSession.shared) so the session cookie set by step 1 is replayed
+    // (`identitySession`) so the session cookie set by step 1 is replayed
     // automatically in step 3 and in the `register/:username` calls that
     // follow.
 
@@ -1786,7 +1796,7 @@ public final class ArkavoClient: NSObject {
     //   2. POST /oauth/apple/link   — client posts the verified Apple
     //      id_token; server validates and binds (apple, sub) → user_id.
     //
-    // Both calls go through URLSession.shared so the session cookie set
+    // Both calls go through `identitySession` so the session cookie set
     // in step 1 is automatically replayed in step 2.
 
     /// Fetches a fresh server-issued Apple nonce for the SiwA flow.
