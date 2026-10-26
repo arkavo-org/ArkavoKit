@@ -182,6 +182,7 @@ final class C2PAVerifierTests: XCTestCase {
             signedAt: Date(timeIntervalSince1970: 1_792_949_401),
             signedAtText: "2026-10-25T17:30:01+00:00",
             aiGenerated: false,
+            digitalSourceType: .screenCapture,
             actions: [C2PAProvenanceAction(
                 action: "created",
                 actor: "arkavo:0715eaff",
@@ -190,6 +191,19 @@ final class C2PAVerifierTests: XCTestCase {
             )]
         )
         XCTAssertEqual(result, .valid(expected))
+    }
+
+    /// The server knows more terms than `C2PADigitalSourceType`; one it doesn't list is
+    /// left out, and the rest of the provenance still comes through
+    func testASourceTypeTheKitDoesNotListIsLeftOut() async throws {
+        let signed = try await sign("in.mov", jumbf: Self.manifestStore(64))
+        StubURLProtocol.handler = { _, _ in
+            (200, Data(#"{"valid":true,"errors":[],"creator":"arkavo:x","digital_source_type":"trainedAlgorithmicData"}"#.utf8))
+        }
+
+        let result = try await verifier().verify(signed)
+
+        XCTAssertEqual(result, .valid(C2PAProvenance(creator: "arkavo:x")))
     }
 
     func testAnInvalidResponseCarriesTheErrors() async throws {
@@ -324,6 +338,6 @@ final class C2PAVerifierTests: XCTestCase {
     private static let validBody = Data(#"""
     {"valid":true,"errors":[],"creator":"arkavo:0715eaff",
      "provenance_chain":[{"action":"created","actor":"arkavo:0715eaff","timestamp":"2026-10-25T17:30:00Z","software":"Arkavo Creator 1.1"}],
-     "ai_generated":false,"signed_at":"2026-10-25T17:30:01+00:00"}
+     "ai_generated":false,"digital_source_type":"screenCapture","signed_at":"2026-10-25T17:30:01+00:00"}
     """#.utf8)
 }

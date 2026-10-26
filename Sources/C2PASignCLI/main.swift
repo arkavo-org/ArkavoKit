@@ -7,7 +7,7 @@ import Foundation
 ///
 /// Usage:
 ///   c2pa-sign <input> <output> [--server URL] [--title T] [--creator C]
-///             [--token CWT] [--trust-anchors ca.pem] [--force]
+///             [--source-type TERM] [--token CWT] [--trust-anchors ca.pem] [--force]
 ///
 /// Checks:
 ///   1. c2patool reports validation_state Valid (Trusted with --trust-anchors),
@@ -51,6 +51,7 @@ struct C2PASignCLI {
         print("Input:    \(options.input.path)")
         print("Output:   \(options.output.path)")
         print("Server:   \(options.serverURL)")
+        print("Source:   \(options.sourceType.rawValue)")
         print("Token:    \(options.token == nil ? "none" : "identity.arkavo.net bearer")")
         print("c2patool: \(c2patool.path)")
         print("============================================")
@@ -63,7 +64,7 @@ struct C2PASignCLI {
         let metadata = C2PASigningMetadata(
             title: options.title,
             creator: options.creator,
-            aiGenerated: false,
+            digitalSourceType: options.sourceType,
             software: "ArkavoKit c2pa-sign"
         )
 
@@ -174,6 +175,9 @@ struct C2PASignCLI {
           --title TITLE         Manifest title (default: input file name)
           --creator NAME        Creator sent in the metadata (default: Arkavo c2pa-sign);
                                 platform.arkavo.net records the token's subject instead
+          --source-type TERM    IPTC digital source type of the recording
+                                (default: digitalCapture), one of:
+                                \(C2PADigitalSourceType.allCases.map(\.rawValue).joined(separator: ", "))
           --token CWT           identity.arkavo.net passkey token sent as the bearer
                                 (default: $ARKAVO_TOKEN)
           --trust-anchors PEM   Trust these CAs; expects Trusted instead of Valid
@@ -210,6 +214,7 @@ struct Options {
     var serverURL = C2PASigningService.defaultServerURL
     var title: String
     var creator = "Arkavo c2pa-sign"
+    var sourceType = C2PADigitalSourceType.digitalCapture
     var token: String?
     var trustAnchors: URL?
     var force = false
@@ -219,6 +224,7 @@ struct Options {
         var serverURL: URL?
         var title: String?
         var creator: String?
+        var sourceType: C2PADigitalSourceType?
         var token = ProcessInfo.processInfo.environment["ARKAVO_TOKEN"]
         var trustAnchors: URL?
         var force = false
@@ -234,6 +240,9 @@ struct Options {
             case "--creator":
                 guard let value = iterator.next() else { return nil }
                 creator = value
+            case "--source-type":
+                guard let value = iterator.next(), let term = C2PADigitalSourceType(rawValue: value) else { return nil }
+                sourceType = term
             case "--token":
                 guard let value = iterator.next() else { return nil }
                 token = value
@@ -254,6 +263,7 @@ struct Options {
         self.title = title ?? input.lastPathComponent
         if let serverURL { self.serverURL = serverURL }
         if let creator { self.creator = creator }
+        if let sourceType { self.sourceType = sourceType }
         self.token = token.flatMap { $0.isEmpty ? nil : $0 }
         self.trustAnchors = trustAnchors
         self.force = force

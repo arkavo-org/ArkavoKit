@@ -16,6 +16,56 @@ public enum C2PAContainerFormat: String, Codable, Sendable {
     }
 }
 
+/// [IPTC digital source types](https://cv.iptc.org/newscodes/digitalsourcetype/) for the
+/// manifest's `c2pa.created` action, named as arkavo-rs takes them (arkavo-rs#129)
+public enum C2PADigitalSourceType: String, Codable, Sendable, CaseIterable {
+    /// Captured from real life with a digital camera or recording device
+    case digitalCapture
+    /// Captured from real life, then merged from several frames by signal processing or
+    /// non-generative AI, as HDR does
+    case computationalCapture
+    /// A composite of captures of real life
+    case compositeCapture
+    /// What a screen showed
+    case screenCapture
+    /// A live recording of a virtual event, made of synthetic and optionally captured elements
+    case virtualRecording
+    /// A composite of elements of any kind
+    case composite
+    /// A composite with at least one synthetic element
+    case compositeSynthetic
+    /// A composite that includes generative AI output
+    case compositeWithTrainedAlgorithmicMedia
+    /// Made by generative AI from sampled training data
+    case trainedAlgorithmicMedia
+    /// Made by an algorithm without sampled training data
+    case algorithmicMedia
+    /// Captured, then slightly enhanced or corrected by an algorithm
+    case algorithmicallyEnhanced
+    /// A representation of data, such as a chart
+    case dataDrivenMedia
+    /// Made by a person with digital tools
+    case digitalCreation
+    /// Edited by a person
+    case humanEdits
+    /// Slightly edited by a person
+    case minorHumanEdits
+    /// Digitised from a film negative
+    case negativeFilm
+    /// Digitised from a film positive
+    case positiveFilm
+    /// Digitised from a print
+    case print
+
+    /// The term's IPTC URI, as the manifest carries it
+    public var uri: String { "http://cv.iptc.org/newscodes/digitalsourcetype/\(rawValue)" }
+
+    /// Whether the content is generative AI output, as the server's `ai_generated` means it
+    public var isAIGenerated: Bool {
+        self == .trainedAlgorithmicMedia || self == .compositeWithTrainedAlgorithmicMedia
+    }
+}
+
 /// Provenance details the server writes into the manifest
 public struct C2PASigningMetadata: Encodable, Sendable {
     public let title: String
@@ -24,6 +74,11 @@ public struct C2PASigningMetadata: Encodable, Sendable {
     /// Becomes the `when` of the manifest's `c2pa.created` action. Sent with
     /// whole seconds so the manifest size does not vary between requests.
     public let timestamp: Date
+    /// The `digitalSourceType` of the manifest's `c2pa.created` action. Nil leaves it to the
+    /// server: trainedAlgorithmicMedia when `aiGenerated` is true, otherwise digitalCapture.
+    public let digitalSourceType: C2PADigitalSourceType?
+    /// Sent as `ai_generated`. With a source type it follows from that type, so a server
+    /// that predates `digital_source_type` still gets the AI flag right.
     public let aiGenerated: Bool?
     public let software: String?
 
@@ -32,13 +87,45 @@ public struct C2PASigningMetadata: Encodable, Sendable {
         creator: String,
         description: String? = nil,
         timestamp: Date = Date(),
-        aiGenerated: Bool? = nil,
+        digitalSourceType: C2PADigitalSourceType? = nil,
         software: String? = nil
+    ) {
+        self.init(
+            title: title, creator: creator, description: description, timestamp: timestamp,
+            digitalSourceType: digitalSourceType, aiGenerated: digitalSourceType?.isAIGenerated,
+            software: software
+        )
+    }
+
+    @available(*, deprecated, message: "Pass digitalSourceType; aiGenerated follows from it")
+    public init(
+        title: String,
+        creator: String,
+        description: String? = nil,
+        timestamp: Date = Date(),
+        aiGenerated: Bool?,
+        software: String? = nil
+    ) {
+        self.init(
+            title: title, creator: creator, description: description, timestamp: timestamp,
+            digitalSourceType: nil, aiGenerated: aiGenerated, software: software
+        )
+    }
+
+    private init(
+        title: String,
+        creator: String,
+        description: String?,
+        timestamp: Date,
+        digitalSourceType: C2PADigitalSourceType?,
+        aiGenerated: Bool?,
+        software: String?
     ) {
         self.title = title
         self.creator = creator
         self.description = description
         self.timestamp = timestamp
+        self.digitalSourceType = digitalSourceType
         self.aiGenerated = aiGenerated
         self.software = software
     }
@@ -48,6 +135,7 @@ public struct C2PASigningMetadata: Encodable, Sendable {
         case creator
         case description
         case timestamp
+        case digitalSourceType = "digital_source_type"
         case aiGenerated = "ai_generated"
         case software
     }
@@ -60,6 +148,7 @@ public struct C2PASigningMetadata: Encodable, Sendable {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
         try container.encode(formatter.string(from: timestamp), forKey: .timestamp)
+        try container.encodeIfPresent(digitalSourceType, forKey: .digitalSourceType)
         try container.encodeIfPresent(aiGenerated, forKey: .aiGenerated)
         try container.encodeIfPresent(software, forKey: .software)
     }
@@ -199,6 +288,11 @@ public struct C2PASigningService: Sendable {
             guard Self.isManifestStore(jumbf) else {
                 throw ServiceError.invalidResponse("manifest is not a JUMBF manifest store")
             }
+            if let sourceType = signRequest.metadata.digitalSourceType, !Self.manifest(jumbf, names: sourceType) {
+                throw ServiceError.invalidResponse(
+                    "manifest does not name digitalSourceType \(sourceType.rawValue); the server may predate it"
+                )
+            }
             return jumbf
         case 401:
             throw ServiceError.unauthenticated(body?.message ?? body?.error ?? "authentication required")
@@ -220,6 +314,14 @@ public struct C2PASigningService: Sendable {
             let message = body?.error ?? String(decoding: data, as: UTF8.self)
             throw ServiceError.server(statusCode: http.statusCode, message: message)
         }
+    }
+
+    /// Whether the manifest names `sourceType`. c2pa-rs writes the URI as a CBOR text string;
+    /// its length header (one byte, as every URI here is 24–255 bytes) keeps `composite`
+    /// from matching `compositeSynthetic`.
+    static func manifest(_ jumbf: Data, names sourceType: C2PADigitalSourceType) -> Bool {
+        let uri = Array(sourceType.uri.utf8)
+        return jumbf.range(of: Data([0x78, UInt8(uri.count)] + uri)) != nil
     }
 
     /// A C2PA manifest store is one JUMBF superbox (`jumb`) spanning the whole manifest
