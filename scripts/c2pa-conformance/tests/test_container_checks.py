@@ -107,6 +107,42 @@ class PlacementTests(unittest.TestCase):
         self.assertIn("truncated box header", problems[0])
 
 
+    def test_a_track_without_a_sample_size_table_is_a_problem_not_a_crash(self):
+        data = signed_layout()
+        stsz = data.index(b"stsz") - 4
+        size = struct.unpack(">I", data[stsz:stsz + 4])[0]
+        # Rename stsz to a free box, so the track has no sample sizes
+        broken = data[:stsz + 4] + b"free" + data[stsz + 8:]
+        self.assertEqual(len(broken), len(data))
+        _, problems = cc.placement(broken)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("stsz", problems[0])
+        self.assertGreater(size, 8)
+
+
+class ProbeOutputTests(unittest.TestCase):
+    def test_increasing_dts_has_no_problems(self):
+        self.assertEqual(cc.dts_problems(["0,0", "1,0", "0,512", "1,1024"]), [])
+
+    def test_a_repeated_dts_is_a_problem(self):
+        self.assertEqual(cc.dts_problems(["0,0", "0,512", "0,512"]), ["stream 0: packet dts 512 after 512"])
+
+    def test_blank_and_short_lines_are_skipped(self):
+        self.assertEqual(cc.dts_problems(["", "0,0", "0", "0,N/A", "0,512"]), [])
+
+    def test_an_ffprobe_failure_is_reported_not_raised(self):
+        class Failed:
+            returncode, stdout, stderr = 1, "", "Invalid data found when processing input"
+        real = cc.subprocess.run
+        cc.subprocess.run = lambda *args, **kwargs: Failed()
+        try:
+            found, error = cc.streams(Path("broken.mov"))
+        finally:
+            cc.subprocess.run = real
+        self.assertIsNone(found)
+        self.assertIn("Invalid data", error)
+
+
 class TamperCopyTests(unittest.TestCase):
     def test_tampering_flips_one_byte_inside_the_first_mdat_payload(self):
         data = signed_layout()

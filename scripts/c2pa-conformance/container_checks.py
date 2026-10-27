@@ -92,6 +92,9 @@ def sample_ranges(data, stbl):
         kind, width, fmt = "co64", 8, "Q"
     else:
         raise ValueError("track has neither stco nor co64")
+    for required in ("stsc", "stsz"):
+        if required not in boxes:
+            raise ValueError(f"track has no {required}")
     p = full_box_payload(data, boxes[kind])
     n = struct.unpack(">I", p[:4])[0]
     chunks = struct.unpack(f">{n}{fmt}", p[4:4 + width * n])
@@ -216,20 +219,34 @@ def decode_errors(path):
                             "-of", "csv=p=0", str(path)], capture_output=True, text=True)
     if probe.returncode:
         errors.append(f"ffprobe exited {probe.returncode}: {probe.stderr.strip()[:200]}")
-    last = {}
-    for line in probe.stdout.splitlines():
-        stream, dts = line.split(",")[:2]
-        if dts != "N/A":
-            if stream in last and int(dts) <= last[stream]:
-                errors.append(f"stream {stream}: packet dts {dts} after {last[stream]}")
-            last[stream] = int(dts)
-    return errors
+    return errors + dts_problems(probe.stdout.splitlines())
+
+
+def dts_problems(lines):
+    """Packets whose DTS doesn't strictly increase in their stream, from ffprobe's
+    `stream_index,dts` lines. Lines without both fields, and N/A, carry no DTS to compare."""
+    problems, last = [], {}
+    for line in lines:
+        fields = line.split(",")
+        if len(fields) < 2 or not fields[1].lstrip("-").isdigit():
+            continue
+        stream, dts = fields[0], int(fields[1])
+        if stream in last and dts <= last[stream]:
+            problems.append(f"stream {stream}: packet dts {dts} after {last[stream]}")
+        last[stream] = dts
+    return problems
 
 
 def streams(path):
+    """ffprobe's stream list for `path`, or None and the reason when ffprobe can't read it"""
     proc = subprocess.run(["ffprobe", "-v", "error", "-show_streams", "-of", "json", str(path)],
-                          capture_output=True, text=True, check=True)
-    return json.loads(proc.stdout)["streams"]
+                          capture_output=True, text=True)
+    if proc.returncode:
+        return None, f"ffprobe exited {proc.returncode}: {proc.stderr.strip()[:200]}"
+    try:
+        return json.loads(proc.stdout)["streams"], ""
+    except (json.JSONDecodeError, KeyError) as exc:
+        return None, f"ffprobe output unreadable: {exc}"
 
 
 def sha256(path):
@@ -276,7 +293,10 @@ def check(asset, anchors, out_dir, c2pa_sign=None):
     codes, err = c2pa_codes(t8_path, anchors, out_dir / "t8-c2patool.txt")
     no_claim = codes is None and "no claim found" in err.lower()
     errors = decode_errors(t8_path)
-    same_streams = streams(asset) == streams(t8_path)
+    signed_streams, signed_error = streams(asset)
+    removed_streams, removed_error = streams(t8_path)
+    errors += [e for e in (signed_error, removed_error) if e]
+    same_streams = signed_streams is not None and signed_streams == removed_streams
     result["T8"] = {"c2patool_stderr": err[:300], "decode_errors": errors[:5], "streams_match_signed": same_streams,
                     "pass": no_claim and not errors and same_streams}
 
