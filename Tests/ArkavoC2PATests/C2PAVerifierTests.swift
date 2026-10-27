@@ -251,6 +251,12 @@ final class C2PAVerifierTests: XCTestCase {
         }
     }
 
+    // MARK: - Transport
+
+    func testVerifyUsesTheTLS1_3SessionByDefault() {
+        XCTAssertTrue(C2PAVerifier().session === C2PASigningService.defaultSession)
+    }
+
     // MARK: - Helpers
 
     private func verifier() -> C2PAVerifier {

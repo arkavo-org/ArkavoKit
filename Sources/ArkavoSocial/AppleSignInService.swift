@@ -86,7 +86,7 @@ public class AppleSignInService: NSObject, ObservableObject {
         defer { isProcessing = false }
 
         // 1. Server-issued nonce. Bound to the session cookie via
-        //    URLSession.shared, which both this call and step 4 share.
+        //    ArkavoClient's identity session, which both this call and step 4 share.
         let rawNonce = try await client.fetchAppleNonce()
 
         // 2. Per Apple guidance: the request's `nonce` is hashed by the

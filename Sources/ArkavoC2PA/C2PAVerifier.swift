@@ -63,9 +63,12 @@ public enum C2PAVerification: Sendable, Equatable {
 /// file to the arkavo-rs `POST /c2pa/v1/validate`, which needs no sign-in.
 public struct C2PAVerifier: Sendable {
     public let serverURL: URL
-    private let session: URLSession
+    let session: URLSession
 
-    public init(serverURL: URL = C2PASigningService.defaultServerURL, session: URLSession = .shared) {
+    public init(
+        serverURL: URL = C2PASigningService.defaultServerURL,
+        session: URLSession = C2PASigningService.defaultSession
+    ) {
         self.serverURL = serverURL
         self.session = session
     }
