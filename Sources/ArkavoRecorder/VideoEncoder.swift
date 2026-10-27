@@ -5,6 +5,33 @@ import AudioToolbox
 import ArkavoStreaming
 import ArkavoMedia
 
+/// Media the file writer didn't get, by reason (#44). Buffers that arrive while paused aren't
+/// counted: dropping them is what a pause does.
+struct DroppedMedia: Equatable, Sendable, CustomStringConvertible {
+    struct Counts: Equatable, Sendable {
+        /// The writer wasn't writing (it failed, or was finishing)
+        var notWriting = 0
+        /// Audio before the first video frame started the session
+        var beforeSession = 0
+        /// The input wasn't ready for more: a real-time input that fell behind
+        var notReady = 0
+        /// The input refused the buffer
+        var rejected = 0
+
+        var total: Int { notWriting + beforeSession + notReady + rejected }
+    }
+
+    var video = Counts()
+    var audio = Counts()
+
+    var description: String {
+        func line(_ c: Counts) -> String {
+            "\(c.total) (not ready \(c.notReady), rejected \(c.rejected), not writing \(c.notWriting), before session \(c.beforeSession))"
+        }
+        return "video \(line(video)), audio \(line(audio))"
+    }
+}
+
 /// Encodes video and audio to MOV files using AVAssetWriter
 /// Supports optional simultaneous streaming via RTMP using VTCompressionSession
 ///
@@ -34,6 +61,8 @@ public actor VideoEncoder {
     private var sessionStarted: Bool = false
     /// Whether the file got at least one video frame or audio sample
     private var appendedMedia: Bool = false
+    /// What this recording dropped so far; reset when a recording starts (#44)
+    private(set) var droppedMedia = DroppedMedia()
 
     public private(set) var isRecording: Bool = false
     /// True while `finishRecording()` waits for the file to be finished
@@ -273,6 +302,7 @@ public actor VideoEncoder {
         appendedMediaEnd = .zero
         sessionStarted = false
         appendedMedia = false
+        droppedMedia = DroppedMedia()
     }
 
     /// Finishes recording and returns the output URL.
@@ -299,6 +329,9 @@ public actor VideoEncoder {
         defer { isFinishing = false }
 
         print("📊 Media appended: \(appendedMedia), Asset writer status: \(assetWriter.status.rawValue)")
+        if droppedMedia.video.total + droppedMedia.audio.total > 0 {
+            print("⚠️ VideoEncoder: this recording dropped \(droppedMedia)")
+        }
 
         // Handle based on session and writer state
         if !appendedMedia {
@@ -444,6 +477,7 @@ public actor VideoEncoder {
                 if assetWriter.status == .failed {
                     print("❌ Asset writer failed before encoding could start")
                 }
+                droppedMedia.video.notWriting += 1
                 return
             }
 
@@ -459,6 +493,7 @@ public actor VideoEncoder {
 
             // Wait if input is not ready
             if !videoInput.isReadyForMoreMediaData {
+                droppedMedia.video.notReady += 1
                 return
             }
 
@@ -472,6 +507,7 @@ public actor VideoEncoder {
                         print("   Underlying error: Domain=\(underlyingError.domain) Code=\(underlyingError.code)")
                     }
                 }
+                droppedMedia.video.notWriting += 1
                 return
             }
 
@@ -498,6 +534,7 @@ public actor VideoEncoder {
 
             // Append pixel buffer to file
             if !adaptor.append(pixelBuffer, withPresentationTime: adjustedTimestamp) {
+                droppedMedia.video.rejected += 1
                 print("❌ Failed to append video frame at timestamp \(adjustedTimestamp.seconds)")
                 if assetWriter.status == .failed {
                     let errorMessage = assetWriter.error?.localizedDescription ?? "Unknown error"
@@ -566,12 +603,14 @@ public actor VideoEncoder {
         // Handle file recording if active
         if isRecording {
             guard let writer = assetWriter, writer.status == .writing else {
+                droppedMedia.audio.notWriting += 1
                 return
             }
 
             // With video, the first video frame starts the session
             let isAudioOnly = videoInput == nil
             guard isAudioOnly || startTime != nil else {
+                droppedMedia.audio.beforeSession += 1
                 return
             }
 
@@ -583,6 +622,7 @@ public actor VideoEncoder {
 
             // Wait if input is not ready
             if !audioInput.isReadyForMoreMediaData {
+                droppedMedia.audio.notReady += 1
                 return
             }
 
@@ -636,6 +676,7 @@ public actor VideoEncoder {
             // Append audio sample to file
             // AVAssetWriterInput will automatically encode PCM to AAC
             if !audioInput.append(finalBuffer) {
+                droppedMedia.audio.rejected += 1
                 print("⚠️ Audio input [\(sourceID)] rejected sample buffer; dropping frame")
                 return
             }
