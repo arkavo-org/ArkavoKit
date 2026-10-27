@@ -23,11 +23,14 @@ struct CatalogEnvelopeTests {
 
     @Test func anEnvelopeCarriesOneCampaignOrItsOwnersCreatorAttribute() {
         for attribute in ["https://patreon.arkavo.com/attr/campaign/value/12345678",
-                          "https://patreon.arkavo.com/attr/campaign/value/a_B-9",
+                          "https://patreon.arkavo.com/attr/campaign/value/0",
                           "https://arkavo.net/attr/creator/value/\(Self.owner)"] {
             #expect(CatalogEnvelope.isEnvelopeAttribute(attribute, owner: Self.owner), "\(attribute)")
         }
         for attribute in ["https://patreon.arkavo.com/attr/campaign/value/",
+                          "https://patreon.arkavo.com/attr/campaign/value/a_B-9",
+                          "https://patreon.arkavo.com/attr/campaign/value/123a",
+                          "https://patreon.arkavo.com/attr/campaign/value/-1",
                           "https://patreon.arkavo.com/attr/campaign/value/1/tier",
                           "https://patreon.arkavo.com/attr/tier/value/1",
                           "https://arkavo.net/attr/creator/value/someone-else",
@@ -36,6 +39,19 @@ struct CatalogEnvelopeTests {
                           "http://patreon.arkavo.com/attr/campaign/value/1"] {
             #expect(!CatalogEnvelope.isEnvelopeAttribute(attribute, owner: Self.owner), "\(attribute)")
         }
+    }
+
+    /// Identity mints the creator value with the bare lowercase account UUID, so no other owner can carry it.
+    @Test func theCreatorValueNeedsABareLowercaseUUIDOwner() {
+        let uuid = "0715eaff-1c2d-4e5f-8a9b-0c1d2e3f4a5b"
+        #expect(CatalogEnvelope.isEnvelopeAttribute(CatalogEnvelope.creatorAttribute(subject: uuid), owner: uuid))
+        for owner in ["arkavo:\(uuid)", uuid.uppercased(), "0715eaff1c2d4e5f8a9b0c1d2e3f4a5b", "creator-1",
+                      "0715eaff-1c2d-4e5f-8a9b-0c1d2e3f4a5", "0715eaff-1c2d-4e5f-8a9b-0c1d2e3f4a5g"] {
+            #expect(!CatalogEnvelope.isEnvelopeAttribute(CatalogEnvelope.creatorAttribute(subject: owner), owner: owner),
+                    "\(owner)")
+        }
+        // A campaign value doesn't depend on the owner.
+        #expect(CatalogEnvelope.isEnvelopeAttribute(CatalogEnvelope.campaignAttribute(campaignID: "42"), owner: "creator-1"))
     }
 
     // MARK: Verification against the pointer
@@ -116,18 +132,26 @@ struct CatalogEnvelopeTests {
         }
     }
 
-    @Test func theBodyIsAtMostOneMebibyte() throws {
-        // A full envelope and a full index: 524,288 bytes in base64url plus 1,000 entries is more than 1 MiB.
+    @Test func theLimitIsTheNodes() {
+        #expect(CatalogPublishRequest.maxBytes == 2_097_152)
+    }
+
+    /// The largest envelope with the largest index, 1,000 entries with 256-byte contentIDs and the largest numbers, is
+    /// more than 1 MiB and fits under the node's 2 MiB.
+    @Test func theLargestCatalogFits() throws {
         let envelope = Data(repeating: 7, count: CatalogEnvelope.maxBytes)
         let entries = (0..<1_000).map { index in
-            CreatorCatalog.Entry(contentID: String(repeating: "c", count: 200) + "\(index)", version: 1,
-                                 payloadHash: CreatorCatalogTests.hex(index), payloadSize: 1,
-                                 metadataHash: CreatorCatalogTests.hex(index + 10_000), metadataSize: 1)
+            let suffix = String(index)
+            return CreatorCatalog.Entry(
+                contentID: String(repeating: "c", count: CatalogField.maxContentIDBytes - suffix.count) + suffix,
+                version: CatalogField.maxVersion, payloadHash: CreatorCatalogTests.hex(index),
+                payloadSize: CatalogField.maxPayloadSize, metadataHash: CreatorCatalogTests.hex(index + 10_000),
+                metadataSize: CreatorCatalog.maxMetadataSize)
         }
         let catalog = CreatorCatalog(owner: Self.owner, entries: entries)
-        #expect(throws: CatalogPublishRequestError.tooLarge) {
-            try CatalogPublishRequest.body(envelope: envelope, bundle: Self.bundle(for: envelope), catalog: catalog,
-                                           blake3: CreatorCatalogTests.sha256)
-        }
+        let body = try CatalogPublishRequest.body(envelope: envelope, bundle: Self.bundle(for: envelope),
+                                                  catalog: catalog, blake3: CreatorCatalogTests.sha256)
+        #expect(body.count > 1_048_576)
+        #expect(body.count <= CatalogPublishRequest.maxBytes)
     }
 }
