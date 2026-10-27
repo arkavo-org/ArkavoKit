@@ -40,11 +40,22 @@ You need `git`, `python3` and `c2patool`, plus `ffmpeg` and `ffprobe` for the co
 
 ## Signing a sample
 
-Sign with `c2pa-sign` against the server under test, then check the result:
+Production signing (platform.arkavo.net) needs two things since arkavo-org/arkavo-rs#133: a passkey token, and an App Attest device token from Creator on an attested Mac. So `c2pa-sign` can't sign against production, and production samples come from Creator.
+
+- **A recording:** record with signing on.
+- **Any other file:** a fixture from `make_fixtures.sh`, for example. In a Debug build of Creator, use **Debug → Sign a File…**. It writes `<name>-signed.<ext>` beside the input and labels the file `algorithmicMedia`.
+
+Then check the result:
 
 ```bash
-swift run c2pa-sign recording.mov signed.mov --server https://platform.arkavo.net --token "$ARKAVO_TOKEN"
-scripts/c2pa-conformance/run.sh signed.mov --trust-anchors arkavo_c2pa_ca.pem --tsa-anchors default
+scripts/c2pa-conformance/run.sh signed.mov --trust-anchors arkavo_c2pa_ca.pem --tsa-anchors default \
+    --unsigned original.mov --c2pa-sign .build/debug/c2pa-sign
+```
+
+`c2pa-sign` still signs against a test server, one without `C2PA_REQUIRE_DEVICE`:
+
+```bash
+swift run c2pa-sign recording.mov signed.mov --server https://arks.test --token "$TEST_TOKEN"
 ```
 
 For a passing run, the server must sign with a timestamp authority on the C2PA TSA trust list (arks `C2PA_TSA_URL`).
