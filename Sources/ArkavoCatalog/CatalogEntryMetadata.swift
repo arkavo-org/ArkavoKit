@@ -44,8 +44,8 @@ public struct CatalogEntryMetadata: Sendable, Equatable {
     }
 
     /// Whether this metadata describes `entry`: the same `contentID`, `version` and `payloadHash`, byte for byte. Call
-    /// it only with an entry of a catalog whose pointer verified, after the metadata TDF's bytes hashed to the entry's
-    /// `metadataHash`.
+    /// it only with an entry of a catalog whose pointer verified, on the payload of the metadata TDF in that entry's own
+    /// `metadata`.
     public func isBound(to entry: CreatorCatalog.Entry) -> Bool {
         contentID.utf8.elementsEqual(entry.contentID.utf8) && version == entry.version
             && payloadHash.utf8.elementsEqual(entry.payloadHash.utf8)

@@ -14,7 +14,7 @@ struct CatalogEnvelopeTests {
 
     @Test func theConstantsAreTheNodes() {
         #expect(CatalogEnvelope.mimeType == "application/vnd.arkavo.creator-catalog+json")
-        #expect(CatalogEnvelope.maxBytes == 524_288)
+        #expect(CatalogEnvelope.maxBytes == 4_194_304)
         #expect(CatalogEnvelope.campaignAttribute(campaignID: "123")
             == "https://patreon.arkavo.com/attr/campaign/value/123")
         #expect(CatalogEnvelope.creatorAttribute(subject: Self.owner)
@@ -133,11 +133,11 @@ struct CatalogEnvelopeTests {
     }
 
     @Test func theLimitIsTheNodes() {
-        #expect(CatalogPublishRequest.maxBytes == 2_097_152)
+        #expect(CatalogPublishRequest.maxBytes == 10_485_760)
     }
 
     /// The largest envelope with the largest index, 1,000 entries with 256-byte contentIDs and the largest numbers, is
-    /// more than 1 MiB and fits under the node's 2 MiB.
+    /// about 6 MB and fits under the node's 10 MiB.
     @Test func theLargestCatalogFits() throws {
         let envelope = Data(repeating: 7, count: CatalogEnvelope.maxBytes)
         let entries = (0..<1_000).map { index in
@@ -145,13 +145,12 @@ struct CatalogEnvelopeTests {
             return CreatorCatalog.Entry(
                 contentID: String(repeating: "c", count: CatalogField.maxContentIDBytes - suffix.count) + suffix,
                 version: CatalogField.maxVersion, payloadHash: CreatorCatalogTests.hex(index),
-                payloadSize: CatalogField.maxPayloadSize, metadataHash: CreatorCatalogTests.hex(index + 10_000),
-                metadataSize: CreatorCatalog.maxMetadataSize)
+                payloadSize: CatalogField.maxPayloadSize, metadata: CreatorCatalogTests.metadata)
         }
         let catalog = CreatorCatalog(owner: Self.owner, entries: entries)
         let body = try CatalogPublishRequest.body(envelope: envelope, bundle: Self.bundle(for: envelope),
                                                   catalog: catalog, blake3: CreatorCatalogTests.sha256)
-        #expect(body.count > 1_048_576)
+        #expect(body.count > 5_000_000)
         #expect(body.count <= CatalogPublishRequest.maxBytes)
     }
 }

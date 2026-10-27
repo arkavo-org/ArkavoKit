@@ -1,9 +1,11 @@
 import Foundation
 import Testing
+import ZIPFoundation
 @testable import ArkavoCatalog
 
-/// The node's publish checks, mirrored from tdf-iroh-s3's `catalog_metadata.rs` tests and its `/2` envelope checks (#39),
-/// plus the design's own rules: fresh policy uuids, and an envelope with no dissemination list.
+/// The checks before a publish: the node's envelope checks (#39), and the metadata checks it no longer runs, mirrored from
+/// tdf-iroh-s3's `catalog_metadata.rs` tests, on the metadata TDFs inside the entries. Plus the design's own rules: fresh
+/// policy uuids, and an envelope with no dissemination list.
 struct CatalogPublicationCheckTests {
     static let kas = "https://platform.arkavo.net/kas"
     static let campaign = "https://patreon.arkavo.com/attr/campaign/value/12345678"
@@ -210,88 +212,117 @@ struct CatalogPublicationCheckTests {
 
     // MARK: A whole catalog
 
-    static func catalog(_ count: Int) -> CreatorCatalog {
+    /// A ZTDF archive holding `manifest` as `name`, and a payload.
+    static func ztdf(_ manifest: Data, name: String = "manifest.json") -> Data {
+        let archive = try! Archive(accessMode: .create)
+        for (path, bytes) in [(name, manifest), ("0.payload", Data(repeating: 1, count: 32))] {
+            try! archive.addEntry(with: path, type: .file, uncompressedSize: Int64(bytes.count)) { position, size in
+                bytes.subdata(in: Int(position)..<Int(position) + size)
+            }
+        }
+        return archive.data!
+    }
+
+    static func catalog(_ count: Int, metadataIDs: [String]? = nil,
+                        metadata: [Int: Data] = [:]) -> CreatorCatalog {
         CreatorCatalog(owner: "owner", entries: (0..<count).map { index in
             CreatorCatalog.Entry(contentID: "rec-\(index)", version: 1, payloadHash: CreatorCatalogTests.hex(index),
-                                 payloadSize: 1, metadataHash: CreatorCatalogTests.hex(index + 100), metadataSize: 1)
+                                 payloadSize: 1, metadata: metadata[index]
+                                     ?? ztdf(manifest(metadataPolicy(uuid: metadataIDs?[index] ?? "metadata-\(index)"))))
         })
     }
 
-    static func manifests(_ count: Int, metadataIDs: [String]? = nil) -> [String: Data] {
-        var manifests: [String: Data] = [:]
+    static func recordings(_ count: Int) -> [String: Data] {
+        var recordings: [String: Data] = [:]
         for index in 0..<count {
-            manifests[CreatorCatalogTests.hex(index)] = manifest(recordingPolicy(uuid: "recording-\(index)"),
-                                                                 mimeType: "video/mp4")
-            manifests[CreatorCatalogTests.hex(index + 100)] = manifest(metadataPolicy(uuid: metadataIDs?[index]
-                    ?? "metadata-\(index)"))
+            recordings[CreatorCatalogTests.hex(index)] = manifest(recordingPolicy(uuid: "recording-\(index)"),
+                                                                  mimeType: "video/mp4")
         }
-        return manifests
+        return recordings
     }
 
-    static func checkCatalog(_ count: Int, envelope: Data = envelope(),
-                             manifests: [String: Data]? = nil) throws(CatalogPublicationError) {
-        try CatalogPublicationCheck.check(catalog(count), envelope: envelope, manifests: manifests ?? Self.manifests(count))
+    static func checkCatalog(_ catalog: CreatorCatalog, envelope: Data = envelope(),
+                             recordings: [String: Data]? = nil) throws(CatalogPublicationError) {
+        try CatalogPublicationCheck.check(catalog, envelope: envelope,
+                                          recordings: recordings ?? Self.recordings(catalog.entries.count))
     }
 
     @Test func aCatalogWhoseTDFsFitPasses() {
-        #expect(throws: Never.self) { try Self.checkCatalog(3) }
-        #expect(throws: Never.self) { try Self.checkCatalog(0) }
+        #expect(throws: Never.self) { try Self.checkCatalog(Self.catalog(3)) }
+        #expect(throws: Never.self) { try Self.checkCatalog(Self.catalog(0)) }
+    }
+
+    @Test func theLegacyManifestNameIsRead() {
+        let legacy = Self.ztdf(Self.manifest(Self.metadataPolicy(uuid: "m")), name: "0.manifest.json")
+        #expect(throws: Never.self) { try Self.checkCatalog(Self.catalog(1, metadata: [0: legacy])) }
     }
 
     @Test func theEnvelopeIsCheckedFirst() {
         #expect(throws: CatalogPublicationError.unreadableEnvelope) {
-            try Self.checkCatalog(3, envelope: Data("{}".utf8))
+            try Self.checkCatalog(Self.catalog(3), envelope: Data("{}".utf8))
         }
         #expect(throws: CatalogPublicationError.envelope(.notACatalog)) {
-            try Self.checkCatalog(3, envelope: Self.envelope(mimeType: "application/json"), manifests: [:])
+            try Self.checkCatalog(Self.catalog(3), envelope: Self.envelope(mimeType: "application/json"), recordings: [:])
         }
     }
 
     @Test func everyRecordingCarriesTheEnvelopeAttribute() {
-        var manifests = Self.manifests(3)
-        manifests[CreatorCatalogTests.hex(2)] = Self.manifest(
+        var recordings = Self.recordings(3)
+        recordings[CreatorCatalogTests.hex(2)] = Self.manifest(
             ["uuid": "recording-2", "body": ["dataAttributes": [["attribute": Self.other]], "dissem": [String]()]],
             mimeType: "video/mp4")
-        manifests[CreatorCatalogTests.hex(102)] = Self.manifest(Self.metadataPolicy(uuid: "metadata-2",
-                                                                                    attributes: [["attribute": Self.other]]))
+        let otherMetadata = Self.ztdf(Self.manifest(Self.metadataPolicy(uuid: "metadata-2",
+                                                                        attributes: [["attribute": Self.other]])))
         #expect(throws: CatalogPublicationError.lacksCatalogAttribute(2)) {
-            try Self.checkCatalog(3, manifests: manifests)
+            try Self.checkCatalog(Self.catalog(3, metadata: [2: otherMetadata]), recordings: recordings)
         }
         let withExtraKey = [["attribute": Self.campaign, "displayName": "Campaign"]]
-        manifests = Self.manifests(1)
-        manifests[CreatorCatalogTests.hex(0)] = Self.manifest(
+        recordings = Self.recordings(1)
+        recordings[CreatorCatalogTests.hex(0)] = Self.manifest(
             ["uuid": "recording-0", "body": ["dataAttributes": withExtraKey, "dissem": [String]()]], mimeType: "video/mp4")
-        manifests[CreatorCatalogTests.hex(100)] = Self.manifest(Self.metadataPolicy(attributes: withExtraKey))
-        #expect(throws: Never.self) { try Self.checkCatalog(1, manifests: manifests) }
+        let metadata = Self.ztdf(Self.manifest(Self.metadataPolicy(attributes: withExtraKey)))
+        #expect(throws: Never.self) { try Self.checkCatalog(Self.catalog(1, metadata: [0: metadata]), recordings: recordings) }
     }
 
     @Test func theEnvelopesKASIsNotComparedWithTheRecordings() {
-        #expect(throws: Never.self) { try Self.checkCatalog(2, envelope: Self.envelope(kas: ["https://kas.example.com"])) }
+        #expect(throws: Never.self) {
+            try Self.checkCatalog(Self.catalog(2), envelope: Self.envelope(kas: ["https://kas.example.com"]))
+        }
     }
 
     @Test func aRepeatedMetadataPolicyIDNamesBothEntries() {
         #expect(throws: CatalogPublicationError.duplicatePolicyID(2, first: 0)) {
-            try Self.checkCatalog(3, manifests: Self.manifests(3, metadataIDs: ["a", "b", "a"]))
+            try Self.checkCatalog(Self.catalog(3, metadataIDs: ["a", "b", "a"]))
         }
         #expect(throws: CatalogPublicationError.reusesEnvelopePolicyID(1)) {
-            try Self.checkCatalog(3, manifests: Self.manifests(3, metadataIDs: ["a", "envelope", "c"]))
+            try Self.checkCatalog(Self.catalog(3, metadataIDs: ["a", "envelope", "c"]))
         }
     }
 
     @Test func aRefusalNamesItsEntry() {
-        var manifests = Self.manifests(3)
-        manifests[CreatorCatalogTests.hex(101)] = Self.manifest(Self.metadataPolicy(), mimeType: "application/json")
+        let untyped = Self.ztdf(Self.manifest(Self.metadataPolicy(), mimeType: "application/json"))
         #expect(throws: CatalogPublicationError.metadata(1, .notCatalogMetadata)) {
-            try Self.checkCatalog(3, manifests: manifests)
+            try Self.checkCatalog(Self.catalog(3, metadata: [1: untyped]))
         }
     }
 
     @Test func missingAndUnreadableManifestsNameTheirEntry() {
-        var manifests = Self.manifests(2)
-        manifests[CreatorCatalogTests.hex(1)] = nil
-        #expect(throws: CatalogPublicationError.missingManifest(1)) { try Self.checkCatalog(2, manifests: manifests) }
-        manifests = Self.manifests(2)
-        manifests[CreatorCatalogTests.hex(100)] = Data("{}".utf8)
-        #expect(throws: CatalogPublicationError.unreadableManifest(0)) { try Self.checkCatalog(2, manifests: manifests) }
+        var recordings = Self.recordings(2)
+        recordings[CreatorCatalogTests.hex(1)] = nil
+        #expect(throws: CatalogPublicationError.missingManifest(1)) {
+            try Self.checkCatalog(Self.catalog(2), recordings: recordings)
+        }
+        recordings = Self.recordings(2)
+        recordings[CreatorCatalogTests.hex(1)] = Data("{}".utf8)
+        #expect(throws: CatalogPublicationError.unreadableManifest(1)) {
+            try Self.checkCatalog(Self.catalog(2), recordings: recordings)
+        }
+        // The metadata isn't a ZTDF, has no manifest, or its manifest is not one.
+        for metadata in [Data("not a zip".utf8), Self.ztdf(Data("{}".utf8)), Self.ztdf(Self.manifest(Self.metadataPolicy()),
+                                                                                     name: "other.json")] {
+            #expect(throws: CatalogPublicationError.unreadableManifest(0)) {
+                try Self.checkCatalog(Self.catalog(2, metadata: [0: metadata]))
+            }
+        }
     }
 }
