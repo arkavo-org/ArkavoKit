@@ -25,11 +25,14 @@ scripts/c2pa-conformance/run.sh signed.mov \
 | T6, media tamper | A copy with one byte flipped in the middle of the first `mdat` reports `assertion.dataHash.mismatch`. |
 | T8, manifest removal | A copy whose manifest box is renamed to a same-size `free` box, so no offset moves, has no claim, decodes cleanly and has the same streams as the signed file. |
 | T9, re-sign | With `--c2pa-sign PATH`: `c2pa-sign` refuses the signed file because it already has a manifest, before any request (the server given is one that refuses connections), and writes no output. |
+| T10, embedding | With `--unsigned PATH`, the file before signing: the signed file has the same streams (ffprobe) and every packet's payload (`ffmpeg -f framemd5 -c copy`). |
+| T7, transplant | With `--transplant-from PATH`, another signed file: this file with that one's manifest box fails validation. A box of the same size (so the same layout) must fail on the hard binding, `assertion.dataHash.mismatch`. |
 
 - **Copies only:** the tampered copies go under `<out>/containers/`. The input is only read, and its SHA-256 is checked afterwards.
 - **Standalone:** `container_checks.py --anchors CA.pem --out DIR [--c2pa-sign PATH] asset...` runs the same checks without the rubrics.
 - **Tests:** the checker's own tests use hand-built files: `python3 -m unittest discover -s scripts/c2pa-conformance/tests`.
-- **Still manual:** comparing sample counts through AVAssetReader, and T5, T7, T10 and S5 (#36).
+- **Fixtures:** `make_fixtures.sh OUT_DIR` generates the unsigned inputs for T7, T10 and S5: two same-layout clips, and a 4.3 GB file whose chunk offsets sit just under 2³², so signing must turn `stco` into `co64`. Sign them with `c2pa-sign`, then run `run.sh` on the signed files. The media stays out of the repo.
+- **Still manual:** comparing sample counts through AVAssetReader. T5 has no validator on an engine other than c2pa-rs yet (#36).
 
 ## Setup
 

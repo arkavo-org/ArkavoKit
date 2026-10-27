@@ -174,8 +174,12 @@ def main():
                         help="python with the evaluator's requirements (default: this one)")
     parser.add_argument("--c2pa-sign", type=Path, metavar="PATH",
                         help="c2pa-sign binary: also check it refuses the signed file (T9)")
+    parser.add_argument("--unsigned", type=Path, metavar="PATH",
+                        help="the file before signing: also check the embedding changed no stream or packet (T10)")
+    parser.add_argument("--transplant-from", type=Path, metavar="PATH",
+                        help="another signed file: also check its manifest box fails here (T7)")
     parser.add_argument("--no-container-checks", action="store_true",
-                        help="skip T14/T6/T8/T9 on a MOV/MP4/M4A")
+                        help="skip T14/T6/T8/T9/T10/T7 on a MOV/MP4/M4A")
     args = parser.parse_args()
 
     if import_error is not None:
@@ -191,8 +195,11 @@ def main():
             fail_usage(f"missing {path}")
 
     containers = (not args.no_container_checks and args.asset.suffix.lower() in container_checks.BMFF_SUFFIXES)
-    if args.c2pa_sign and not containers:
-        fail_usage("--c2pa-sign runs with the container checks, on a MOV/MP4/M4A")
+    if (args.c2pa_sign or args.unsigned or args.transplant_from) and not containers:
+        fail_usage("--c2pa-sign, --unsigned and --transplant-from run with the container checks, on a MOV/MP4/M4A")
+    for extra in (args.unsigned, args.transplant_from):
+        if extra and not extra.is_file():
+            fail_usage(f"no such file: {extra}")
     if containers:
         missing = container_checks.missing_tools(args.c2pa_sign)
         if missing:
@@ -246,7 +253,8 @@ def main():
 
     container_result = None
     if containers:
-        container_result = container_checks.check(args.asset, anchors, out_dir / "containers", args.c2pa_sign)
+        container_result = container_checks.check(args.asset, anchors, out_dir / "containers", args.c2pa_sign,
+                                                  args.unsigned, args.transplant_from)
         container_checks.print_result(container_result)
 
     (out_dir / "summary.json").write_text(json.dumps(
