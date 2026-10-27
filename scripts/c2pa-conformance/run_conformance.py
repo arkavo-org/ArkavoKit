@@ -200,6 +200,8 @@ def main():
     for extra in (args.unsigned, args.transplant_from):
         if extra and not extra.is_file():
             fail_usage(f"no such file: {extra}")
+    if args.transplant_from and not container_checks.has_manifest_box(args.transplant_from):
+        fail_usage(f"--transplant-from needs a signed file: {args.transplant_from} has no C2PA manifest box")
     if containers:
         missing = container_checks.missing_tools(args.c2pa_sign)
         if missing:

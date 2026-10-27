@@ -187,12 +187,52 @@ def tampered(data):
 
 def transplanted(data, donor):
     """T7: `data` with its manifest box replaced by `donor`'s, and whether the two boxes are the
-    same size, so that no media offset moves"""
-    own = manifest_boxes(parse_boxes(data, 0, len(data)), data)[0]
-    theirs = manifest_boxes(parse_boxes(donor, 0, len(donor)), donor)[0]
+    same size, so that no media offset moves. ValueError when either has no manifest box."""
+    own = manifest_boxes(parse_boxes(data, 0, len(data)), data)
+    theirs = manifest_boxes(parse_boxes(donor, 0, len(donor)), donor)
+    if not own or not theirs:
+        raise ValueError("the donor has no C2PA manifest box" if own else "the file has no C2PA manifest box")
+    own, theirs = own[0], theirs[0]
     box = donor[theirs["offset"]:theirs["offset"] + theirs["size"]]
     copy = data[:own["offset"]] + box + data[own["offset"] + own["size"]:]
     return bytes(copy), theirs["size"] == own["size"]
+
+
+def t7_refused(codes, err, aligned):
+    """Whether validation rejected a transplant. A same-size box must fail on the hard binding. A
+    different-size box needs a failure code, or c2patool saying it found no usable manifest; a
+    report c2patool couldn't produce for some other reason is not a rejection."""
+    if aligned:
+        return codes is not None and "assertion.dataHash.mismatch" in codes["failure"]
+    if codes is not None:
+        return bool(codes["failure"])
+    return any(phrase in err.lower() for phrase in ("no claim found", "jumbf"))
+
+
+def has_manifest_box(path):
+    """Whether `path` has a top-level C2PA manifest box. Reads box headers only, so a large file
+    costs a few seeks; a file that isn't BMFF has none."""
+    try:
+        with open(path, "rb") as f:
+            size = f.seek(0, 2)
+            offset = 0
+            while offset + 8 <= size:
+                f.seek(offset)
+                header = f.read(32)
+                box_size, kind = struct.unpack(">I4s", header[:8])
+                hdr = 8
+                if box_size == 1:
+                    box_size, hdr = struct.unpack(">Q", header[8:16])[0], 16
+                elif box_size == 0:
+                    box_size = size - offset
+                if box_size < hdr or offset + box_size > size:
+                    return False
+                if kind == b"uuid" and header[hdr:hdr + 16] == C2PA_UUID:
+                    return True
+                offset += box_size
+    except (OSError, struct.error):
+        return False
+    return False
 
 
 def manifest_removed(data):
@@ -364,15 +404,17 @@ def check(asset, anchors, out_dir, c2pa_sign=None, unsigned=None, donor=None):
                          "pass": same_streams and not differences and not errors}
 
     if donor:
-        copy, aligned = transplanted(data, donor.read_bytes())
-        t7_path = out_dir / f"t7-transplanted{asset.suffix}"
-        t7_path.write_bytes(copy)
-        codes, err = c2pa_codes(t7_path, anchors, out_dir / "t7-c2patool.txt")
-        if aligned:
-            refused = codes is not None and "assertion.dataHash.mismatch" in codes["failure"]
+        try:
+            copy, aligned = transplanted(data, donor.read_bytes())
+        except (ValueError, OSError) as exc:
+            result["T7"] = {"donor": str(donor), "aligned": None, "codes": None,
+                            "stderr": f"donor unusable: {exc}", "pass": False}
         else:
-            refused = codes is None or bool(codes["failure"])
-        result["T7"] = {"donor": str(donor), "aligned": aligned, "codes": codes, "stderr": err[:300], "pass": refused}
+            t7_path = out_dir / f"t7-transplanted{asset.suffix}"
+            t7_path.write_bytes(copy)
+            codes, err = c2pa_codes(t7_path, anchors, out_dir / "t7-c2patool.txt")
+            result["T7"] = {"donor": str(donor), "aligned": aligned, "codes": codes, "stderr": err[:300],
+                            "pass": t7_refused(codes, err, aligned)}
 
     result["input_unchanged"] = sha256(asset) == before
     result["pass"] = result["input_unchanged"] and all(
@@ -408,7 +450,7 @@ def print_result(result):
             print(f"    - {e}")
     if "T7" in result:
         t7 = result["T7"]
-        kind = "same-size box" if t7["aligned"] else "different-size box"
+        kind = {True: "same-size box", False: "different-size box", None: "no transplant"}[t7["aligned"]]
         print(f"T7 transplant:      {'PASS' if t7['pass'] else 'FAIL'}  {kind} from {Path(t7['donor']).name}, "
               f"failure={t7['codes'] and t7['codes']['failure']}{'' if t7['codes'] else ' stderr=' + t7['stderr'][:80]}")
     if not result["input_unchanged"]:
@@ -431,6 +473,10 @@ def main():
         if extra and not extra.is_file():
             print(f"error: no such file: {extra}", file=sys.stderr)
             sys.exit(2)
+    if args.transplant_from and not has_manifest_box(args.transplant_from):
+        print(f"error: --transplant-from needs a signed file: {args.transplant_from} has no C2PA manifest box",
+              file=sys.stderr)
+        sys.exit(2)
     missing = missing_tools(args.c2pa_sign)
     if missing:
         print(f"error: missing {', '.join(missing)}", file=sys.stderr)
