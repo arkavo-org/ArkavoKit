@@ -18,6 +18,7 @@ or a waiver that breaks policy).
 import argparse
 import datetime as dt
 import json
+import math
 import os
 import re
 import sys
@@ -43,9 +44,12 @@ def group_level(group, vulns_by_id):
     """Return (level, score text) for one group of aliased advisories."""
     best = "UNKNOWN"
     shown = ""
+    # osv-scanner writes "0" (or nothing) when it could compute no CVSS score. Only a positive,
+    # finite score rates the finding; anything else leaves it to the label below, or UNKNOWN.
     try:
         score = float(group.get("max_severity") or "")
-        best, shown = level_from_score(score), f"{score:.1f}"
+        if math.isfinite(score) and score > 0:
+            best, shown = level_from_score(score), f"{score:.1f}"
     except ValueError:
         pass
     # Advisory databases also carry a text rating (GHSA: database_specific.severity).
