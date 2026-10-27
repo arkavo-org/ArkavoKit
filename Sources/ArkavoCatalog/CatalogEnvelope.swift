@@ -5,8 +5,11 @@ import Foundation
 ///
 /// Its policy has only `uuid` (fresh) and `body`, with exactly one data attribute and no dissemination list, so anyone
 /// who can play anything in the catalog can open the list:
-/// - a creator with a Patreon campaign: `https://patreon.arkavo.com/attr/campaign/value/<campaign id>`;
-/// - a creator without one: `https://arkavo.net/attr/creator/value/<sub>`, which only the creator holds.
+/// - a creator with a Patreon campaign: `https://patreon.arkavo.com/attr/campaign/value/<campaign id>`, the numeric id
+///   the platform grants patrons;
+/// - a creator without one: `https://arkavo.net/attr/creator/value/<account UUID>`, which only the creator holds.
+///   Identity mints it with the bare lowercase account UUID (the passkey CWT's `sub`, `arkavo_account_id` on every
+///   token), never `arkavo:<uuid>`, so the catalog's owner must be that UUID.
 ///
 /// Never both, since the platform ANDs across attribute definitions. That attribute must be in every entry's recording
 /// policy (`CatalogPublicationCheck`). Wrapping and unwrapping the envelope are the caller's, with OpenTDFKit.
@@ -18,30 +21,38 @@ public enum CatalogEnvelope {
     public static let campaignAttributePrefix = "https://patreon.arkavo.com/attr/campaign/value/"
     public static let creatorAttributePrefix = "https://arkavo.net/attr/creator/value/"
 
-    /// The attribute of a creator with a Patreon campaign.
+    /// The attribute of a creator with a Patreon campaign. `isEnvelopeAttribute` requires a numeric id.
     public static func campaignAttribute(campaignID: String) -> String {
         campaignAttributePrefix + campaignID
     }
 
-    /// The attribute of a creator without a campaign.
+    /// The attribute of a creator without a campaign. `subject` is the bare lowercase account UUID, never
+    /// `arkavo:<uuid>`; `isEnvelopeAttribute` refuses anything else.
     public static func creatorAttribute(subject: String) -> String {
         creatorAttributePrefix + subject
     }
 
-    /// Whether `attribute` may be an envelope's for the catalog of `owner`: a campaign value (a non-empty id of
-    /// `[A-Za-z0-9_-]`), or the creator value whose subject is `owner`, byte for byte.
+    /// Whether `attribute` may be an envelope's for the catalog of `owner`, as the platform grants them: a campaign value
+    /// with a numeric id (the platform's Patreon source grants only `^[0-9]+$`), or the creator value of `owner`, byte for
+    /// byte, when `owner` is a bare lowercase account UUID. A value the platform never grants would lock everyone out.
     public static func isEnvelopeAttribute(_ attribute: String, owner: String) -> Bool {
         let bytes = Array(attribute.utf8)
         let campaign = Array(campaignAttributePrefix.utf8)
         if bytes.starts(with: campaign) {
             let id = bytes.dropFirst(campaign.count)
-            return !id.isEmpty && id.allSatisfy { byte in
-                (UInt8(ascii: "0")...UInt8(ascii: "9")).contains(byte) || (UInt8(ascii: "A")...UInt8(ascii: "Z")).contains(byte)
-                    || (UInt8(ascii: "a")...UInt8(ascii: "z")).contains(byte) || byte == UInt8(ascii: "_")
-                    || byte == UInt8(ascii: "-")
-            }
+            return !id.isEmpty && id.allSatisfy { (UInt8(ascii: "0")...UInt8(ascii: "9")).contains($0) }
         }
-        return bytes == Array(creatorAttribute(subject: owner).utf8)
+        return isAccountUUID(owner) && bytes == Array(creatorAttribute(subject: owner).utf8)
+    }
+
+    /// `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` in lowercase hex, as identity writes an account id.
+    static func isAccountUUID(_ value: String) -> Bool {
+        let bytes = Array(value.utf8)
+        guard bytes.count == 36 else { return false }
+        return bytes.enumerated().allSatisfy { index, byte in
+            [8, 13, 18, 23].contains(index) ? byte == UInt8(ascii: "-")
+                : (UInt8(ascii: "0")...UInt8(ascii: "9")).contains(byte) || (UInt8(ascii: "a")...UInt8(ascii: "f")).contains(byte)
+        }
     }
 
     /// Checks fetched envelope bytes against the verified pointer that names them, in this order: the size limit
@@ -68,9 +79,10 @@ public enum CatalogPublishRequestError: Error, Sendable, Equatable {
 }
 
 /// The body of `PUT /v2/catalogs/{sub}`, the only route that publishes `/2`:
-/// `{"bundle":{…},"document":"<base64url envelope>","index":[…]}`, at most 1 MiB.
+/// `{"bundle":{…},"document":"<base64url envelope>","index":[…]}`, at most 2 MiB, the node's limit. The largest envelope
+/// is about 700 KiB in base64url and the largest index about 500 KiB, so any valid catalog fits.
 public enum CatalogPublishRequest {
-    public static let maxBytes = 1_048_576
+    public static let maxBytes = 2_097_152
 
     /// The body for `envelope`, signed by `bundle`, listing `catalog` (the envelope's payload) in the clear as `index`.
     /// The pointer must name the envelope's size and hash (with the caller's BLAKE3) and the catalog's owner. The node

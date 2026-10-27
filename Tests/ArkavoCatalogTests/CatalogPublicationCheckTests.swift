@@ -161,8 +161,13 @@ struct CatalogPublicationCheckTests {
 
     @Test func anEnvelopeWithOneCampaignAttributeFits() {
         #expect(Self.checkEnvelope(Self.envelope()) == nil)
-        #expect(Self.checkEnvelope(Self.envelope(attributes: [["attribute": "https://arkavo.net/attr/creator/value/owner"]]))
-            == nil)
+        let uuid = "0715eaff-1c2d-4e5f-8a9b-0c1d2e3f4a5b"
+        let creator = [["attribute": "https://arkavo.net/attr/creator/value/\(uuid)"]]
+        #expect(Self.checkEnvelope(Self.envelope(attributes: creator), owner: uuid) == nil)
+        #expect(Self.checkEnvelope(Self.envelope(attributes: [["attribute": "https://arkavo.net/attr/creator/value/arkavo:\(uuid)"]]),
+                                   owner: "arkavo:\(uuid)") == .attribute)
+        #expect(Self.checkEnvelope(Self.envelope(attributes: [["attribute": "https://patreon.arkavo.com/attr/campaign/value/a1"]]))
+            == .attribute)
     }
 
     @Test func theEnvelopeMustHaveTheCatalogType() {
