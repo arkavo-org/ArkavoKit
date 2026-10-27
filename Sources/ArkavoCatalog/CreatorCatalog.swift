@@ -11,16 +11,19 @@ public enum CreatorCatalogError: Error, Sendable, Equatable {
     case metadataHashIsPayloadHash(Int)
 }
 
-/// Why a document is not the one a verified catalog pointer names. The checks run in this order.
+/// Why a fetched catalog is not the one a verified pointer names. `CatalogEnvelope.verify` checks the envelope's bytes
+/// (the first three cases); `CreatorCatalog.decode(_:owner:)` checks its decrypted payload (the last two).
 public enum CatalogDocumentError: Error, Sendable, Equatable {
     case tooLarge, sizeMismatch, hashMismatch
     case invalid(CreatorCatalogError)
     case ownerMismatch
 }
 
-/// A creator's catalog, `arkavo.creator-catalog/2` (tdf-iroh-s3 `docs/creator-catalogs.md`). Only what the node and
-/// moderation need is in the clear. Each entry's title, publish time and attributes are in its metadata TDF
-/// (`CatalogEntryMetadata`), a small ZTDF under the recording's own policy.
+/// A creator's catalog, `arkavo.creator-catalog/2` (tdf-iroh-s3 `docs/creator-catalogs.md`, amended on tdf-iroh-s3#38
+/// on 2026-10-27). The document is the payload of one ZTDF, the envelope (`CatalogEnvelope`), whose bytes the signed
+/// pointer names. Each entry's title, publish time and attributes are in its own metadata TDF (`CatalogEntryMetadata`),
+/// a small ZTDF under the recording's policy. The node never decrypts either, so a publish also sends the entries in the
+/// clear as `index` (`encodedIndex()`), which the node checks and never serves.
 ///
 /// - One strict UTF-8 JSON object (`StrictJSON`: no byte-order mark, nothing after it, no repeated key) of at most
 ///   524,288 bytes, with exactly `schema`, `owner` and `entries`.
@@ -129,6 +132,12 @@ public struct CreatorCatalog: Sendable, Equatable {
         guard root["schema"] == .string(schema) else { throw .schema }
         guard let owner = root["owner"]?.string, CatalogField.isValidSubject(owner) else { throw .owner }
         guard let items = root["entries"]?.array else { throw .entries }
+        return CreatorCatalog(owner: owner, entries: try entries(items))
+    }
+
+    /// The entry rules a document and an index share: at most 1,000, each valid, unique contentIDs, then the metadata
+    /// hashes.
+    private static func entries(_ items: [StrictJSON]) throws(CreatorCatalogError) -> [Entry] {
         guard items.count <= maxEntries else { throw .tooManyEntries }
         var contentIDs = Set<[UInt8]>()
         var entries: [Entry] = []
@@ -139,24 +148,39 @@ public struct CreatorCatalog: Sendable, Equatable {
             entries.append(entry)
         }
         try checkMetadataHashes(entries)
-        return CreatorCatalog(owner: owner, entries: entries)
+        return entries
     }
 
-    /// Verifies a fetched document against the pointer that names it, in this order: the size limit, the pointer's
-    /// `catalogSize`, its `catalogHash` (with the caller's BLAKE3, as 64 lowercase hex), the format, then the owner.
-    public static func verify(_ data: Data, pointer: CatalogPointer,
-                              blake3: (Data) -> String) throws(CatalogDocumentError) -> CreatorCatalog {
-        guard data.count <= maxDocumentBytes else { throw .tooLarge }
-        guard data.count == pointer.catalogSize else { throw .sizeMismatch }
-        guard blake3(data).utf8.elementsEqual(pointer.catalogHash.utf8) else { throw .hashMismatch }
+    /// Decodes the decrypted payload of an envelope that `CatalogEnvelope.verify` checked against its pointer, and
+    /// requires the pointer's owner: the format (`.invalid`), then the owner (`.ownerMismatch`).
+    public static func decode(_ payload: Data, owner: String) throws(CatalogDocumentError) -> CreatorCatalog {
         let catalog: CreatorCatalog
         do {
-            catalog = try decode(data)
+            catalog = try decode(payload)
         } catch {
             throw .invalid(error)
         }
-        guard catalog.owner.utf8.elementsEqual(pointer.owner.utf8) else { throw .ownerMismatch }
+        guard catalog.owner.utf8.elementsEqual(owner.utf8) else { throw .ownerMismatch }
         return catalog
+    }
+
+    // MARK: - The index
+
+    /// The entries in the clear, as a publish sends them in `index`: a JSON array of the same entry objects as the
+    /// document, in the same order. It throws the error the document's encoding would.
+    public func encodedIndex() throws(CreatorCatalogError) -> Data {
+        _ = try encoded()
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        guard let data = try? encoder.encode(entries.map(EncodedEntry.init)) else { throw .malformed }
+        return data
+    }
+
+    /// An `index` as the node reads it: a strict JSON array of 0–1,000 entries under the document's entry rules.
+    static func decodeIndex(_ data: Data) throws(CreatorCatalogError) -> [Entry] {
+        guard data.count <= maxDocumentBytes else { throw .tooLarge }
+        guard let items = StrictJSON.parse(data)?.array else { throw .malformed }
+        return try entries(items)
     }
 
     private static func entry(_ value: StrictJSON, index: Int) throws(CreatorCatalogError) -> Entry {

@@ -64,8 +64,27 @@ public enum CatalogMetadataRefusal: Error, Sendable, Equatable {
     case reusesRecordingPolicyID
 }
 
-/// Why a `/2` catalog would be refused at publish. Each case names the entry by its position in `entries`.
+/// Why an envelope may not carry a catalog. The node refuses the first three (its checks 2 and 3 for `/2` on
+/// `PUT /v2/catalogs`); the last two are the design's and Creator's own.
+public enum CatalogEnvelopeRefusal: Error, Sendable, Equatable {
+    /// `payload.mimeType` is not `CatalogEnvelope.mimeType`.
+    case notACatalog
+    /// The policy has a top-level key besides `uuid` and `body`, or lacks one of them.
+    case extraPolicyKeys
+    /// `body.dataAttributes` is not exactly one attribute that `CatalogEnvelope.isEnvelopeAttribute` accepts for the
+    /// catalog's owner.
+    case attribute
+    /// The policy's `uuid` is not a non-empty string.
+    case noPolicyID
+    /// `body.dissem` is not empty.
+    case dissemination
+}
+
+/// Why a `/2` catalog would be refused at publish. Each entry case names the entry by its position in `entries`.
 public enum CatalogPublicationError: Error, Sendable, Equatable {
+    /// The envelope's manifest is not a readable ZTDF manifest.
+    case unreadableEnvelope
+    case envelope(CatalogEnvelopeRefusal)
     /// No manifest was given for the entry's recording or metadata TDF.
     case missingManifest(Int)
     /// A manifest given for the entry is not a readable ZTDF manifest.
@@ -74,15 +93,32 @@ public enum CatalogPublicationError: Error, Sendable, Equatable {
     /// The entry's metadata policy `uuid` is also the one of the entry at `first`. The viewer unwraps all of a catalog's
     /// metadata in one bulk rewrap, and the KAS refuses repeated policy ids (the node's check 8e).
     case duplicatePolicyID(Int, first: Int)
+    /// The entry's metadata policy `uuid` is the envelope's.
+    case reusesEnvelopePolicyID(Int)
+    /// The entry's recording policy lacks the envelope's attribute, so someone who can open the entry couldn't open the
+    /// catalog that lists it.
+    case lacksCatalogAttribute(Int)
+    /// The entry's recording names other KAS URLs than the envelope.
+    case kasMismatch(Int)
 }
 
 /// The node's publish checks on a `/2` catalog's TDFs, run before publishing so a catalog the node would refuse with a
-/// 422 is never sent. The document's own rules are `CreatorCatalog.encoded()`'s.
+/// 422 is never sent. The document's and the index's own rules are `CreatorCatalog.encoded()`'s.
 public enum CatalogPublicationCheck {
-    /// Checks every entry in order, each against its recording, then its policy `uuid` against the entries before it.
-    /// `manifests` maps each `payloadHash` and `metadataHash` to that TDF's `manifest.json` bytes.
-    public static func check(_ catalog: CreatorCatalog,
+    /// Checks the envelope, then every entry in order: its metadata against its recording, its metadata policy `uuid`
+    /// against the envelope's and the entries' before it, that its recording carries the envelope's attribute, then
+    /// that the recording's KAS URLs are the envelope's.
+    /// `envelope` is the envelope's `manifest.json` bytes; `manifests` maps each `payloadHash` and `metadataHash` to that
+    /// TDF's.
+    public static func check(_ catalog: CreatorCatalog, envelope: Data,
                              manifests: [String: Data]) throws(CatalogPublicationError) {
+        guard let envelope = CatalogTDFManifest(manifestJSON: envelope) else { throw .unreadableEnvelope }
+        let attribute: String
+        do {
+            attribute = try check(envelope: envelope, owner: catalog.owner)
+        } catch {
+            throw .envelope(error)
+        }
         var policyIDs: [String: Int] = [:]
         for (index, entry) in catalog.entries.enumerated() {
             guard let recordingJSON = manifests[entry.payloadHash], let metadataJSON = manifests[entry.metadataHash]
@@ -97,8 +133,30 @@ public enum CatalogPublicationCheck {
             // check(metadata:recording:) passed, so the policy id is a non-empty string.
             guard let id = metadata.policyID else { throw .metadata(index, .noPolicyID) }
             if let first = policyIDs[id] { throw .duplicatePolicyID(index, first: first) }
+            if id.utf8.elementsEqual((envelope.policyID ?? "").utf8) { throw .reusesEnvelopePolicyID(index) }
             policyIDs[id] = index
+            guard recording.list("dataAttributes")?.contains(where: {
+                $0.object?["attribute"]?.string?.utf8.elementsEqual(attribute.utf8) == true
+            }) == true else { throw .lacksCatalogAttribute(index) }
+            guard recording.kasURLs == envelope.kasURLs else { throw .kasMismatch(index) }
         }
+    }
+
+    /// Whether `envelope` may carry the catalog of `owner`, in the node's order: the mime type, the policy's keys, then
+    /// its one attribute; then the design's: the `uuid`, and an empty dissemination list. Returns the attribute, which
+    /// every recording's `dataAttributes` must carry.
+    @discardableResult
+    static func check(envelope: CatalogTDFManifest, owner: String) throws(CatalogEnvelopeRefusal) -> String {
+        guard let mimeType = envelope.mimeType, mimeType.utf8.elementsEqual(CatalogEnvelope.mimeType.utf8) else {
+            throw .notACatalog
+        }
+        guard Set(envelope.policy.keys) == ["uuid", "body"] else { throw .extraPolicyKeys }
+        guard let attributes = envelope.list("dataAttributes"), attributes.count == 1,
+              let fqn = attributes[0].object?["attribute"]?.string,
+              CatalogEnvelope.isEnvelopeAttribute(fqn, owner: owner) else { throw .attribute }
+        guard envelope.policyID != nil else { throw .noPolicyID }
+        guard envelope.list("dissem")?.isEmpty == true else { throw .dissemination }
+        return fqn
     }
 
     /// Whether `metadata` may stand for `recording`, in the node's order: the policy's keys, its `uuid`, the mime type,

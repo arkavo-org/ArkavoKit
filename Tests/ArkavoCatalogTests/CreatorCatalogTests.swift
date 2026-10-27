@@ -132,41 +132,40 @@ struct CreatorCatalogTests {
         #expect(throws: CreatorCatalogError.tooLarge) { try CreatorCatalog.decode(padded + Data(" ".utf8)) }
     }
 
-    // MARK: Verification against the pointer
+    // MARK: The decrypted payload
 
-    static func pointer(for data: Data, owner: String = owner, size: Int? = nil) throws -> CatalogPointer {
-        try CatalogPointer(owner: owner, seq: 1, catalogHash: sha256(data), catalogSize: size ?? data.count,
-                           issuedAt: Date(timeIntervalSince1970: 1_792_371_723))
-    }
-
-    @Test func verifiesTheDocumentThePointerNames() throws {
+    @Test func decodesThePayloadForItsOwner() throws {
         let catalog = CreatorCatalog(owner: Self.owner, entries: [Self.entry()])
-        let data = try catalog.encoded()
-        #expect(try CreatorCatalog.verify(data, pointer: Self.pointer(for: data), blake3: Self.sha256) == catalog)
+        #expect(try CreatorCatalog.decode(catalog.encoded(), owner: Self.owner) == catalog)
     }
 
-    @Test func verificationRunsItsChecksInOrder() throws {
-        let data = try CreatorCatalog(owner: Self.owner, entries: [Self.entry()]).encoded()
-        let pointer = try Self.pointer(for: data)
-        let oversized = data + Data(repeating: 0x20, count: CreatorCatalog.maxDocumentBytes)
-        #expect(throws: CatalogDocumentError.tooLarge) {
-            try CreatorCatalog.verify(oversized, pointer: pointer, blake3: Self.sha256)
-        }
-        #expect(throws: CatalogDocumentError.sizeMismatch) {
-            try CreatorCatalog.verify(data + Data(" ".utf8), pointer: pointer, blake3: Self.sha256)
-        }
-        var flipped = data
-        flipped[flipped.count - 3] ^= 0x01
-        #expect(throws: CatalogDocumentError.hashMismatch) {
-            try CreatorCatalog.verify(flipped, pointer: pointer, blake3: Self.sha256)
-        }
+    @Test func aPayloadIsCheckedForFormatThenOwner() throws {
         let v1 = Data(#"{"schema":"arkavo.creator-catalog/1","owner":"\#(Self.owner)","entries":[]}"#.utf8)
-        #expect(throws: CatalogDocumentError.invalid(.schema)) {
-            try CreatorCatalog.verify(v1, pointer: Self.pointer(for: v1), blake3: Self.sha256)
+        #expect(throws: CatalogDocumentError.invalid(.schema)) { try CreatorCatalog.decode(v1, owner: Self.owner) }
+        let data = try CreatorCatalog(owner: Self.owner, entries: [Self.entry()]).encoded()
+        #expect(throws: CatalogDocumentError.ownerMismatch) { try CreatorCatalog.decode(data, owner: "someone-else") }
+    }
+
+    // MARK: The index
+
+    @Test func theIndexIsTheDocumentsEntries() throws {
+        let catalog = CreatorCatalog(owner: Self.owner, entries: [
+            Self.entry("rec-b", payload: "3", metadata: "4"), Self.entry("rec-a"),
+        ])
+        let index = try catalog.encodedIndex()
+        let document = String(decoding: try catalog.encoded(), as: UTF8.self)
+        let text = String(decoding: index, as: UTF8.self)
+        #expect(document == #"{"entries":\#(text),"owner":"\#(Self.owner)","schema":"arkavo.creator-catalog/2"}"#)
+        #expect(try CreatorCatalog.decodeIndex(index) == catalog.entries)
+        #expect(String(decoding: try CreatorCatalog(owner: Self.owner).encodedIndex(), as: UTF8.self) == "[]")
+    }
+
+    @Test func theIndexRefusesWhatTheDocumentRefuses() {
+        #expect(throws: CreatorCatalogError.metadataHashIsPayloadHash(0)) {
+            try CreatorCatalog(owner: Self.owner, entries: [Self.entry(payload: "1", metadata: "1")]).encodedIndex()
         }
-        #expect(throws: CatalogDocumentError.ownerMismatch) {
-            try CreatorCatalog.verify(data, pointer: Self.pointer(for: data, owner: "someone-else"), blake3: Self.sha256)
-        }
+        #expect(throws: CreatorCatalogError.owner) { try CreatorCatalog(owner: ".").encodedIndex() }
+        #expect(throws: CreatorCatalogError.malformed) { try CreatorCatalog.decodeIndex(Data("{}".utf8)) }
     }
 
     static func hex(_ value: Int) -> String {
