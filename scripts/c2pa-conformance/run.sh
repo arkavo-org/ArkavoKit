@@ -4,10 +4,12 @@
 #
 #   scripts/c2pa-conformance/run.sh <signed asset> [--spec 2.2|2.4] [--trust-anchors CA.pem]
 #                                   [--tsa-anchors C2PA-TSA-TRUST-LIST.pem] [--waive RULE_ID]...
+#                                   [--c2pa-sign PATH] [--no-container-checks]
 #
 # The first run fetches conformance-public at a pinned commit and creates a Python venv with
 # the evaluator's requirements, both under .build/c2pa-conformance. Needs git, python3 and
-# c2patool. `--tsa-anchors default` uses the pinned C2PA TSA trust list.
+# c2patool, plus ffmpeg and ffprobe for the container checks on a MOV/MP4/M4A.
+# `--tsa-anchors default` uses the pinned C2PA TSA trust list.
 set -euo pipefail
 
 CONFORMANCE_COMMIT=da71a7231fd6c86d308771dbb5557fabc920997a

@@ -10,3 +10,6 @@ xcuserdata/
 Package.pins
 *.xcscmblueprint
 *.xccheckout
+
+# Python bytecode from scripts/c2pa-conformance
+__pycache__/
