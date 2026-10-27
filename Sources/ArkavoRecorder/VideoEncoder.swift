@@ -5,6 +5,43 @@ import AudioToolbox
 import ArkavoStreaming
 import ArkavoMedia
 
+/// Media the file writer didn't get, by reason (#44). Buffers that arrive while paused aren't
+/// counted: dropping them is what a pause does.
+struct DroppedMedia: Equatable, Sendable, CustomStringConvertible {
+    struct Counts: Equatable, Sendable {
+        /// The writer wasn't writing (it failed, or was finishing)
+        var notWriting = 0
+        /// Audio before the first video frame started the session
+        var beforeSession = 0
+        /// Stamped before the recording's start
+        var beforeStart = 0
+        /// Video stamped no later than the previous frame
+        var outOfOrder = 0
+        /// Audio for a source the recording has no input for
+        var noInput = 0
+        /// Audio whose timing couldn't be rewritten onto the file's timeline
+        var retimeFailed = 0
+        /// The input wasn't ready for more: a real-time input that fell behind
+        var notReady = 0
+        /// The input refused the buffer
+        var rejected = 0
+
+        var total: Int { notWriting + beforeSession + beforeStart + outOfOrder + noInput + retimeFailed + notReady + rejected }
+    }
+
+    var video = Counts()
+    var audio = Counts()
+
+    var description: String {
+        func line(_ c: Counts) -> String {
+            "\(c.total) (not ready \(c.notReady), rejected \(c.rejected), not writing \(c.notWriting), "
+                + "before session \(c.beforeSession), before start \(c.beforeStart), out of order \(c.outOfOrder), "
+                + "no input \(c.noInput), retime failed \(c.retimeFailed))"
+        }
+        return "video \(line(video)), audio \(line(audio))"
+    }
+}
+
 /// Encodes video and audio to MOV files using AVAssetWriter
 /// Supports optional simultaneous streaming via RTMP using VTCompressionSession
 ///
@@ -24,7 +61,8 @@ public actor VideoEncoder {
 
     private var outputURL: URL?
     private var startTime: CMTime?
-    private var lastVideoTimestamp: CMTime = .zero
+    /// The last video frame taken, on the file's (or stream's) timeline; nil until the first
+    private var lastVideoTimestamp: CMTime?
     private var isPaused: Bool = false
     /// Set by `resume()`: the next sample measures how long the pause lasted
     private var resumePending: Bool = false
@@ -34,6 +72,8 @@ public actor VideoEncoder {
     private var sessionStarted: Bool = false
     /// Whether the file got at least one video frame or audio sample
     private var appendedMedia: Bool = false
+    /// What this recording dropped so far; reset when a recording starts (#44)
+    private(set) var droppedMedia = DroppedMedia()
 
     public private(set) var isRecording: Bool = false
     /// True while `finishRecording()` waits for the file to be finished
@@ -266,13 +306,14 @@ public actor VideoEncoder {
         isRecording = true
         print("✅ VideoEncoder: Recording started. isRecording = \(isRecording)")
         startTime = nil
-        lastVideoTimestamp = .zero
+        lastVideoTimestamp = nil
         isPaused = false
         resumePending = false
         totalPausedDuration = .zero
         appendedMediaEnd = .zero
         sessionStarted = false
         appendedMedia = false
+        droppedMedia = DroppedMedia()
     }
 
     /// Finishes recording and returns the output URL.
@@ -299,6 +340,9 @@ public actor VideoEncoder {
         defer { isFinishing = false }
 
         print("📊 Media appended: \(appendedMedia), Asset writer status: \(assetWriter.status.rawValue)")
+        if droppedMedia.video.total + droppedMedia.audio.total > 0 {
+            print("⚠️ VideoEncoder: this recording dropped \(droppedMedia)")
+        }
 
         // Handle based on session and writer state
         if !appendedMedia {
@@ -411,11 +455,37 @@ public actor VideoEncoder {
         }
     }
 
+    /// `buffer` moved to start at `presentationTime`, keeping each sample's own duration. A
+    /// timing entry's duration is per sample: giving it the whole buffer's 20 ms made each
+    /// 960-frame PCM buffer claim 19.2 s, and with video the writer then held audio back (#44).
+    static func retimed(_ buffer: CMSampleBuffer, to presentationTime: CMTime) -> CMSampleBuffer? {
+        var count: CMItemCount = 0
+        guard CMSampleBufferGetSampleTimingInfoArray(buffer, entryCount: 0, arrayToFill: nil, entriesNeededOut: &count) == noErr,
+              count > 0 else { return nil }
+        var timings = [CMSampleTimingInfo](repeating: CMSampleTimingInfo(), count: count)
+        guard CMSampleBufferGetSampleTimingInfoArray(buffer, entryCount: count, arrayToFill: &timings, entriesNeededOut: &count) == noErr
+        else { return nil }
+        let shift = CMTimeSubtract(presentationTime, CMSampleBufferGetPresentationTimeStamp(buffer))
+        for index in timings.indices {
+            timings[index].presentationTimeStamp = CMTimeAdd(timings[index].presentationTimeStamp, shift)
+            timings[index].decodeTimeStamp = .invalid
+        }
+        var adjustedBuffer: CMSampleBuffer?
+        let status = CMSampleBufferCreateCopyWithNewTiming(
+            allocator: kCFAllocatorDefault,
+            sampleBuffer: buffer,
+            sampleTimingEntryCount: count,
+            sampleTimingArray: &timings,
+            sampleBufferOut: &adjustedBuffer
+        )
+        return status == noErr ? adjustedBuffer : nil
+    }
+
     /// Current recording duration
     public var duration: TimeInterval {
         guard startTime != nil else { return 0 }
         // lastVideoTimestamp is already normalized to start at zero, without pauses
-        return CMTimeGetSeconds(lastVideoTimestamp)
+        return CMTimeGetSeconds(lastVideoTimestamp ?? .zero)
     }
 
     // MARK: - Frame Encoding
@@ -444,22 +514,25 @@ public actor VideoEncoder {
                 if assetWriter.status == .failed {
                     print("❌ Asset writer failed before encoding could start")
                 }
+                droppedMedia.video.notWriting += 1
                 return
             }
 
-            // Initialize session on first frame (thread-safe check)
+            // Wait if input is not ready. Checked before the session starts, so a frame dropped
+            // here can't set the timeline's start, as on the audio-only path (#44)
+            if !videoInput.isReadyForMoreMediaData {
+                droppedMedia.video.notReady += 1
+                return
+            }
+
+            // Initialize session on the first frame the input can take
             if !sessionStarted {
                 sessionStarted = true
                 startTime = timestamp
                 // Start session at time zero - we'll normalize all timestamps
                 assetWriter.startSession(atSourceTime: .zero)
-                lastVideoTimestamp = .zero
+                lastVideoTimestamp = nil
                 print("📹 VideoEncoder: Session started, base timestamp \(timestamp.seconds)")
-            }
-
-            // Wait if input is not ready
-            if !videoInput.isReadyForMoreMediaData {
-                return
             }
 
             // Double-check asset writer is still healthy
@@ -472,6 +545,7 @@ public actor VideoEncoder {
                         print("   Underlying error: Domain=\(underlyingError.domain) Code=\(underlyingError.code)")
                     }
                 }
+                droppedMedia.video.notWriting += 1
                 return
             }
 
@@ -481,6 +555,7 @@ public actor VideoEncoder {
 
             // Skip frames from before recording started (can happen with preview running)
             if adjustedTimestamp.seconds < 0 {
+                droppedMedia.video.beforeStart += 1
                 return
             }
 
@@ -490,14 +565,16 @@ public actor VideoEncoder {
                 adjustedTimestamp = CMTimeSubtract(adjustedTimestamp, totalPausedDuration)
             }
 
-            // Ensure timestamps are monotonically increasing
-            if CMTimeCompare(adjustedTimestamp, lastVideoTimestamp) <= 0 {
-                // Timestamp is not increasing, skip this frame
+            // Ensure timestamps are monotonically increasing. The first frame has nothing to follow:
+            // compared with a zero start it would fail, and every recording lost it (#44)
+            if let lastVideoTimestamp, CMTimeCompare(adjustedTimestamp, lastVideoTimestamp) <= 0 {
+                droppedMedia.video.outOfOrder += 1
                 return
             }
 
             // Append pixel buffer to file
             if !adaptor.append(pixelBuffer, withPresentationTime: adjustedTimestamp) {
+                droppedMedia.video.rejected += 1
                 print("❌ Failed to append video frame at timestamp \(adjustedTimestamp.seconds)")
                 if assetWriter.status == .failed {
                     let errorMessage = assetWriter.error?.localizedDescription ?? "Unknown error"
@@ -517,7 +594,7 @@ public actor VideoEncoder {
             if !sessionStarted {
                 sessionStarted = true
                 startTime = timestamp
-                lastVideoTimestamp = .zero
+                lastVideoTimestamp = nil
                 print("📹 VideoEncoder: Stream session started, base timestamp \(timestamp.seconds)")
             }
 
@@ -532,7 +609,7 @@ public actor VideoEncoder {
             }
 
             // Ensure timestamps are monotonically increasing
-            if CMTimeCompare(adjustedTimestamp, lastVideoTimestamp) <= 0 {
+            if let lastVideoTimestamp, CMTimeCompare(adjustedTimestamp, lastVideoTimestamp) <= 0 {
                 return
             }
             lastVideoTimestamp = adjustedTimestamp
@@ -566,23 +643,27 @@ public actor VideoEncoder {
         // Handle file recording if active
         if isRecording {
             guard let writer = assetWriter, writer.status == .writing else {
+                droppedMedia.audio.notWriting += 1
                 return
             }
 
             // With video, the first video frame starts the session
             let isAudioOnly = videoInput == nil
             guard isAudioOnly || startTime != nil else {
+                droppedMedia.audio.beforeSession += 1
                 return
             }
 
             // Get audio input for this source (must have been pre-created during startRecording)
             guard let audioInput = audioInputs[sourceID] else {
                 print("⚠️ No audio input exists for source: \(sourceID). Audio inputs must be pre-created before recording starts.")
+                droppedMedia.audio.noInput += 1
                 return
             }
 
             // Wait if input is not ready
             if !audioInput.isReadyForMoreMediaData {
+                droppedMedia.audio.notReady += 1
                 return
             }
 
@@ -603,6 +684,7 @@ public actor VideoEncoder {
 
             // Skip audio from before recording started
             if adjustedTimestamp.seconds < 0 {
+                droppedMedia.audio.beforeStart += 1
                 return
             }
 
@@ -613,29 +695,16 @@ public actor VideoEncoder {
             }
 
             // Create adjusted sample buffer with normalized timing
-            var adjustedBuffer: CMSampleBuffer?
-            var timingInfo = CMSampleTimingInfo(
-                duration: CMSampleBufferGetDuration(sampleBuffer),
-                presentationTimeStamp: adjustedTimestamp,
-                decodeTimeStamp: .invalid
-            )
-
-            let status = CMSampleBufferCreateCopyWithNewTiming(
-                allocator: kCFAllocatorDefault,
-                sampleBuffer: sampleBuffer,
-                sampleTimingEntryCount: 1,
-                sampleTimingArray: &timingInfo,
-                sampleBufferOut: &adjustedBuffer
-            )
-
-            guard status == noErr, let finalBuffer = adjustedBuffer else {
+            guard let finalBuffer = Self.retimed(sampleBuffer, to: adjustedTimestamp) else {
                 print("⚠️ Failed to create adjusted audio buffer")
+                droppedMedia.audio.retimeFailed += 1
                 return
             }
 
             // Append audio sample to file
             // AVAssetWriterInput will automatically encode PCM to AAC
             if !audioInput.append(finalBuffer) {
+                droppedMedia.audio.rejected += 1
                 print("⚠️ Audio input [\(sourceID)] rejected sample buffer; dropping frame")
                 return
             }

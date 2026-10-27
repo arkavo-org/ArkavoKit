@@ -24,7 +24,8 @@ struct PauseResumeTests {
 
         let asset = AVURLAsset(url: url)
         let duration = try await asset.load(.duration).seconds
-        #expect(abs(duration - 2) < 0.05, "duration \(duration)")
+        let dropped = await encoder.droppedMedia
+        #expect(abs(duration - 2) < 0.05, "duration \(duration), dropped \(dropped)")
     }
 
     @Test("A paused video recording keeps audio and video on one timeline without the gap")
@@ -47,8 +48,9 @@ struct PauseResumeTests {
         let audio = try #require(try await asset.loadTracks(withMediaType: .audio).first)
         let videoEnd = try await video.load(.timeRange).end.seconds
         let audioEnd = try await audio.load(.timeRange).end.seconds
-        #expect(abs(videoEnd - 2) < 0.1, "video ends at \(videoEnd)")
-        #expect(abs(audioEnd - 2) < 0.1, "audio ends at \(audioEnd)")
+        let dropped = await encoder.droppedMedia
+        #expect(abs(videoEnd - 2) < 0.1, "video ends at \(videoEnd), dropped \(dropped)")
+        #expect(abs(audioEnd - 2) < 0.1, "audio ends at \(audioEnd), dropped \(dropped)")
     }
 
     // MARK: - Helpers
@@ -65,20 +67,22 @@ struct PauseResumeTests {
     }
 
     /// 30 fps video and 20 ms audio buffers covering `seconds` from `from`, in time order,
-    /// starting with a video frame
+    /// starting with a video frame. Each is sent when its time comes, as capture delivers them.
     private static func feedAudioAndVideo(_ encoder: VideoEncoder, from start: Int, seconds: Int) async throws {
         let base = CMTimeValue(start * 48000)
         let video = (0..<(30 * seconds)).map { (time: base + CMTimeValue($0 * 1600), isVideo: true) }
         let audio = (0..<(50 * seconds)).map { (time: base + CMTimeValue($0 * 960), isVideo: false) }
         let events = (video + audio).sorted { ($0.time, $0.isVideo ? 0 : 1) < ($1.time, $1.isVideo ? 0 : 1) }
+        let clock = ContinuousClock()
+        let began = clock.now
         for event in events {
+            try await clock.sleep(until: began + .milliseconds(Int(event.time - base) * 1000 / 48000))
             let pts = CMTime(value: event.time, timescale: 48000)
             if event.isVideo {
                 await encoder.encodeVideoFrame(try pixelBuffer(width: 1280, height: 720), timestamp: pts)
             } else {
                 await encoder.encodeAudioSample(AudioMixerTests.buffer(frames: 960, value: 1000, pts: pts), sourceID: "microphone")
             }
-            try await Task.sleep(for: .milliseconds(2))
         }
     }
 
