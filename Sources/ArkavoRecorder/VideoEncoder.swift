@@ -13,12 +13,20 @@ struct DroppedMedia: Equatable, Sendable, CustomStringConvertible {
         var notWriting = 0
         /// Audio before the first video frame started the session
         var beforeSession = 0
+        /// Stamped before the recording's start
+        var beforeStart = 0
+        /// Video stamped no later than the previous frame
+        var outOfOrder = 0
+        /// Audio for a source the recording has no input for
+        var noInput = 0
+        /// Audio whose timing couldn't be rewritten onto the file's timeline
+        var retimeFailed = 0
         /// The input wasn't ready for more: a real-time input that fell behind
         var notReady = 0
         /// The input refused the buffer
         var rejected = 0
 
-        var total: Int { notWriting + beforeSession + notReady + rejected }
+        var total: Int { notWriting + beforeSession + beforeStart + outOfOrder + noInput + retimeFailed + notReady + rejected }
     }
 
     var video = Counts()
@@ -26,7 +34,9 @@ struct DroppedMedia: Equatable, Sendable, CustomStringConvertible {
 
     var description: String {
         func line(_ c: Counts) -> String {
-            "\(c.total) (not ready \(c.notReady), rejected \(c.rejected), not writing \(c.notWriting), before session \(c.beforeSession))"
+            "\(c.total) (not ready \(c.notReady), rejected \(c.rejected), not writing \(c.notWriting), "
+                + "before session \(c.beforeSession), before start \(c.beforeStart), out of order \(c.outOfOrder), "
+                + "no input \(c.noInput), retime failed \(c.retimeFailed))"
         }
         return "video \(line(video)), audio \(line(audio))"
     }
@@ -491,7 +501,8 @@ public actor VideoEncoder {
                 print("📹 VideoEncoder: Session started, base timestamp \(timestamp.seconds)")
             }
 
-            // Wait if input is not ready
+            // Wait if input is not ready. The session above has already started at this frame's
+            // time, so a first frame dropped here still sets the timeline's start (#44)
             if !videoInput.isReadyForMoreMediaData {
                 droppedMedia.video.notReady += 1
                 return
@@ -517,6 +528,7 @@ public actor VideoEncoder {
 
             // Skip frames from before recording started (can happen with preview running)
             if adjustedTimestamp.seconds < 0 {
+                droppedMedia.video.beforeStart += 1
                 return
             }
 
@@ -529,6 +541,7 @@ public actor VideoEncoder {
             // Ensure timestamps are monotonically increasing
             if CMTimeCompare(adjustedTimestamp, lastVideoTimestamp) <= 0 {
                 // Timestamp is not increasing, skip this frame
+                droppedMedia.video.outOfOrder += 1
                 return
             }
 
@@ -617,6 +630,7 @@ public actor VideoEncoder {
             // Get audio input for this source (must have been pre-created during startRecording)
             guard let audioInput = audioInputs[sourceID] else {
                 print("⚠️ No audio input exists for source: \(sourceID). Audio inputs must be pre-created before recording starts.")
+                droppedMedia.audio.noInput += 1
                 return
             }
 
@@ -643,6 +657,7 @@ public actor VideoEncoder {
 
             // Skip audio from before recording started
             if adjustedTimestamp.seconds < 0 {
+                droppedMedia.audio.beforeStart += 1
                 return
             }
 
@@ -670,6 +685,7 @@ public actor VideoEncoder {
 
             guard status == noErr, let finalBuffer = adjustedBuffer else {
                 print("⚠️ Failed to create adjusted audio buffer")
+                droppedMedia.audio.retimeFailed += 1
                 return
             }
 

@@ -49,11 +49,13 @@ struct PauseResumeTests {
         let videoEnd = try await video.load(.timeRange).end.seconds
         let audioEnd = try await audio.load(.timeRange).end.seconds
         let dropped = await encoder.droppedMedia
-        // Where video encoding can't keep up (the CI runner has no hardware encoder), the
-        // writer stops taking audio and the encoder drops it: #44. Recorded, not hidden.
-        withKnownIssue("#44: media the writer isn't ready for is dropped", isIntermittent: true) {
-            #expect(abs(videoEnd - 2) < 0.1, "video ends at \(videoEnd), dropped \(dropped)")
+        #expect(abs(videoEnd - 2) < 0.1, "video ends at \(videoEnd), dropped \(dropped)")
+        // On the CI runner, which has no hardware video encoder, the writer stops taking audio
+        // and the encoder drops it (#44). Tolerated there only, and still recorded.
+        withKnownIssue("#44: audio the writer isn't ready for is dropped", isIntermittent: true) {
             #expect(abs(audioEnd - 2) < 0.1, "audio ends at \(audioEnd), dropped \(dropped)")
+        } when: {
+            ProcessInfo.processInfo.environment["CI"] != nil
         }
     }
 
