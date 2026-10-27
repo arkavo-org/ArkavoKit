@@ -79,10 +79,10 @@ public enum CatalogPublishRequestError: Error, Sendable, Equatable {
 }
 
 /// The body of `PUT /v2/catalogs/{sub}`, the only route that publishes `/2`:
-/// `{"bundle":{…},"document":"<base64url envelope>","index":[…]}`, at most 2 MiB, the node's limit. The largest envelope
-/// is about 700 KiB in base64url and the largest index about 500 KiB, so any valid catalog fits.
+/// `{"bundle":{…},"document":"<base64url envelope>","index":[…]}`, at most 10 MiB, the node's limit. The largest envelope
+/// is about 5.6 MB in base64url and the largest index about 0.5 MB, so any valid catalog fits.
 public enum CatalogPublishRequest {
-    public static let maxBytes = 2_097_152
+    public static let maxBytes = 10_485_760
 
     /// The body for `envelope`, signed by `bundle`, listing `catalog` (the envelope's payload) in the clear as `index`.
     /// The pointer must name the envelope's size and hash (with the caller's BLAKE3) and the catalog's owner. The node

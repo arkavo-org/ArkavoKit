@@ -1,4 +1,5 @@
 import Foundation
+import OpenTDFKit
 
 /// The parts of a ZTDF `manifest.json` the publication checks read: `payload.mimeType`, the policy decoded from
 /// `encryptionInformation.policy` (standard base64 of a JSON object), and the `url` of each
@@ -14,6 +15,14 @@ public struct CatalogTDFManifest: Sendable, Equatable, CustomStringConvertible, 
     }
     public let kasURLs: Set<String>
     let policy: [String: StrictJSON]
+
+    /// The manifest of a ZTDF archive, read with OpenTDFKit's `TDFArchiveReader` (`manifest.json`, or the legacy
+    /// `0.manifest.json`), as `init?(manifestJSON:)` reads it. Nil when the archive or its manifest can't be read.
+    public init?(ztdf: Data, maxManifestBytes: Int = CreatorCatalog.maxMetadataSize) {
+        guard let reader = try? TDFArchiveReader(data: ztdf),
+              let manifest = try? reader.manifestData(maxSize: maxManifestBytes) else { return nil }
+        self.init(manifestJSON: manifest)
+    }
 
     /// Nil unless `manifestJSON` is one strict JSON object with a base64 JSON-object policy and a `keyAccess` array whose
     /// objects all have a string `url`.
@@ -49,8 +58,8 @@ public struct CatalogTDFManifest: Sendable, Equatable, CustomStringConvertible, 
     }
 }
 
-/// Why a metadata TDF may not stand for its recording in a catalog. The first four are the node's publish checks 8b–8d;
-/// `reusesRecordingPolicyID` is Creator's own.
+/// Why a metadata TDF may not stand for its recording in a catalog. The node no longer sees metadata TDFs, which travel
+/// inside the envelope, so these are Creator's checks, carried over from the node's 8b–8d.
 public enum CatalogMetadataRefusal: Error, Sendable, Equatable {
     /// The policy has a top-level key besides `uuid` and `body`, or lacks one of them.
     case extraPolicyKeys
@@ -85,9 +94,9 @@ public enum CatalogPublicationError: Error, Sendable, Equatable {
     /// The envelope's manifest is not a readable ZTDF manifest.
     case unreadableEnvelope
     case envelope(CatalogEnvelopeRefusal)
-    /// No manifest was given for the entry's recording or metadata TDF.
+    /// No manifest was given for the entry's recording.
     case missingManifest(Int)
-    /// A manifest given for the entry is not a readable ZTDF manifest.
+    /// The recording's manifest, or the manifest inside the entry's metadata TDF, is not a readable ZTDF manifest.
     case unreadableManifest(Int)
     case metadata(Int, CatalogMetadataRefusal)
     /// The entry's metadata policy `uuid` is also the one of the entry at `first`. The viewer unwraps all of a catalog's
@@ -100,15 +109,16 @@ public enum CatalogPublicationError: Error, Sendable, Equatable {
     case lacksCatalogAttribute(Int)
 }
 
-/// The node's publish checks on a `/2` catalog's TDFs, run before publishing so a catalog the node would refuse with a
-/// 422 is never sent. The document's and the index's own rules are `CreatorCatalog.encoded()`'s.
+/// The checks on a `/2` catalog's TDFs before a publish. The node refuses an envelope or an index that breaks its rules
+/// with a 422; it never sees the metadata TDFs, which travel inside the envelope, so this is the only check they get. The
+/// document's and the index's own rules are `CreatorCatalog.encoded()`'s.
 public enum CatalogPublicationCheck {
-    /// Checks the envelope, then every entry in order: its metadata against its recording, its metadata policy `uuid`
-    /// against the envelope's and the entries' before it, then that its recording carries the envelope's attribute.
-    /// `envelope` is the envelope's `manifest.json` bytes; `manifests` maps each `payloadHash` and `metadataHash` to that
-    /// TDF's.
+    /// Checks the envelope, then every entry in order: the metadata TDF inside the entry against its recording, its
+    /// policy `uuid` against the envelope's and the entries' before it, then that its recording carries the envelope's
+    /// attribute. `envelope` is the envelope's `manifest.json` bytes; `recordings` maps each `payloadHash` to that
+    /// recording's.
     public static func check(_ catalog: CreatorCatalog, envelope: Data,
-                             manifests: [String: Data]) throws(CatalogPublicationError) {
+                             recordings: [String: Data]) throws(CatalogPublicationError) {
         guard let envelope = CatalogTDFManifest(manifestJSON: envelope) else { throw .unreadableEnvelope }
         let attribute: String
         do {
@@ -118,10 +128,9 @@ public enum CatalogPublicationCheck {
         }
         var policyIDs: [String: Int] = [:]
         for (index, entry) in catalog.entries.enumerated() {
-            guard let recordingJSON = manifests[entry.payloadHash], let metadataJSON = manifests[entry.metadataHash]
-            else { throw .missingManifest(index) }
+            guard let recordingJSON = recordings[entry.payloadHash] else { throw .missingManifest(index) }
             guard let recording = CatalogTDFManifest(manifestJSON: recordingJSON),
-                  let metadata = CatalogTDFManifest(manifestJSON: metadataJSON) else { throw .unreadableManifest(index) }
+                  let metadata = CatalogTDFManifest(ztdf: entry.metadata) else { throw .unreadableManifest(index) }
             do {
                 try check(metadata: metadata, recording: recording)
             } catch {

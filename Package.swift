@@ -34,8 +34,8 @@ let package = Package(
             name: "ArkavoStore",
             targets: ["ArkavoStore"]
         ),
-        // The creator catalog formats Creator writes and the viewer reads. Foundation and CryptoKit only:
-        // no network and no keys.
+        // The creator catalog formats Creator writes and the viewer reads. No network and no keys; OpenTDFKit
+        // only to read a ZTDF's manifest.
         .library(
             name: "ArkavoCatalog",
             targets: ["ArkavoCatalog"]
@@ -142,12 +142,12 @@ let package = Package(
         ),
         .target(
             name: "ArkavoCatalog",
-            dependencies: [],
+            dependencies: ["OpenTDFKit"],
             swiftSettings: sharedSwiftSettings
         ),
         .testTarget(
             name: "ArkavoCatalogTests",
-            dependencies: ["ArkavoCatalog"],
+            dependencies: ["ArkavoCatalog", "ZIPFoundation"],
             // Read from the source tree, so the node's tests can read the same file.
             exclude: ["Vectors"],
             swiftSettings: sharedSwiftSettings

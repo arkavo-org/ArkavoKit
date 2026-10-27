@@ -30,10 +30,10 @@ struct CatalogPointerTests {
 
     @Test
     func acceptsTheBoundaries() throws {
-        #expect(CreatorCatalog.maxDocumentBytes == 524_288)
+        #expect(CreatorCatalog.maxDocumentBytes == 4_194_304)
         #expect(try CatalogPointer.decode(Self.edited("\"seq\":7", "\"seq\":9007199254740991")).seq == 9_007_199_254_740_991)
         #expect(try CatalogPointer.decode(Self.edited("\"seq\":7", "\"seq\":1")).seq == 1)
-        #expect(try CatalogPointer.decode(Self.edited("\"catalogSize\":97", "\"catalogSize\":524288")).catalogSize == 524_288)
+        #expect(try CatalogPointer.decode(Self.edited("\"catalogSize\":97", "\"catalogSize\":4194304")).catalogSize == 4_194_304)
         #expect(try CatalogPointer.decode(Self.edited("\"catalogSize\":97", "\"catalogSize\":1")).catalogSize == 1)
     }
 
@@ -67,7 +67,7 @@ struct CatalogPointerTests {
         .init(label: "seq 07", bytes: edited("\"seq\":7", "\"seq\":07")),
         .init(label: "seq as a string", bytes: edited("\"seq\":7", "\"seq\":\"7\"")),
         .init(label: "catalogSize 0", bytes: edited("\"catalogSize\":97", "\"catalogSize\":0")),
-        .init(label: "catalogSize 524289", bytes: edited("\"catalogSize\":97", "\"catalogSize\":524289")),
+        .init(label: "catalogSize 4194305", bytes: edited("\"catalogSize\":97", "\"catalogSize\":4194305")),
         .init(label: "catalogSize 97.0", bytes: edited("\"catalogSize\":97", "\"catalogSize\":97.0")),
         .init(label: "catalogSize as a string", bytes: edited("\"catalogSize\":97", "\"catalogSize\":\"97\"")),
         .init(label: "uppercase catalogHash", bytes: edited("729d79721d28362279f6e2a5a9e0f7b64a7e9097adfa67207f41b615618d01e7",
@@ -133,7 +133,7 @@ struct CatalogPointerTests {
         .init(label: "seq 1", seq: 1),
         .init(label: "seq 2^53 - 1", seq: CatalogPointer.maxSeq),
         .init(label: "catalogSize 1", catalogSize: 1),
-        .init(label: "catalogSize 524288", catalogSize: 524_288),
+        .init(label: "catalogSize 4194304", catalogSize: 4_194_304),
         .init(label: "another catalogHash", catalogHash: otherHash),
         .init(label: "an owner of every allowed kind of byte", owner: "a:b@c.d_e-f"),
         .init(label: "an owner of 248 bytes", owner: String(repeating: "a", count: 248)),
@@ -200,7 +200,7 @@ struct CatalogPointerTests {
         .init(label: "a catalogHash that is not hex", catalogHash: String(repeating: "g", count: 64)),
         .init(label: "an empty catalogHash", catalogHash: ""),
         .init(label: "catalogSize 0", catalogSize: 0),
-        .init(label: "catalogSize 524289", catalogSize: 524_289),
+        .init(label: "catalogSize 4194305", catalogSize: 4_194_305),
         .init(label: "catalogSize -1", catalogSize: -1),
         .init(label: "catalogSize Int.max", catalogSize: .max),
         .init(label: "issuedAt the last second before 0000", issuedAt: Date(timeIntervalSince1970: -62_167_219_201)),

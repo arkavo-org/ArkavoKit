@@ -74,8 +74,7 @@ struct CatalogEntryMetadataTests {
 
     @Test func bindsOnlyToItsOwnEntry() {
         let entry = CreatorCatalog.Entry(contentID: "rec-a", version: 3, payloadHash: String(repeating: "1", count: 64),
-                                         payloadSize: 10, metadataHash: String(repeating: "2", count: 64),
-                                         metadataSize: 10)
+                                         payloadSize: 10, metadata: Data([1]))
         #expect(Self.metadata(version: 3).isBound(to: entry))
         #expect(!Self.metadata(contentID: "rec-b", version: 3).isBound(to: entry))
         #expect(!Self.metadata(version: 2).isBound(to: entry))
