@@ -13,12 +13,27 @@ scripts/c2pa-conformance/run.sh signed.mov \
 - **Timestamp trust:** with `--tsa-anchors`, it also requires `timeStamp.trusted`. The integrity rubric doesn't catch an informational `timeStamp.untrusted`. `default` means the C2PA TSA trust list at the pinned commit.
 - **Trust anchors:** c2patool 0.27 checks the signer and the timestamp against one anchor set, so the two PEM files are joined.
 - **Waivers:** `--waive RULE_ID` turns a documented exception into a listed waiver instead of a failure. An example is `validation:trusted_success`, while the signer still chains to a private CA. Waived failures are always printed.
-- **Output:** raw outputs and `summary.json` go to `<asset>.conformance/`, or to `--out`. You can also pass a crJSON file instead of an asset.
-- **Exit codes:** `1` for a failed rule, an evaluator error, a rule that didn't run, or an untrusted timestamp. `2` for a usage or tool error.
+- **Container checks:** on a MOV, MP4 or M4A, it then runs the self-test plan's container checks from `container_checks.py`. Pass `--no-container-checks` to skip them.
+- **Output:** raw outputs and `summary.json` go to `<asset>.conformance/`, or to `--out`. You can also pass a crJSON file instead of an asset; the container checks need the asset, so they don't run then.
+- **Exit codes:** `1` for a failed rule, an evaluator error, a rule that didn't run, an untrusted timestamp or a failed container check. `2` for a usage or tool error.
+
+## Container checks
+
+| Test | What it checks |
+|---|---|
+| T14, placement | The manifest box is the box right after `ftyp`, before `moov` and every `mdat`, with purpose `manifest`. Every sample, from `stco`/`co64`, `stsc` and `stsz`, lies inside an `mdat`. ffmpeg decodes the file cleanly, and ffprobe shows packet DTS strictly increasing in each stream. |
+| T6, media tamper | A copy with one byte flipped in the middle of the first `mdat` reports `assertion.dataHash.mismatch`. |
+| T8, manifest removal | A copy whose manifest box is renamed to a same-size `free` box, so no offset moves, has no claim, decodes cleanly and has the same streams as the signed file. |
+| T9, re-sign | With `--c2pa-sign PATH`: `c2pa-sign` refuses the signed file because it already has a manifest, before any request (the server given is one that refuses connections), and writes no output. |
+
+- **Copies only:** the tampered copies go under `<out>/containers/`. The input is only read, and its SHA-256 is checked afterwards.
+- **Standalone:** `container_checks.py --anchors CA.pem --out DIR [--c2pa-sign PATH] asset...` runs the same checks without the rubrics.
+- **Tests:** the checker's own tests use hand-built files: `python3 -m unittest discover -s scripts/c2pa-conformance/tests`.
+- **Still manual:** comparing sample counts through AVAssetReader, and T5, T7, T10 and S5 (#36).
 
 ## Setup
 
-You need `git`, `python3` and `c2patool`. On the first run, the script fetches conformance-public at a pinned commit (`CONFORMANCE_COMMIT` in `run.sh`) and creates a venv with the evaluator's requirements. Both go under `.build/c2pa-conformance`. Bump the commit deliberately: the rubrics change between program versions.
+You need `git`, `python3` and `c2patool`, plus `ffmpeg` and `ffprobe` for the container checks. On the first run, the script fetches conformance-public at a pinned commit (`CONFORMANCE_COMMIT` in `run.sh`) and creates a venv with the evaluator's requirements. Both go under `.build/c2pa-conformance`. Bump the commit deliberately: the rubrics change between program versions.
 
 ## Signing a sample
 

@@ -7,9 +7,11 @@ exits 0 even when rules fail. This runner:
   1. produces crJSON with `c2patool <asset> --crjson` (optionally with trust anchors),
   2. runs the program rubric for the chosen spec and the integrity rubric,
   3. prints a pass/fail/warn table per rubric with each failing rule and its report text,
-  4. saves every raw output under --out,
-  5. exits 1 on any failed rule, evaluator error, malformed or empty output, or rule that
-     did not execute; 2 on usage or tool errors.
+  4. on a MOV/MP4/M4A, runs the container checks in container_checks.py (T14 placement,
+     T6 media tamper, T8 manifest removal, and T9 re-sign with --c2pa-sign) on copies,
+  5. saves every raw output under --out,
+  6. exits 1 on any failed rule, evaluator error, malformed or empty output, rule that
+     did not execute, or failed container check; 2 on usage or tool errors.
 
 Trust: c2patool 0.27.x (c2pa-rs 0.90) checks both the signing credential and the timestamp
 against one anchor set, so --trust-anchors and --tsa-anchors are concatenated and passed with
@@ -24,6 +26,8 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+
+import container_checks
 
 import_error = None
 try:
@@ -168,6 +172,10 @@ def main():
                         help="checkout of github.com/c2pa-org/conformance-public (run.sh pins and fetches it)")
     parser.add_argument("--python", type=Path, default=Path(sys.executable),
                         help="python with the evaluator's requirements (default: this one)")
+    parser.add_argument("--c2pa-sign", type=Path, metavar="PATH",
+                        help="c2pa-sign binary: also check it refuses the signed file (T9)")
+    parser.add_argument("--no-container-checks", action="store_true",
+                        help="skip T14/T6/T8/T9 on a MOV/MP4/M4A")
     args = parser.parse_args()
 
     if import_error is not None:
@@ -182,9 +190,18 @@ def main():
         if not path.exists():
             fail_usage(f"missing {path}")
 
+    containers = (not args.no_container_checks and args.asset.suffix.lower() in container_checks.BMFF_SUFFIXES)
+    if args.c2pa_sign and not containers:
+        fail_usage("--c2pa-sign runs with the container checks, on a MOV/MP4/M4A")
+    if containers:
+        missing = container_checks.missing_tools(args.c2pa_sign)
+        if missing:
+            fail_usage(f"the container checks need {', '.join(missing)} (or pass --no-container-checks)")
+
     out_dir = args.out or args.asset.with_name(args.asset.name + ".conformance")
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    anchors = None
     if args.asset.suffix == ".json":
         if args.trust_anchors or args.tsa_anchors:
             fail_usage("trust anchors apply when producing crJSON; pass the asset, not a crJSON file")
@@ -196,7 +213,6 @@ def main():
         if not isinstance(data, dict) or not data.get("manifests"):
             fail_usage(f"no manifests in {crjson_path}")
     else:
-        anchors = None
         pems = [p for p in (args.trust_anchors, args.tsa_anchors) if p]
         if pems:
             anchors = out_dir / "trust-anchors.pem"
@@ -228,10 +244,16 @@ def main():
         print(f"\n== timestamp trust: {'trusted' if timestamp_ok else 'NOT trusted'}"
               f" (success has timeStamp.trusted: {timestamp_ok}; informational: {codes['informational']})")
 
+    container_result = None
+    if containers:
+        container_result = container_checks.check(args.asset, anchors, out_dir / "containers", args.c2pa_sign)
+        container_checks.print_result(container_result)
+
     (out_dir / "summary.json").write_text(json.dumps(
         {"asset": str(args.asset), "spec": args.spec, "validation": codes, "timestamp_trusted": timestamp_ok,
-         "rubrics": summaries}, indent=2))
-    ok = timestamp_ok and all(not s["fail"] and not s["errors"] for s in summaries)
+         "rubrics": summaries, "containers": container_result}, indent=2))
+    ok = (timestamp_ok and all(not s["fail"] and not s["errors"] for s in summaries)
+          and (container_result is None or container_result["pass"]))
     print(f"\nresult: {'PASS' if ok else 'FAIL'}   (raw outputs in {out_dir})")
     sys.exit(0 if ok else 1)
 
