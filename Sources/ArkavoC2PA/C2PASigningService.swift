@@ -218,6 +218,9 @@ public struct C2PASigningService: Sendable {
         /// Signing needs a creator membership: the token lacks the `entitlement` attribute
         /// the server requires (arkavo-rs#120)
         case membershipRequired(entitlement: String)
+        /// Signing needs this device's App Attest device token, and none was sent or the
+        /// server refused it (arkavo-rs#133)
+        case deviceAttestationRequired
         /// The exclusion range was not the size of the signed manifest box. The server
         /// discarded the manifest; ask again with a range of `requiredLength` bytes.
         case exclusionLengthMismatch(requiredLength: Int)
@@ -234,6 +237,8 @@ public struct C2PASigningService: Sendable {
                 return "C2PA signing denied: \(message)"
             case .membershipRequired:
                 return "C2PA signing needs an Arkavo creator membership"
+            case .deviceAttestationRequired:
+                return "C2PA signing needs this device's App Attest device token"
             case .exclusionLengthMismatch(let requiredLength):
                 return "C2PA signing needs a \(requiredLength)-byte manifest range"
             case .rateLimited(let retryAfter):
@@ -259,15 +264,21 @@ public struct C2PASigningService: Sendable {
     public let serverURL: URL
     let session: URLSession
     private let accessToken: AccessTokenProvider?
+    private let deviceToken: AccessTokenProvider?
 
+    /// - Parameter deviceToken: Returns identity's DeviceCheck CWT for the same account (minted
+    ///   from this device's App Attest key), sent as `X-Entity-Token` so the server can tell the
+    ///   request comes from a genuine Creator (arkavo-rs#133). Nil, or a nil token, sends none.
     public init(
         serverURL: URL = Self.defaultServerURL,
         session: URLSession = Self.defaultSession,
-        accessToken: AccessTokenProvider? = nil
+        accessToken: AccessTokenProvider? = nil,
+        deviceToken: AccessTokenProvider? = nil
     ) {
         self.serverURL = serverURL
         self.session = session
         self.accessToken = accessToken
+        self.deviceToken = deviceToken
     }
 
     /// Returns the signed manifest store (JUMBF) for the client to embed
@@ -278,6 +289,9 @@ public struct C2PASigningService: Sendable {
         request.httpBody = try JSONEncoder().encode(signRequest)
         if let token = try await accessToken?() {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        if let token = try await deviceToken?() {
+            request.setValue(token, forHTTPHeaderField: "X-Entity-Token")
         }
 
         let (data, response) = try await session.data(for: request)
@@ -309,6 +323,9 @@ public struct C2PASigningService: Sendable {
             // Decoded on its own, so a field of the wrong type elsewhere can't hide it
             if let entitlement = (try? JSONDecoder().decode(EntitlementRefusal.self, from: data))?.requiredEntitlement {
                 throw ServiceError.membershipRequired(entitlement: entitlement)
+            }
+            if (try? JSONDecoder().decode(RequirementRefusal.self, from: data))?.required == "device_attestation" {
+                throw ServiceError.deviceAttestationRequired
             }
             throw ServiceError.creatorNotAuthorized(body?.error ?? "creator not authorized")
         case 422 where body?.requiredExclusionLength != nil:
@@ -357,6 +374,12 @@ public struct C2PASigningService: Sendable {
             case message
             case requiredExclusionLength = "required_exclusion_length"
         }
+    }
+
+    /// The 403 arkavo-rs sends when signing needs something the request lacks, e.g.
+    /// `{"required":"device_attestation"}`
+    private struct RequirementRefusal: Decodable {
+        let required: String
     }
 
     /// The 403 arkavo-rs sends when signing needs a creator membership
