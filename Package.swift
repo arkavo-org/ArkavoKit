@@ -34,6 +34,12 @@ let package = Package(
             name: "ArkavoStore",
             targets: ["ArkavoStore"]
         ),
+        // The creator catalog formats Creator writes and the viewer reads. Foundation and CryptoKit only:
+        // no network and no keys.
+        .library(
+            name: "ArkavoCatalog",
+            targets: ["ArkavoCatalog"]
+        ),
         .executable(
             name: "ntdf-test",
             targets: ["NTDFTestCLI"]
@@ -132,6 +138,18 @@ let package = Package(
         .testTarget(
             name: "ArkavoC2PATests",
             dependencies: ["ArkavoC2PA"],
+            swiftSettings: sharedSwiftSettings
+        ),
+        .target(
+            name: "ArkavoCatalog",
+            dependencies: [],
+            swiftSettings: sharedSwiftSettings
+        ),
+        .testTarget(
+            name: "ArkavoCatalogTests",
+            dependencies: ["ArkavoCatalog"],
+            // Read from the source tree, so the node's tests can read the same file.
+            exclude: ["Vectors"],
             swiftSettings: sharedSwiftSettings
         ),
         .target(
