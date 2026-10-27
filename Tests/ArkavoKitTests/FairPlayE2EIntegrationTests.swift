@@ -13,6 +13,10 @@ struct FairPlayE2EIntegrationTests {
 
     let serverURL = URL(string: "https://platform.arkavo.net")!
 
+    /// An identity.arkavo.net passkey token. Session start requires one (arkavo-rs binds a
+    /// session to the token's subject), so the tests that start a session run only with it.
+    static let token = ProcessInfo.processInfo.environment["ARKAVO_TOKEN"].flatMap { $0.isEmpty ? nil : $0 }
+
     // Test fixtures
     let testSPS = Data([0x67, 0x64, 0x00, 0x1F, 0xAC, 0xD9, 0x40, 0x50,
                         0x05, 0xBB, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00,
@@ -62,12 +66,14 @@ struct FairPlayE2EIntegrationTests {
         print("   Certificate size: \(data.count) bytes")
     }
 
-    @Test("Server: FairPlay session start works")
+    @Test("Server: FairPlay session start works",
+          .enabled(if: FairPlayE2EIntegrationTests.token != nil, "needs ARKAVO_TOKEN: session start requires a passkey token"))
     func sessionStartEndpoint() async throws {
         let url = serverURL.appendingPathComponent("media/v1/session/start")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(Self.token ?? "")", forHTTPHeaderField: "Authorization")
 
         let body: [String: Any] = [
             "userId": "e2e-test-user",
@@ -134,7 +140,8 @@ struct FairPlayE2EIntegrationTests {
 
     // MARK: - Full Key Exchange Flow
 
-    @Test("E2E: Complete key exchange flow with TDF manifest")
+    @Test("E2E: Complete key exchange flow with TDF manifest",
+          .enabled(if: FairPlayE2EIntegrationTests.token != nil, "needs ARKAVO_TOKEN: session start requires a passkey token"))
     func completeKeyExchangeFlow() async throws {
         // 1. Generate content key
         let contentKey = Data((0..<16).map { _ in UInt8.random(in: 0...255) })
@@ -162,6 +169,7 @@ struct FairPlayE2EIntegrationTests {
         var sessionRequest = URLRequest(url: sessionURL)
         sessionRequest.httpMethod = "POST"
         sessionRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        sessionRequest.setValue("Bearer \(Self.token ?? "")", forHTTPHeaderField: "Authorization")
 
         let sessionBody: [String: Any] = [
             "userId": "e2e-test-user",
