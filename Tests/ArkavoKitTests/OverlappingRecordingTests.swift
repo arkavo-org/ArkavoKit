@@ -46,12 +46,13 @@ struct OverlappingRecordingTests {
         FileManager.default.temporaryDirectory.appendingPathComponent("overlap-\(UUID().uuidString).m4a")
     }
 
-    /// 0.5 s of 20 ms buffers from time zero
+    /// 0.5 s of 20 ms buffers from time zero, one every 20 ms as capture delivers them (the
+    /// writer's inputs are real-time; a faster feed outruns a slow machine)
     private static func feedAudio(_ encoder: VideoEncoder) async throws {
         for i in 0..<25 {
             let pts = CMTime(value: CMTimeValue(i * 960), timescale: 48000)
             await encoder.encodeAudioSample(AudioMixerTests.buffer(frames: 960, value: 1000, pts: pts), sourceID: "microphone")
-            try await Task.sleep(for: .milliseconds(2))
+            try await Task.sleep(for: .milliseconds(20))
         }
     }
 }
