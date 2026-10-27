@@ -53,12 +53,14 @@ struct PauseResumeTests {
 
     // MARK: - Helpers
 
-    /// 20 ms buffers of 48 kHz stereo PCM covering `seconds` from `from`
+    /// 20 ms buffers of 48 kHz stereo PCM covering `seconds` from `from`, one every 20 ms as
+    /// capture delivers them. The writer's inputs are real-time, so a faster feed outruns a
+    /// slow machine and the encoder drops the buffers it isn't ready for.
     private static func feedAudio(_ encoder: VideoEncoder, from start: Int, seconds: Int) async throws {
         for i in 0..<(50 * seconds) {
             let pts = CMTime(value: CMTimeValue(start * 48000 + i * 960), timescale: 48000)
             await encoder.encodeAudioSample(AudioMixerTests.buffer(frames: 960, value: 1000, pts: pts), sourceID: "microphone")
-            try await Task.sleep(for: .milliseconds(2))
+            try await Task.sleep(for: .milliseconds(20))
         }
     }
 
