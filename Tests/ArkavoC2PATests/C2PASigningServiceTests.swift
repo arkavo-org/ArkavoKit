@@ -151,6 +151,46 @@ final class C2PASigningServiceTests: XCTestCase {
         }
     }
 
+    // MARK: - Device attestation (arkavo-rs#133)
+
+    func testSendsTheDeviceTokenAsTheEntityToken() async throws {
+        var entityToken: String?
+        StubURLProtocol.handler = { request, _ in
+            entityToken = request.value(forHTTPHeaderField: "X-Entity-Token")
+            return (200, Self.successBody(manifest: Self.manifestStore))
+        }
+
+        _ = try await makeService(deviceToken: { "device-cwt" }).signManifest(sampleRequest())
+
+        XCTAssertEqual(entityToken, "device-cwt")
+    }
+
+    func testSendsNoEntityTokenWhenThereIsNone() async throws {
+        var headers: [[String: String]] = []
+        StubURLProtocol.handler = { request, _ in
+            headers.append(request.allHTTPHeaderFields ?? [:])
+            return (200, Self.successBody(manifest: Self.manifestStore))
+        }
+
+        _ = try await makeService().signManifest(sampleRequest())
+        _ = try await makeService(deviceToken: { nil }).signManifest(sampleRequest())
+
+        XCTAssertEqual(headers.count, 2)
+        XCTAssertTrue(headers.allSatisfy { $0["X-Entity-Token"] == nil }, "\(headers)")
+    }
+
+    func testForbiddenForADeviceAttestationIsItsOwnError() async throws {
+        StubURLProtocol.handler = { _, _ in
+            (403, Data(#"{"error":"device attestation required","required":"device_attestation"}"#.utf8))
+        }
+
+        do {
+            _ = try await makeService(deviceToken: { "expired" }).signManifest(sampleRequest())
+            XCTFail("expected deviceAttestationRequired")
+        } catch C2PASigningService.ServiceError.deviceAttestationRequired {
+        }
+    }
+
     func testForbiddenWithARequiredEntitlementMeansAMembershipIsNeeded() async throws {
         let entitlement = "https://patreon.arkavo.com/attr/arkavo-creator/value/publish"
         StubURLProtocol.handler = { _, _ in
@@ -352,14 +392,16 @@ final class C2PASigningServiceTests: XCTestCase {
     }
 
     private func makeService(
-        accessToken: C2PASigningService.AccessTokenProvider? = nil
+        accessToken: C2PASigningService.AccessTokenProvider? = nil,
+        deviceToken: C2PASigningService.AccessTokenProvider? = nil
     ) -> C2PASigningService {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [StubURLProtocol.self]
         return C2PASigningService(
             serverURL: URL(string: "https://signer.test")!,
             session: URLSession(configuration: configuration),
-            accessToken: accessToken
+            accessToken: accessToken,
+            deviceToken: deviceToken
         )
     }
 
