@@ -61,7 +61,8 @@ public actor VideoEncoder {
 
     private var outputURL: URL?
     private var startTime: CMTime?
-    private var lastVideoTimestamp: CMTime = .zero
+    /// The last video frame taken, on the file's (or stream's) timeline; nil until the first
+    private var lastVideoTimestamp: CMTime?
     private var isPaused: Bool = false
     /// Set by `resume()`: the next sample measures how long the pause lasted
     private var resumePending: Bool = false
@@ -305,7 +306,7 @@ public actor VideoEncoder {
         isRecording = true
         print("✅ VideoEncoder: Recording started. isRecording = \(isRecording)")
         startTime = nil
-        lastVideoTimestamp = .zero
+        lastVideoTimestamp = nil
         isPaused = false
         resumePending = false
         totalPausedDuration = .zero
@@ -454,11 +455,37 @@ public actor VideoEncoder {
         }
     }
 
+    /// `buffer` moved to start at `presentationTime`, keeping each sample's own duration. A
+    /// timing entry's duration is per sample: giving it the whole buffer's 20 ms made each
+    /// 960-frame PCM buffer claim 19.2 s, and with video the writer then held audio back (#44).
+    static func retimed(_ buffer: CMSampleBuffer, to presentationTime: CMTime) -> CMSampleBuffer? {
+        var count: CMItemCount = 0
+        guard CMSampleBufferGetSampleTimingInfoArray(buffer, entryCount: 0, arrayToFill: nil, entriesNeededOut: &count) == noErr,
+              count > 0 else { return nil }
+        var timings = [CMSampleTimingInfo](repeating: CMSampleTimingInfo(), count: count)
+        guard CMSampleBufferGetSampleTimingInfoArray(buffer, entryCount: count, arrayToFill: &timings, entriesNeededOut: &count) == noErr
+        else { return nil }
+        let shift = CMTimeSubtract(presentationTime, CMSampleBufferGetPresentationTimeStamp(buffer))
+        for index in timings.indices {
+            timings[index].presentationTimeStamp = CMTimeAdd(timings[index].presentationTimeStamp, shift)
+            timings[index].decodeTimeStamp = .invalid
+        }
+        var adjustedBuffer: CMSampleBuffer?
+        let status = CMSampleBufferCreateCopyWithNewTiming(
+            allocator: kCFAllocatorDefault,
+            sampleBuffer: buffer,
+            sampleTimingEntryCount: count,
+            sampleTimingArray: &timings,
+            sampleBufferOut: &adjustedBuffer
+        )
+        return status == noErr ? adjustedBuffer : nil
+    }
+
     /// Current recording duration
     public var duration: TimeInterval {
         guard startTime != nil else { return 0 }
         // lastVideoTimestamp is already normalized to start at zero, without pauses
-        return CMTimeGetSeconds(lastVideoTimestamp)
+        return CMTimeGetSeconds(lastVideoTimestamp ?? .zero)
     }
 
     // MARK: - Frame Encoding
@@ -491,21 +518,21 @@ public actor VideoEncoder {
                 return
             }
 
-            // Initialize session on first frame (thread-safe check)
+            // Wait if input is not ready. Checked before the session starts, so a frame dropped
+            // here can't set the timeline's start, as on the audio-only path (#44)
+            if !videoInput.isReadyForMoreMediaData {
+                droppedMedia.video.notReady += 1
+                return
+            }
+
+            // Initialize session on the first frame the input can take
             if !sessionStarted {
                 sessionStarted = true
                 startTime = timestamp
                 // Start session at time zero - we'll normalize all timestamps
                 assetWriter.startSession(atSourceTime: .zero)
-                lastVideoTimestamp = .zero
+                lastVideoTimestamp = nil
                 print("📹 VideoEncoder: Session started, base timestamp \(timestamp.seconds)")
-            }
-
-            // Wait if input is not ready. The session above has already started at this frame's
-            // time, so a first frame dropped here still sets the timeline's start (#44)
-            if !videoInput.isReadyForMoreMediaData {
-                droppedMedia.video.notReady += 1
-                return
             }
 
             // Double-check asset writer is still healthy
@@ -538,9 +565,9 @@ public actor VideoEncoder {
                 adjustedTimestamp = CMTimeSubtract(adjustedTimestamp, totalPausedDuration)
             }
 
-            // Ensure timestamps are monotonically increasing
-            if CMTimeCompare(adjustedTimestamp, lastVideoTimestamp) <= 0 {
-                // Timestamp is not increasing, skip this frame
+            // Ensure timestamps are monotonically increasing. The first frame has nothing to follow:
+            // compared with a zero start it would fail, and every recording lost it (#44)
+            if let lastVideoTimestamp, CMTimeCompare(adjustedTimestamp, lastVideoTimestamp) <= 0 {
                 droppedMedia.video.outOfOrder += 1
                 return
             }
@@ -567,7 +594,7 @@ public actor VideoEncoder {
             if !sessionStarted {
                 sessionStarted = true
                 startTime = timestamp
-                lastVideoTimestamp = .zero
+                lastVideoTimestamp = nil
                 print("📹 VideoEncoder: Stream session started, base timestamp \(timestamp.seconds)")
             }
 
@@ -582,7 +609,7 @@ public actor VideoEncoder {
             }
 
             // Ensure timestamps are monotonically increasing
-            if CMTimeCompare(adjustedTimestamp, lastVideoTimestamp) <= 0 {
+            if let lastVideoTimestamp, CMTimeCompare(adjustedTimestamp, lastVideoTimestamp) <= 0 {
                 return
             }
             lastVideoTimestamp = adjustedTimestamp
@@ -668,22 +695,7 @@ public actor VideoEncoder {
             }
 
             // Create adjusted sample buffer with normalized timing
-            var adjustedBuffer: CMSampleBuffer?
-            var timingInfo = CMSampleTimingInfo(
-                duration: CMSampleBufferGetDuration(sampleBuffer),
-                presentationTimeStamp: adjustedTimestamp,
-                decodeTimeStamp: .invalid
-            )
-
-            let status = CMSampleBufferCreateCopyWithNewTiming(
-                allocator: kCFAllocatorDefault,
-                sampleBuffer: sampleBuffer,
-                sampleTimingEntryCount: 1,
-                sampleTimingArray: &timingInfo,
-                sampleBufferOut: &adjustedBuffer
-            )
-
-            guard status == noErr, let finalBuffer = adjustedBuffer else {
+            guard let finalBuffer = Self.retimed(sampleBuffer, to: adjustedTimestamp) else {
                 print("⚠️ Failed to create adjusted audio buffer")
                 droppedMedia.audio.retimeFailed += 1
                 return

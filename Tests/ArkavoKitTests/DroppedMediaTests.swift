@@ -68,11 +68,9 @@ struct DroppedMediaTests {
         _ = try? await encoder.finishRecording()
 
         let dropped = await encoder.droppedMedia.video
-        // Three: the repeated 3200, the 1600 after it, and today also the first frame.
-        // `lastVideoTimestamp` starts at zero and the first frame's time on the file's timeline
-        // is zero, so it fails the strictly-increasing check (#44). A frame the writer wasn't
-        // ready for never reaches the check, so the count is exact only when none were.
-        #expect(dropped.notReady > 0 || dropped.outOfOrder == 3, "\(dropped)")
+        // The repeated 3200 and the 1600 after it. A frame the writer wasn't ready for never
+        // reaches the order check, so the count is exact only when none were.
+        #expect(dropped.notReady > 0 || dropped.outOfOrder == 2, "\(dropped)")
     }
 
     @Test("A new recording starts with no drops counted")
