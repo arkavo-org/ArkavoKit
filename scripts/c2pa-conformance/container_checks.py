@@ -9,12 +9,18 @@
        no claim, decodes cleanly and has the same streams as the signed file
   T9   re-sign (only with --c2pa-sign): c2pa-sign refuses the signed file before any
        request, writes nothing and leaves the input unchanged
+  T10  embedding (only with --unsigned): the signed file has the unsigned input's streams and
+       every packet's payload, by ffprobe and `ffmpeg -f framemd5 -c copy`
+  T7   transplant (only with --transplant-from): the signed file with another signed file's
+       manifest box in place of its own fails validation. A box of the same size, so the same
+       layout, must fail on the hard binding (assertion.dataHash.mismatch)
 
 Tampered copies go under --out; the input is only read, and its SHA-256 is checked
 afterwards. Needs c2patool, ffmpeg and ffprobe. Exits 1 if any check fails, 2 on a usage
 or tool error. run_conformance.py runs these after the rubrics.
 
   container_checks.py --anchors anchors.pem --out DIR [--c2pa-sign PATH] asset...
+  container_checks.py --anchors anchors.pem --out DIR [--unsigned PATH] [--transplant-from PATH] asset
 """
 import argparse
 import hashlib
@@ -179,6 +185,56 @@ def tampered(data):
     return bytes(copy), offset
 
 
+def transplanted(data, donor):
+    """T7: `data` with its manifest box replaced by `donor`'s, and whether the two boxes are the
+    same size, so that no media offset moves. ValueError when either has no manifest box."""
+    own = manifest_boxes(parse_boxes(data, 0, len(data)), data)
+    theirs = manifest_boxes(parse_boxes(donor, 0, len(donor)), donor)
+    if not own or not theirs:
+        raise ValueError("the donor has no C2PA manifest box" if own else "the file has no C2PA manifest box")
+    own, theirs = own[0], theirs[0]
+    box = donor[theirs["offset"]:theirs["offset"] + theirs["size"]]
+    copy = data[:own["offset"]] + box + data[own["offset"] + own["size"]:]
+    return bytes(copy), theirs["size"] == own["size"]
+
+
+def t7_refused(codes, err, aligned):
+    """Whether validation rejected a transplant. A same-size box must fail on the hard binding. A
+    different-size box needs a failure code, or c2patool saying it found no usable manifest; a
+    report c2patool couldn't produce for some other reason is not a rejection."""
+    if aligned:
+        return codes is not None and "assertion.dataHash.mismatch" in codes["failure"]
+    if codes is not None:
+        return bool(codes["failure"])
+    return any(phrase in err.lower() for phrase in ("no claim found", "jumbf"))
+
+
+def has_manifest_box(path):
+    """Whether `path` has a top-level C2PA manifest box. Reads box headers only, so a large file
+    costs a few seeks; a file that isn't BMFF has none."""
+    try:
+        with open(path, "rb") as f:
+            size = f.seek(0, 2)
+            offset = 0
+            while offset + 8 <= size:
+                f.seek(offset)
+                header = f.read(32)
+                box_size, kind = struct.unpack(">I4s", header[:8])
+                hdr = 8
+                if box_size == 1:
+                    box_size, hdr = struct.unpack(">Q", header[8:16])[0], 16
+                elif box_size == 0:
+                    box_size = size - offset
+                if box_size < hdr or offset + box_size > size:
+                    return False
+                if kind == b"uuid" and header[hdr:hdr + 16] == C2PA_UUID:
+                    return True
+                offset += box_size
+    except (OSError, struct.error):
+        return False
+    return False
+
+
 def manifest_removed(data):
     """T8: the file with its manifest box renamed to a same-size free box, so no media offset moves"""
     manifest = manifest_boxes(parse_boxes(data, 0, len(data)), data)[0]
@@ -237,6 +293,28 @@ def dts_problems(lines):
     return problems
 
 
+def framemd5(path):
+    """ffmpeg's per-packet checksums of every stream, copied without decoding"""
+    proc = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-map", "0", "-c", "copy",
+                           "-f", "framemd5", "-"], capture_output=True, text=True)
+    return proc.stdout.splitlines(), proc.stderr.strip() if proc.returncode else ""
+
+
+def framemd5_differences(signed, unsigned):
+    """How two framemd5 listings differ: the first differing packet and any count mismatch.
+    Comment lines (stream headers) are skipped."""
+    a = [line for line in signed if line.strip() and not line.startswith("#")]
+    b = [line for line in unsigned if line.strip() and not line.startswith("#")]
+    problems = []
+    for index, (x, y) in enumerate(zip(a, b), start=1):
+        if x != y:
+            problems.append(f"packet {index} differs: signed {x!r}, unsigned {y!r}")
+            break
+    if len(a) != len(b):
+        problems.append(f"signed has {len(a)} packets, unsigned {len(b)}")
+    return problems
+
+
 def streams(path):
     """ffprobe's stream list for `path`, or None and the reason when ffprobe can't read it"""
     proc = subprocess.run(["ffprobe", "-v", "error", "-show_streams", "-of", "json", str(path)],
@@ -266,8 +344,10 @@ def missing_tools(c2pa_sign=None):
 
 # MARK: - Checks
 
-def check(asset, anchors, out_dir, c2pa_sign=None):
-    """Runs T14, T6, T8 and, with `c2pa_sign`, T9 on `asset`. Returns a JSON-able result."""
+def check(asset, anchors, out_dir, c2pa_sign=None, unsigned=None, donor=None):
+    """Runs T14, T6, T8 and, when given what they need, T9 (`c2pa_sign`), T10 (`unsigned`, the
+    file before signing) and T7 (`donor`, another signed file) on `asset`. Returns a JSON-able
+    result."""
     out_dir.mkdir(parents=True, exist_ok=True)
     before = sha256(asset)
     data = asset.read_bytes()
@@ -310,9 +390,35 @@ def check(asset, anchors, out_dir, c2pa_sign=None):
         result["T9"] = {"exit": proc.returncode, "refused_for_manifest": refused, "wrote_output": t9_out.exists(),
                         "pass": proc.returncode != 0 and refused and not t9_out.exists()}
 
+    if unsigned:
+        signed_streams, signed_error = streams(asset)
+        unsigned_streams, unsigned_error = streams(unsigned)
+        signed_packets, signed_packet_error = framemd5(asset)
+        unsigned_packets, unsigned_packet_error = framemd5(unsigned)
+        errors = [e for e in (signed_error, unsigned_error, signed_packet_error, unsigned_packet_error) if e]
+        differences = framemd5_differences(signed_packets, unsigned_packets)
+        same_streams = signed_streams is not None and signed_streams == unsigned_streams
+        result["T10"] = {"unsigned": str(unsigned), "streams_match": same_streams,
+                         "packets": len([line for line in signed_packets if line and not line.startswith("#")]),
+                         "payload_differences": differences, "errors": errors[:5],
+                         "pass": same_streams and not differences and not errors}
+
+    if donor:
+        try:
+            copy, aligned = transplanted(data, donor.read_bytes())
+        except (ValueError, OSError) as exc:
+            result["T7"] = {"donor": str(donor), "aligned": None, "codes": None,
+                            "stderr": f"donor unusable: {exc}", "pass": False}
+        else:
+            t7_path = out_dir / f"t7-transplanted{asset.suffix}"
+            t7_path.write_bytes(copy)
+            codes, err = c2pa_codes(t7_path, anchors, out_dir / "t7-c2patool.txt")
+            result["T7"] = {"donor": str(donor), "aligned": aligned, "codes": codes, "stderr": err[:300],
+                            "pass": t7_refused(codes, err, aligned)}
+
     result["input_unchanged"] = sha256(asset) == before
     result["pass"] = result["input_unchanged"] and all(
-        result[t]["pass"] for t in ("T14", "T6", "T8", "T9") if t in result)
+        result[t]["pass"] for t in ("T14", "T6", "T8", "T9", "T10", "T7") if t in result)
     return result
 
 
@@ -336,6 +442,17 @@ def print_result(result):
         t9 = result["T9"]
         print(f"T9 re-sign:         {'PASS' if t9['pass'] else 'FAIL'}  exit {t9['exit']}, "
               f"refused for its manifest: {t9['refused_for_manifest']}, wrote output: {t9['wrote_output']}")
+    if "T10" in result:
+        t10 = result["T10"]
+        print(f"T10 embedding:      {'PASS' if t10['pass'] else 'FAIL'}  streams match unsigned: {t10['streams_match']}, "
+              f"{t10['packets']} packets, payload differences: {t10['payload_differences'][:2]}")
+        for e in t10["errors"]:
+            print(f"    - {e}")
+    if "T7" in result:
+        t7 = result["T7"]
+        kind = {True: "same-size box", False: "different-size box", None: "no transplant"}[t7["aligned"]]
+        print(f"T7 transplant:      {'PASS' if t7['pass'] else 'FAIL'}  {kind} from {Path(t7['donor']).name}, "
+              f"failure={t7['codes'] and t7['codes']['failure']}{'' if t7['codes'] else ' stderr=' + t7['stderr'][:80]}")
     if not result["input_unchanged"]:
         print("    - THE INPUT CHANGED")
 
@@ -346,7 +463,20 @@ def main():
     parser.add_argument("--anchors", type=Path, help="PEM trust anchors passed to c2patool")
     parser.add_argument("--out", type=Path, required=True, help="directory for tampered copies and reports")
     parser.add_argument("--c2pa-sign", type=Path, help="c2pa-sign binary, to run T9")
+    parser.add_argument("--unsigned", type=Path, help="the file before signing, to run T10 (one asset only)")
+    parser.add_argument("--transplant-from", type=Path, help="another signed file, to run T7 (one asset only)")
     args = parser.parse_args()
+    if (args.unsigned or args.transplant_from) and len(args.assets) != 1:
+        print("error: --unsigned and --transplant-from take one asset", file=sys.stderr)
+        sys.exit(2)
+    for extra in (args.unsigned, args.transplant_from):
+        if extra and not extra.is_file():
+            print(f"error: no such file: {extra}", file=sys.stderr)
+            sys.exit(2)
+    if args.transplant_from and not has_manifest_box(args.transplant_from):
+        print(f"error: --transplant-from needs a signed file: {args.transplant_from} has no C2PA manifest box",
+              file=sys.stderr)
+        sys.exit(2)
     missing = missing_tools(args.c2pa_sign)
     if missing:
         print(f"error: missing {', '.join(missing)}", file=sys.stderr)
@@ -356,7 +486,8 @@ def main():
         if asset.suffix.lower() not in BMFF_SUFFIXES or not asset.is_file():
             print(f"error: not a MOV/MP4/M4A file: {asset}", file=sys.stderr)
             sys.exit(2)
-        results[asset.name] = check(asset, args.anchors, args.out / asset.stem, args.c2pa_sign)
+        results[asset.name] = check(asset, args.anchors, args.out / asset.stem, args.c2pa_sign,
+                                    args.unsigned, args.transplant_from)
         print_result(results[asset.name])
     (args.out / "containers.json").write_text(json.dumps(results, indent=2))
     ok = all(r["pass"] for r in results.values())

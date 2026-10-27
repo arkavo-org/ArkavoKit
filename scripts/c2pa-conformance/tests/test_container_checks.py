@@ -143,6 +143,82 @@ class ProbeOutputTests(unittest.TestCase):
         self.assertIn("Invalid data", error)
 
 
+class TransplantTests(unittest.TestCase):
+    def test_a_same_size_donor_box_is_swapped_in_place(self):
+        data = signed_layout()
+        donor = FTYP + manifest_box(b"other manifest store") + MDAT + moov(sample_offsets(0))
+        self.assertEqual(len(manifest_box(b"other manifest store")), len(manifest_box()))
+        copy, aligned = cc.transplanted(data, donor)
+        self.assertTrue(aligned)
+        self.assertEqual(len(copy), len(data))
+        start = len(FTYP)
+        self.assertEqual(copy[start:start + len(manifest_box())], manifest_box(b"other manifest store"))
+        self.assertEqual(copy[start + len(manifest_box()):], data[start + len(manifest_box()):])
+
+    def test_a_different_size_donor_box_shifts_the_media(self):
+        data = signed_layout()
+        bigger = manifest_box(b"a longer manifest store than ours")
+        copy, aligned = cc.transplanted(data, FTYP + bigger + MDAT)
+        self.assertFalse(aligned)
+        self.assertEqual(len(copy), len(data) - len(manifest_box()) + len(bigger))
+
+
+    def test_a_donor_without_a_manifest_box_is_a_value_error(self):
+        with self.assertRaises(ValueError):
+            cc.transplanted(signed_layout(), FTYP + MDAT)
+
+    def test_a_same_size_transplant_must_fail_on_the_hard_binding(self):
+        self.assertTrue(cc.t7_refused({"failure": ["assertion.dataHash.mismatch"]}, "", aligned=True))
+        self.assertFalse(cc.t7_refused({"failure": ["signingCredential.untrusted"]}, "", aligned=True))
+        self.assertFalse(cc.t7_refused(None, "Error: No claim found", aligned=True))
+
+    def test_a_different_size_transplant_needs_a_real_rejection(self):
+        self.assertTrue(cc.t7_refused({"failure": ["assertion.dataHash.mismatch"]}, "", aligned=False))
+        self.assertTrue(cc.t7_refused(None, "Error: No claim found", aligned=False))
+        self.assertFalse(cc.t7_refused({"failure": []}, "", aligned=False))
+        self.assertFalse(cc.t7_refused(None, "error: unexpected argument '--crjson' found", aligned=False))
+
+
+class ManifestInFileTests(unittest.TestCase):
+    def write(self, data):
+        import tempfile
+        f = tempfile.NamedTemporaryFile(suffix=".mov", delete=False)
+        f.write(data)
+        f.close()
+        self.addCleanup(Path(f.name).unlink)
+        return Path(f.name)
+
+    def test_a_signed_file_has_a_manifest_box(self):
+        self.assertTrue(cc.has_manifest_box(self.write(signed_layout())))
+
+    def test_an_unsigned_file_has_none(self):
+        self.assertFalse(cc.has_manifest_box(self.write(FTYP + MDAT)))
+
+    def test_a_file_that_is_not_bmff_has_none(self):
+        self.assertFalse(cc.has_manifest_box(self.write(b"not a movie at all")))
+
+
+class Framemd5Tests(unittest.TestCase):
+    SIGNED = ["#format: frame checksums", "#stream#, dts, pts, duration, size, hash",
+              "0, 0, 0, 1, 460800, aa", "1, 0, 0, 1024, 4096, bb"]
+
+    def test_identical_packets_have_no_differences(self):
+        self.assertEqual(cc.framemd5_differences(self.SIGNED, list(self.SIGNED)), [])
+
+    def test_comment_lines_are_ignored(self):
+        unsigned = ["#format: other header"] + self.SIGNED[1:]
+        self.assertEqual(cc.framemd5_differences(self.SIGNED, unsigned), [])
+
+    def test_a_changed_packet_is_reported(self):
+        unsigned = self.SIGNED[:2] + ["0, 0, 0, 1, 460800, ff", self.SIGNED[3]]
+        self.assertEqual(cc.framemd5_differences(self.SIGNED, unsigned),
+                         ["packet 1 differs: signed '0, 0, 0, 1, 460800, aa', unsigned '0, 0, 0, 1, 460800, ff'"])
+
+    def test_a_missing_packet_is_reported(self):
+        self.assertEqual(cc.framemd5_differences(self.SIGNED, self.SIGNED[:3]),
+                         ["signed has 2 packets, unsigned 1"])
+
+
 class TamperCopyTests(unittest.TestCase):
     def test_tampering_flips_one_byte_inside_the_first_mdat_payload(self):
         data = signed_layout()
