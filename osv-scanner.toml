@@ -1,0 +1,19 @@
+# Vulnerability waivers for the CI gate (.github/workflows/vulnerability-scan.yml).
+#
+# The gate runs osv-scanner over the SwiftPM lockfile and fails on any CRITICAL or
+# HIGH finding (C2PA Generator Product Security Requirements, O.3/O.4 Level 1:
+# fix within 90 days of detection). To accept a finding for a short time, add an
+# [[IgnoredVulns]] entry below. Policy, checked by .github/scripts/osv_gate.py:
+#
+#   * Every waiver records its detection date in `reason`, as "Detected YYYY-MM-DD".
+#   * `ignoreUntil` is required and is at most 90 days after the detection date.
+#     osv-scanner treats an entry without `ignoreUntil` as permanent; the gate rejects it.
+#   * An expired waiver stops hiding the finding, so the gate fails again. Fix the
+#     dependency or remove the entry; do not extend the date.
+#
+# Example (kept as a comment on purpose, the file starts with no waivers):
+#
+#   [[IgnoredVulns]]
+#   id = "<advisory id>"
+#   ignoreUntil = 2026-01-31
+#   reason = "Detected 2026-01-02. <why the library is not exposed, and the fix plan>"
