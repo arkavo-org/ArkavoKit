@@ -1,0 +1,37 @@
+name: Build and test
+
+# swift build and swift test (#39). Package.swift needs swift-tools-version 6.4 and
+# macOS 27 (Xcode 27), so this uses the GitHub-hosted `xcode-27` image (macOS 27,
+# Xcode 27.x; announced as a preview). The standard `macos-latest` / `macos-26`
+# images do not carry Xcode 27 and cannot build the package. If `xcode-27` is
+# unavailable or flaky, switch to a self-hosted macOS 27 runner, for example
+# `[self-hosted, macOS, ARM64, m1max]` as the Creator repo uses.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: xcode-27
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Toolchain
+        run: |
+          swift --version
+          xcodebuild -version
+
+      - name: Build
+        run: swift build --build-tests
+
+      - name: Test
+        run: swift test
