@@ -10,6 +10,8 @@
 #     osv-scanner treats an entry without `ignoreUntil` as permanent; the gate rejects it.
 #   * An expired waiver stops hiding the finding, so the gate fails again. Fix the
 #     dependency or remove the entry; do not extend the date.
+#   * [[PackageOverrides]] with `ignore` or `vulnerability.ignore` is rejected: it has
+#     no detection date and can hide a package for good.
 #
 # Example (kept as a comment on purpose, the file starts with no waivers):
 #

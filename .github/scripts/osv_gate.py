@@ -107,12 +107,30 @@ def lint_waivers(config_path, max_days):
             problems.append(f'{vid}: reason must record the detection date as "Detected YYYY-MM-DD"')
             continue
         detected = dt.date.fromisoformat(match.group(1))
+        today = dt.date.today()
+        # Anchor the cap to today as well as to the claimed detection date, so a mistyped
+        # year cannot buy a waiver longer than max_days.
+        if detected > today:
+            problems.append(f"{vid}: detection date {detected} is in the future")
         if until > detected + dt.timedelta(days=max_days):
             problems.append(
                 f"{vid}: ignoreUntil {until} is more than {max_days} days after detection {detected}"
             )
+        if until > today + dt.timedelta(days=max_days):
+            problems.append(f"{vid}: ignoreUntil {until} is more than {max_days} days from today")
         if until <= dt.date.today():
             print(f"::notice::Waiver for {vid} expired on {until}; remove it from {config_path}.")
+    # osv-scanner also suppresses findings through [[PackageOverrides]], and treats one with no
+    # effectiveUntil as permanent. `ignore = true` even drops the package from the scan. Only the
+    # dated [[IgnoredVulns]] waivers above are allowed.
+    for entry in config.get("PackageOverrides", []):
+        name = entry.get("name") or entry.get("purl") or "<no name>"
+        vulnerability = entry.get("vulnerability") or {}
+        if entry.get("ignore") or (isinstance(vulnerability, dict) and vulnerability.get("ignore")):
+            problems.append(
+                f"PackageOverrides for {name} ignores the package or its vulnerabilities; "
+                "use a dated [[IgnoredVulns]] waiver instead"
+            )
     return problems
 
 
