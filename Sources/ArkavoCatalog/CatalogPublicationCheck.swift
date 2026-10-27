@@ -98,16 +98,13 @@ public enum CatalogPublicationError: Error, Sendable, Equatable {
     /// The entry's recording policy lacks the envelope's attribute, so someone who can open the entry couldn't open the
     /// catalog that lists it.
     case lacksCatalogAttribute(Int)
-    /// The entry's recording names other KAS URLs than the envelope.
-    case kasMismatch(Int)
 }
 
 /// The node's publish checks on a `/2` catalog's TDFs, run before publishing so a catalog the node would refuse with a
 /// 422 is never sent. The document's and the index's own rules are `CreatorCatalog.encoded()`'s.
 public enum CatalogPublicationCheck {
     /// Checks the envelope, then every entry in order: its metadata against its recording, its metadata policy `uuid`
-    /// against the envelope's and the entries' before it, that its recording carries the envelope's attribute, then
-    /// that the recording's KAS URLs are the envelope's.
+    /// against the envelope's and the entries' before it, then that its recording carries the envelope's attribute.
     /// `envelope` is the envelope's `manifest.json` bytes; `manifests` maps each `payloadHash` and `metadataHash` to that
     /// TDF's.
     public static func check(_ catalog: CreatorCatalog, envelope: Data,
@@ -138,7 +135,6 @@ public enum CatalogPublicationCheck {
             guard recording.list("dataAttributes")?.contains(where: {
                 $0.object?["attribute"]?.string?.utf8.elementsEqual(attribute.utf8) == true
             }) == true else { throw .lacksCatalogAttribute(index) }
-            guard recording.kasURLs == envelope.kasURLs else { throw .kasMismatch(index) }
         }
     }
 

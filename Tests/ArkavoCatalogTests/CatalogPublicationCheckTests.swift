@@ -3,7 +3,7 @@ import Testing
 @testable import ArkavoCatalog
 
 /// The node's publish checks, mirrored from tdf-iroh-s3's `catalog_metadata.rs` tests and its `/2` envelope checks (#39),
-/// plus the design's own rules: fresh policy uuids, an envelope with no dissemination list and the recordings' KAS.
+/// plus the design's own rules: fresh policy uuids, and an envelope with no dissemination list.
 struct CatalogPublicationCheckTests {
     static let kas = "https://platform.arkavo.net/kas"
     static let campaign = "https://patreon.arkavo.com/attr/campaign/value/12345678"
@@ -260,10 +260,8 @@ struct CatalogPublicationCheckTests {
         #expect(throws: Never.self) { try Self.checkCatalog(1, manifests: manifests) }
     }
 
-    @Test func theRecordingsUseTheEnvelopesKAS() {
-        #expect(throws: CatalogPublicationError.kasMismatch(0)) {
-            try Self.checkCatalog(2, envelope: Self.envelope(kas: ["https://kas.example.com"]))
-        }
+    @Test func theEnvelopesKASIsNotComparedWithTheRecordings() {
+        #expect(throws: Never.self) { try Self.checkCatalog(2, envelope: Self.envelope(kas: ["https://kas.example.com"])) }
     }
 
     @Test func aRepeatedMetadataPolicyIDNamesBothEntries() {
