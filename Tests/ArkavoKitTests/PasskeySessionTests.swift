@@ -195,6 +195,19 @@ final class PasskeySessionTests: XCTestCase {
         XCTAssertNil(store.record)
     }
 
+    /// A token the session cannot be opened with leaves the session this app held.
+    func testATokenWithoutAnIDKeepsThePreviousSession() async {
+        installSession()
+        let before = store.record
+        let http = ScriptedHTTP([.status(204, "")])
+
+        let opened = await sessions.open(token: TestCWT.token(sub: Self.sub), via: endpoint(http))
+
+        XCTAssertFalse(opened)
+        XCTAssertTrue(http.requests.isEmpty)
+        XCTAssertEqual(store.record, before)
+    }
+
     func testASessionIDThatIsNoUUIDIsNotKept() async {
         let reply = #"{"sessionId":"nope","credential":"1.Zmlyc3Q","sessionExpiresAt":1,"idleTimeoutSeconds":1}"#
         let http = ScriptedHTTP([.status(201, reply)])

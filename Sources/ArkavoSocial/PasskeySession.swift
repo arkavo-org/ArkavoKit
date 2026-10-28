@@ -250,11 +250,11 @@ final class PasskeySessions {
     }
 
     private func performOpen(token: String, via endpoint: PasskeySessionEndpoint) async -> Bool {
-        await performEnd(via: endpoint)
         guard let claims = CWTSubject.subjectAndID(fromToken: token) else {
-            print("PasskeySessions.open: the token names no sub and cti; no session")
+            print("PasskeySessions.open: the token names no sub and cti; no session opened")
             return false
         }
+        await performEnd(via: endpoint)
         let key: any SessionDeviceKey
         let publicKey: String
         let proof: Data
