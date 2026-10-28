@@ -253,6 +253,36 @@ final class PatreonClientTests: XCTestCase {
         XCTAssertEqual(account?.isCreator, true)
     }
 
+    /// An amount is read from a CBOR integer that fits an `Int`, negative included;
+    /// a float, or an integer out of range, reads as no amount.
+    func testATierAmountIsReadOnlyFromAnIntegerThatFits() async throws {
+        let amounts: [(TestCBOR, Int?)] = [
+            (.uint(500), 500),
+            (.uint(0), 0),
+            (.nint(99), -100),                              // CBOR -1 - 99
+            (.uint(UInt64(Int.max) + 1), nil),
+            (.nint(UInt64(Int.max)), Int.min),              // -1 - (2^63 - 1)
+            (.nint(UInt64(Int.max) + 1), nil),
+            (.raw([0xF9, 0x3C, 0x00]), nil),                // half float 1.0
+            (.raw([0xFB, 0x40, 0x7F, 0x40, 0, 0, 0, 0, 0]), nil), // double 500.0
+            (.text("500"), nil),
+        ]
+        for (encoded, expected) in amounts {
+            let patreon = TestCBOR.map([
+                (.text("role"), .text("creator")), (.text("patreon_user_id"), .text("p")),
+                (.text("owned_campaign"), .map([
+                    (.text("id"), .text("1")),
+                    (.text("tiers"), .array([.map([(.text("id"), .text("t")), (.text("amount_cents"), encoded)])])),
+                ])),
+            ])
+
+            let account = try await account(from: token(patreon: patreon))
+
+            let tier = try XCTUnwrap(account?.ownedCampaign?.tiers.first, "\(encoded)")
+            XCTAssertEqual(tier.amountCents, expected, "\(encoded)")
+        }
+    }
+
     /// A token minted before authnz-rs#128 has none of its fields.
     func testAClaimFromBeforeTheLadderStillReads() async throws {
         let patreon = TestCBOR.map([
@@ -335,7 +365,10 @@ final class PatreonClientTests: XCTestCase {
 /// A CBOR item for building test tokens.
 indirect enum TestCBOR {
     case uint(UInt64)
+    case nint(UInt64)
     case bool(Bool)
+    /// Bytes as they are, for items this encoder does not build (floats).
+    case raw([UInt8])
     case text(String)
     case array([TestCBOR])
     case map([(TestCBOR, TestCBOR)])
@@ -343,7 +376,9 @@ indirect enum TestCBOR {
     var encoded: [UInt8] {
         switch self {
         case let .uint(value): Self.head(0, value)
+        case let .nint(value): Self.head(1, value)
         case let .bool(value): [value ? 0xF5 : 0xF4]
+        case let .raw(bytes): bytes
         case let .text(text): Self.head(3, UInt64(text.utf8.count)) + Array(text.utf8)
         case let .array(items): Self.head(4, UInt64(items.count)) + items.flatMap(\.encoded)
         case let .map(pairs): Self.head(5, UInt64(pairs.count)) + pairs.flatMap { $0.0.encoded + $0.1.encoded }
@@ -356,7 +391,8 @@ indirect enum TestCBOR {
         case 0 ..< 24: return [type | UInt8(value)]
         case 24 ..< 256: return [type | 24, UInt8(value)]
         case 256 ..< 65536: return [type | 25, UInt8(value >> 8), UInt8(value & 0xFF)]
-        default: return [type | 26] + (0 ..< 4).reversed().map { UInt8((value >> (8 * UInt64($0))) & 0xFF) }
+        case 65536 ..< 4_294_967_296: return [type | 26] + (0 ..< 4).reversed().map { UInt8((value >> (8 * UInt64($0))) & 0xFF) }
+        default: return [type | 27] + (0 ..< 8).reversed().map { UInt8((value >> (8 * UInt64($0))) & 0xFF) }
         }
     }
 }
