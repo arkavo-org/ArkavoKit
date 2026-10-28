@@ -10,6 +10,12 @@ enum TestCWT {
         return wrap(claims: claims)
     }
 
+    /// claims map: {1: "identity.arkavo.net", 2: sub, 7: cti}
+    static func token(sub: String, cti: [UInt8]) -> String {
+        let claims: [UInt8] = [0xA3, 0x01] + tstr("identity.arkavo.net") + [0x02] + tstr(sub) + [0x07] + bstr(cti)
+        return wrap(claims: claims)
+    }
+
     /// A claims map with an issuer and no `sub`.
     static func tokenWithoutSub() -> String {
         wrap(claims: [0xA1, 0x01] + tstr("identity.arkavo.net"))

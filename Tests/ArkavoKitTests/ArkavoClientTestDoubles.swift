@@ -112,11 +112,14 @@ final class RecordingReporter: PasskeyCredentialReporting {
 
 @MainActor
 func makeTestClient() -> ArkavoClient {
-    ArkavoClient(
+    let client = ArkavoClient(
         authURL: URL(string: "https://identity.example.test")!,
         websocketURL: URL(string: "wss://kas.example.test")!,
         relyingPartyID: "identity.example.test"
     )
+    // Never the device keychain or Secure Enclave.
+    client.passkeySessions = PasskeySessions(store: InMemorySessionStore(), keys: SoftwareSessionKeys())
+    return client
 }
 
 /// Holds an async call until the test opens it, so a test can act while a

@@ -46,6 +46,33 @@ final class ArkavoSocialPublicAPITests: XCTestCase {
         XCTAssertTrue(matched, "ArkavoError.unknownPasskey must be matchable by consumers")
     }
 
+    /// Apps renew their passkey session and map every refusal to a passkey sign-in.
+    @MainActor
+    func testPasskeySessionIsPublicAndMatchable() {
+        // Compile-time shape checks only; the closures are never executed.
+        let _: (ArkavoClient) async throws -> RenewedSession = { try await $0.renewSession() }
+        let _: (ArkavoClient) async -> Void = { await $0.endSession() }
+
+        let renewed = RenewedSession(token: "t", expiresAt: Date(timeIntervalSince1970: 1), sessionExpiresAt: Date(timeIntervalSince1970: 2))
+        XCTAssertEqual(renewed.token, "t")
+        XCTAssertEqual(renewed.expiresAt, Date(timeIntervalSince1970: 1))
+        XCTAssertEqual(renewed.sessionExpiresAt, Date(timeIntervalSince1970: 2))
+
+        let errors: [any Error] = [
+            PasskeySessionError.noSession,
+            PasskeySessionError.sessionEnded(.reused),
+            PasskeySessionError.serverFailure,
+        ]
+        let signIns = errors.filter { error in
+            switch error as? PasskeySessionError {
+            case .noSession?, .sessionEnded?: true
+            default: false
+            }
+        }
+        XCTAssertEqual(signIns.count, 2)
+        XCTAssertEqual(SessionEndReason(rawValue: "account_deleted"), .accountDeleted)
+    }
+
     /// Sign-in returns the account handle; `account` is optional so existing callers compile.
     @MainActor
     func testConnectReturnsTheHandle() {
