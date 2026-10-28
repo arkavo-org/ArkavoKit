@@ -108,7 +108,6 @@ public struct PatreonClient: Sendable {
 
         let (data, response) = try await send(request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        print("PatreonClient.link: status=\(status)")
         switch status {
         case 200:
             guard let reply = try? JSONDecoder().decode(LinkReply.self, from: data),
@@ -285,7 +284,7 @@ public struct PatreonAccount: Sendable, Equatable {
     public struct Tier: Sendable, Equatable {
         public let id: String
         public let title: String?
-        /// US cents.
+        /// US cents. nil when absent, or not an integer that fits an `Int` (a float is not read).
         public let amountCents: Int?
         public let published: Bool?
 
@@ -384,11 +383,14 @@ public struct TokenPatreonAccountSource: PatreonAccountSource {
         if case let .map(campaign)? = field("owned_campaign", in: fields), let id = text("id", in: campaign) {
             let tiers = maps("tiers", in: campaign).compactMap { tier -> PatreonAccount.Tier? in
                 guard let id = text("id", in: tier) else { return nil }
-                var amount: Int?
-                if case let .uint(cents)? = field("amount_cents", in: tier), cents <= UInt64(Int.max) { amount = Int(cents) }
                 var published: Bool?
                 if case let .bool(value)? = field("published", in: tier) { published = value }
-                return PatreonAccount.Tier(id: id, title: text("title", in: tier), amountCents: amount, published: published)
+                return PatreonAccount.Tier(
+                    id: id,
+                    title: text("title", in: tier),
+                    amountCents: integer("amount_cents", in: tier),
+                    published: published
+                )
             }
             ownedCampaign = PatreonAccount.OwnedCampaign(id: id, name: text("name", in: campaign), tiers: tiers)
         }
@@ -406,6 +408,20 @@ public struct TokenPatreonAccountSource: PatreonAccountSource {
             if case let .text(text) = key { return text == name }
             return false
         }?.1
+    }
+
+    /// A CBOR integer (major type 0 or 1) that fits an `Int`. A float, a text,
+    /// or an integer out of range is no value.
+    private static func integer(_ name: String, in pairs: [(CBOR, CBOR)]) -> Int? {
+        switch field(name, in: pairs) {
+        case let .uint(value)?:
+            return value <= UInt64(Int.max) ? Int(value) : nil
+        case let .nint(value)?:
+            // CBOR's negative integer is -1 - value.
+            return value <= UInt64(Int.max) ? -1 - Int(value) : nil
+        default:
+            return nil
+        }
     }
 
     private static func text(_ name: String, in pairs: [(CBOR, CBOR)]) -> String? {
