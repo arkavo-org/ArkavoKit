@@ -41,7 +41,9 @@ enum TestCWT {
     }
 
     static func bstr(_ b: [UInt8]) -> [UInt8] {
-        precondition(b.count < 256, "fixture byte strings stay under 256 bytes")
-        return b.count < 24 ? [0x40 + UInt8(b.count)] + b : [0x58, UInt8(b.count)] + b
+        precondition(b.count < 65536, "fixture byte strings stay under 64 KiB")
+        if b.count < 24 { return [0x40 + UInt8(b.count)] + b }
+        if b.count < 256 { return [0x58, UInt8(b.count)] + b }
+        return [0x59, UInt8(b.count >> 8), UInt8(b.count & 0xFF)] + b
     }
 }

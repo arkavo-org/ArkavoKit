@@ -73,6 +73,32 @@ final class ArkavoSocialPublicAPITests: XCTestCase {
         XCTAssertEqual(SessionEndReason(rawValue: "account_deleted"), .accountDeleted)
     }
 
+    /// Creator links Patreon through identity with no client secret, and reads the membership from one source.
+    func testSecretlessPatreonClientIsPublic() throws {
+        let client = PatreonClient(clientID: "c")
+        let authorization: PatreonAuthorization = client.authorization(redirectURI: PatreonClient.defaultRedirectURI)
+        XCTAssertFalse(authorization.state.isEmpty)
+        let _: (PatreonAuthorization, URL) throws -> String = { try $0.code(from: $1) }
+        let _: (PatreonClient) async throws -> PatreonLink = { try await $0.link(code: "c", redirectURI: "r") }
+        let _: () -> Void = { PatreonClient.removeLegacyTokens() }
+
+        let source: any PatreonAccountSource = TokenPatreonAccountSource(token: { nil })
+        XCTAssertNotNil(source)
+        let account = PatreonAccount(
+            role: .creator,
+            campaignID: "1",
+            memberships: [.init(campaignID: "2", patronStatus: nil, tierIDs: [], tierSlugs: [], campaignName: "n", creatorSubject: "s")],
+            ownedCampaign: .init(id: "1", name: nil, tiers: [.init(id: "t", title: "Gold", amountCents: 500, published: true)])
+        )
+        XCTAssertTrue(account.isCreator)
+
+        for error in [PatreonLinkError.signInRequired, .linkedToAnotherAccount, .misconfigured, .patreonUnavailable,
+                      .notConfigured, .serverFailure, .unexpectedResponse] {
+            XCTAssertNotNil(error as any Error)
+        }
+        XCTAssertEqual(PatreonCallbackError.stateMismatch, .stateMismatch)
+    }
+
     /// Sign-in returns the account handle; `account` is optional so existing callers compile.
     @MainActor
     func testConnectReturnsTheHandle() {
