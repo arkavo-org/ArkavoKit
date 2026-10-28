@@ -113,65 +113,6 @@ public class KeychainManager {
         }
     }
 
-    // MARK: - Token Management Convenience Methods
-
-    static func getAccessToken() -> String? {
-        do {
-            let data = try load(service: "com.arkavo.patreon", account: "access_token")
-            return String(data: data, encoding: .utf8)
-        } catch {
-            //            print("Error retrieving access token:", error)
-            return nil
-        }
-    }
-
-    static func getRefreshToken() -> String? {
-        do {
-            let data = try load(service: "com.arkavo.patreon", account: "refresh_token")
-            return String(data: data, encoding: .utf8)
-        } catch {
-            //            print("Error retrieving refresh token:", error)
-            return nil
-        }
-    }
-
-    static func saveTokens(accessToken: String, refreshToken: String) throws {
-        try save(accessToken.data(using: .utf8)!,
-                 service: "com.arkavo.patreon",
-                 account: "access_token")
-        try save(refreshToken.data(using: .utf8)!,
-                 service: "com.arkavo.patreon",
-                 account: "refresh_token")
-    }
-
-    public static func deleteTokens() {
-        try? delete(service: "com.arkavo.patreon", account: "access_token")
-        try? delete(service: "com.arkavo.patreon", account: "refresh_token")
-        try? delete(service: "com.arkavo.patreon", account: "campaign_id")
-    }
-
-    public static func saveCampaignId(_ campaignId: String) throws {
-        try save(campaignId.data(using: .utf8)!,
-                 service: "com.arkavo.patreon",
-                 account: "campaign_id")
-    }
-
-    public static func getCampaignId() -> String? {
-        do {
-            let data = try load(service: "com.arkavo.patreon", account: "campaign_id")
-            return String(data: data, encoding: .utf8)
-        } catch {
-            print("Error retrieving campaign ID:", error)
-            return nil
-        }
-    }
-
-    static func deleteTokensAndCampaignId() {
-        try? delete(service: "com.arkavo.patreon", account: "access_token")
-        try? delete(service: "com.arkavo.patreon", account: "refresh_token")
-        try? delete(service: "com.arkavo.patreon", account: "campaign_id")
-    }
-
     // MARK: - Apple Account Linking Methods
 
     public static func saveAppleUserID(_ userID: String) throws {
@@ -212,10 +153,6 @@ public class KeychainManager {
 
     public static func isAppleAccountLinked() -> Bool {
         getAppleUserID() != nil
-    }
-
-    public static func isPatreonAccountLinked() -> Bool {
-        getAccessToken() != nil
     }
 
     static func saveBlueskyTokens(accessToken: String, refreshToken: String) throws {
