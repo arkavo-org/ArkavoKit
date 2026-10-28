@@ -9,10 +9,26 @@ import Foundation
 /// account deletion scopes its sign-in to the stored token's `sub`, checks the
 /// fresh token's against it, and compares the two before removing the stored
 /// one; `connect(account:)` reuses a cached session only when its token's `sub`
-/// is `account`. Ported from Creator's `ArkavoCreator/Patreon/CWTSubject.swift`
-/// (subject only).
+/// is `account`; a passkey session's open (`PasskeySessions`) signs the
+/// token's `sub` and `cti` (key 7). Ported from Creator's
+/// `ArkavoCreator/Patreon/CWTSubject.swift` (subject only).
 enum CWTSubject {
     static func sub(fromToken token: String) -> String? {
+        claims(fromToken: token, stoppingAtSub: true)?.sub
+    }
+
+    /// The token's `sub` and `cti` (its id, a byte string), or nil unless it carries both.
+    static func subjectAndID(fromToken token: String) -> (sub: String, cti: Data)? {
+        guard let claims = claims(fromToken: token, stoppingAtSub: false),
+              let sub = claims.sub,
+              let cti = claims.cti
+        else { return nil }
+        return (sub, cti)
+    }
+
+    /// Reads claims 2 (`sub`, text) and 7 (`cti`, bytes) until both are read, or
+    /// only `sub` with `stoppingAtSub`. A claim of another type is not read.
+    private static func claims(fromToken token: String, stoppingAtSub: Bool) -> (sub: String?, cti: Data?)? {
         var b64 = token.replacingOccurrences(of: "-", with: "+")
             .replacingOccurrences(of: "_", with: "/")
         while b64.count % 4 != 0 { b64 += "=" }
@@ -26,18 +42,29 @@ enum CWTSubject {
         else { return nil }
         var c = Reader(bytes: claims)
         guard let pairs = c.readMapHeader() else { return nil }
+        var sub: String?
+        var cti: Data?
         for _ in 0 ..< pairs {
             let savedIndex = c.i
             if let key = c.readUInt() {
-                if key == 2 { return c.readTextString() }
-                guard c.skipItem() else { return nil }
+                switch key {
+                case 2:
+                    guard let text = c.readTextString() else { return (sub, cti) }
+                    sub = text
+                    if stoppingAtSub { return (sub, cti) }
+                case 7:
+                    guard let bytes = c.readByteString() else { return (sub, cti) }
+                    cti = Data(bytes)
+                default:
+                    guard c.skipItem() else { return (sub, cti) }
+                }
+                if sub != nil, cti != nil { return (sub, cti) }
             } else {
                 c.i = savedIndex
-                guard c.skipItem() else { return nil }
-                guard c.skipItem() else { return nil }
+                guard c.skipItem(), c.skipItem() else { return (sub, cti) }
             }
         }
-        return nil
+        return (sub, cti)
     }
 
     private struct Reader {

@@ -110,6 +110,15 @@ public final class ArkavoClient: NSObject {
     /// Tells the system which passkeys identity no longer accepts.
     var credentialReporter: any PasskeyCredentialReporting = SystemPasskeyCredentialReporter()
 
+    /// This app's passkey session (authnz-rs #108): opened by `connect`'s
+    /// passkey sign-in, renewed by `renewSession()`, ended by `endSession()`.
+    var passkeySessions: PasskeySessions = .shared
+
+    /// identity, through the same transport as every other identity call.
+    var passkeySessionEndpoint: PasskeySessionEndpoint {
+        PasskeySessionEndpoint(identity: authURL, send: httpData)
+    }
+
     /// Performs a request that opts into HTTP/3 on the first hop.
     ///
     /// `URLRequest.assumesHTTP3Capable` lets the first request negotiate HTTP/3
@@ -353,6 +362,9 @@ public final class ArkavoClient: NSObject {
             // beside a stale handle, so the next connect runs the ceremony.
             try KeychainManager.saveArkavoHandle(reply.handle)
             try KeychainManager.saveAuthenticationToken(reply.token)
+            // Within the 300 s the token can open a session. A failed open is
+            // only no session: the sign-in goes on.
+            await passkeySessions.open(token: reply.token, via: passkeySessionEndpoint)
 
             // Then establish WebSocket connection
             currentState = .connecting
@@ -502,6 +514,8 @@ public final class ArkavoClient: NSObject {
             storedToken: storedToken,
             storedHandle: storedHandle
         )
+        // identity ended the account's sessions with it.
+        await passkeySessions.discard(account: account)
         // After the wipe, so a stalled report cannot hold it up.
         await credentialReporter.reportNoAcceptedCredentials(
             relyingPartyID: relyingPartyID,
@@ -2113,7 +2127,7 @@ private struct AuthenticatorSelectionCriteria: Decodable {
     let userVerification: String?
 }
 
-private extension Data {
+extension Data {
     func base64URLEncodedString() -> String {
         base64EncodedString()
             .replacingOccurrences(of: "+", with: "-")
