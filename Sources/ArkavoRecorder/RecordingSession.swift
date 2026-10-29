@@ -88,6 +88,19 @@ public final class RecordingSession: Sendable {
     private var recordingStartTime: ContinuousClock.Instant?
     private var pauseStartTime: ContinuousClock.Instant?
     private var pausedDuration: Duration = .zero
+    private struct ComposedPreviewState {
+        var enabled = false
+        var generation: UInt64 = 0
+        var lastFrameTime: ContinuousClock.Instant?
+        var inFlight = false
+    }
+    private let composedPreview = OSAllocatedUnfairLock(initialState: ComposedPreviewState())
+    private var composedPreviewTimer: Timer?
+    private typealias MonitorHandler = @Sendable (CVPixelBuffer, CMTime) -> Void
+    private struct FrameDelivery: Sendable {
+        let handler: MonitorHandler?
+        let previewGeneration: UInt64?
+    }
     private let previewCIContext = CIContext()
 
     // Cache for floating head segmentation to avoid running it twice per frame
@@ -255,12 +268,15 @@ public final class RecordingSession: Sendable {
     public var remoteSourcesHandler: (@Sendable ([String]) -> Void)?
     /// Handler for monitor frames - receives the final composed frame before encoding
     nonisolated(unsafe) public var monitorFrameHandler: (@Sendable (CVPixelBuffer, CMTime) -> Void)?
-    nonisolated(unsafe) private var isScreenPreviewOnly: Bool = false
 
     // MARK: - Initialization
 
-    public init() throws {
-        self.screenCapture = ScreenCaptureManager()
+    public convenience init() throws {
+        try self.init(screenCapture: ScreenCaptureManager())
+    }
+
+    init(screenCapture: ScreenCaptureManager) throws {
+        self.screenCapture = screenCapture
         self.cameraCaptures = [:]
         self.audioRouter = AudioRouter()
         self.audioMixer = AudioMixer(voiceSourceID: "muse-voice")
@@ -274,11 +290,15 @@ public final class RecordingSession: Sendable {
 
     private nonisolated func setupCapture() {
         // Wire up screen capture
-        screenCapture.onFrame = { @Sendable [weak self] screenBuffer in
+        screenCapture.onFrameForCapture = { @Sendable [weak self] screenBuffer, captureID in
+            guard let self else { return }
+            // Keep the consumer associated with this frame, even if the source changes
+            // while composition is suspended waiting for the main actor.
+            let monitorHandler = self.monitorFrameHandler
             // Process asynchronously to handle encoding
             // Note: CMSampleBuffer is not Sendable, but we process it immediately without retaining
             Task {
-                await self?.processScreenFrame(screenBuffer)
+                await self.processScreenFrame(screenBuffer, captureID: captureID, monitorHandler: monitorHandler)
             }
         }
 
@@ -312,9 +332,6 @@ public final class RecordingSession: Sendable {
         guard await requestPermissions() else {
             throw RecorderError.permissionDenied
         }
-
-        // Clear preview-only mode so frames go to encoder
-        isScreenPreviewOnly = false
 
         // Clear any previous source registrations
         await sourceRegistry.clear()
@@ -407,6 +424,7 @@ public final class RecordingSession: Sendable {
         recordingStartTime = .now
         pauseStartTime = nil
         pausedDuration = .zero
+        updateComposedPreviewDriver()
 
         // STEP 6: Start audio sources (after encoder is ready to receive samples)
         print("🎙️ RecordingSession: Starting all audio sources...")
@@ -487,6 +505,7 @@ public final class RecordingSession: Sendable {
             recordingStartTime = nil
             pauseStartTime = nil
             pausedDuration = .zero
+            inputsDidChange()
         }
 
         // Finish encoding
@@ -538,7 +557,8 @@ public final class RecordingSession: Sendable {
 
     nonisolated(unsafe) private var latestCameraBuffers: [String: CMSampleBuffer] = [:]
 
-    private nonisolated func processScreenFrame(_ screenBuffer: CMSampleBuffer) async {
+    private nonisolated func processScreenFrame(_ screenBuffer: CMSampleBuffer, captureID: UUID, monitorHandler: MonitorHandler?) async {
+        guard screenCapture.isCurrentCapture(captureID) else { return }
         // Dispatch screen preview if handler is set
         if let handler = screenPreviewHandler,
            let pixelBuffer = CMSampleBufferGetImageBuffer(screenBuffer) {
@@ -549,16 +569,12 @@ public final class RecordingSession: Sendable {
             }
         }
 
-        // If preview-only mode (no recording or streaming), don't process for encoding. A screen
-        // turned on mid-recording or mid-stream runs as a preview capture, and its frames still count.
-        guard !isScreenPreviewOnly || _isRecording || _streamingActive.withLock({ $0 }) else { return }
-
-        // Continue with recording/streaming if active
-        await processFrameSync(screen: screenBuffer)
+        await processFrameSync(screen: screenBuffer, captureID: captureID, monitorHandler: monitorHandler)
     }
 
-    private nonisolated func processFrameSync(screen screenBuffer: CMSampleBuffer) async {
-        guard _isRecording || _streamingActive.withLock({ $0 }) else { return }
+    private nonisolated func processFrameSync(screen screenBuffer: CMSampleBuffer, captureID: UUID, monitorHandler: MonitorHandler?) async {
+        guard let delivery = beginFrameDelivery(handler: monitorHandler) else { return }
+        defer { finishFrameDelivery(delivery) }
 
         let mode = await MainActor.run { self.inputMode }
 
@@ -599,15 +615,19 @@ public final class RecordingSession: Sendable {
         // Encode the composited frame
         let timestamp = CMSampleBufferGetPresentationTimeStamp(screenBuffer)
 
-        // Send to monitor if handler is set
-        monitorFrameHandler?(composited, timestamp)
+        guard screenCapture.isCurrentCapture(captureID), isCurrent(delivery) else { return }
+        delivery.handler?(composited, timestamp)
 
-        await encoder.encodeVideoFrame(composited, timestamp: timestamp)
+        if delivery.previewGeneration == nil {
+            await encoder.encodeVideoFrame(composited, timestamp: timestamp)
+        }
     }
 
     /// Processes a frame for camera-only or avatar-only modes (called by timer)
     private nonisolated func processCameraOrAvatarFrame() async {
-        guard _isRecording || _streamingActive.withLock({ $0 }) else { return }
+        let monitorHandler = monitorFrameHandler
+        guard let delivery = beginFrameDelivery(handler: monitorHandler) else { return }
+        defer { finishFrameDelivery(delivery) }
 
         let mode = await MainActor.run { self.inputMode }
         let canvasSize = standardCanvasSize
@@ -652,10 +672,61 @@ public final class RecordingSession: Sendable {
 
         guard let output = composited else { return }
 
-        // Send to monitor if handler is set
-        monitorFrameHandler?(output, timestamp)
+        guard isCurrent(delivery) else { return }
+        delivery.handler?(output, timestamp)
 
-        await encoder.encodeVideoFrame(output, timestamp: timestamp)
+        if delivery.previewGeneration == nil {
+            await encoder.encodeVideoFrame(output, timestamp: timestamp)
+        }
+    }
+
+    /// The idle path has its own admission gate: it never enters the encoder or starts
+    /// audio, and all sources together compose at most one preview frame per second.
+    private nonisolated func beginFrameDelivery(handler: MonitorHandler?) -> FrameDelivery? {
+        if _isRecording || _streamingActive.withLock({ $0 }) {
+            return FrameDelivery(handler: handler, previewGeneration: nil)
+        }
+        return composedPreview.withLock { state in
+            guard state.enabled, !state.inFlight, handler != nil else { return nil }
+            let now = ContinuousClock.now
+            if let last = state.lastFrameTime, last.duration(to: now) < .seconds(1) { return nil }
+            state.inFlight = true
+            return FrameDelivery(handler: handler, previewGeneration: state.generation)
+        }
+    }
+
+    private nonisolated func finishFrameDelivery(_ delivery: FrameDelivery) {
+        guard delivery.previewGeneration != nil else { return }
+        composedPreview.withLock {
+            $0.inFlight = false
+            $0.lastFrameTime = .now
+        }
+    }
+
+    private nonisolated func isCurrent(_ delivery: FrameDelivery) -> Bool {
+        guard let generation = delivery.previewGeneration else { return true }
+        return composedPreview.withLock { $0.enabled && $0.generation == generation }
+    }
+
+    private func updateComposedPreviewDriver() {
+        composedPreviewTimer?.invalidate()
+        composedPreviewTimer = nil
+        let enabled = composedPreview.withLock { state in
+            state.generation &+= 1
+            return state.enabled
+        }
+        guard enabled, !_isRecording, !_streamingActive.withLock({ $0 }),
+              !inputMode.needsDesktop, inputMode.needsVideo else { return }
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] timer in
+            guard let self else {
+                timer.invalidate()
+                return
+            }
+            Task { @MainActor [weak self] in await self?.processCameraOrAvatarFrame() }
+        }
+        composedPreviewTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+        Task { [weak self] in await self?.processCameraOrAvatarFrame() }
     }
 
     // MARK: - Camera/Avatar Frame Driver
@@ -677,7 +748,11 @@ public final class RecordingSession: Sendable {
     /// start the screen capture first (e.g. `startScreenPreview()`): this stops the frame
     /// timer, and the screen frames then carry the output.
     public func inputsDidChange() {
-        guard _isRecording || _streamingActive.withLock({ $0 }) else { return }
+        updateComposedPreviewDriver()
+        guard _isRecording || _streamingActive.withLock({ $0 }) else {
+            stopCameraFrameDriver()
+            return
+        }
         let mode = inputMode
         if !mode.needsDesktop && mode.needsVideo {
             if cameraFrameTimer == nil { startCameraFrameDriver() }
@@ -702,6 +777,19 @@ public final class RecordingSession: Sendable {
     }
 
     // MARK: - Public Utilities
+
+    /// Enables final composed monitor frames at most once per second while idle.
+    /// Callers configure/start their existing visual previews and call `inputsDidChange()`
+    /// after changing sources. This starts no capture, audio, recording or streaming;
+    /// disabling it leaves an active recording or stream's normal frame cadence intact.
+    public func setComposedPreviewEnabled(_ enabled: Bool) {
+        let changed = composedPreview.withLock { state in
+            guard state.enabled != enabled else { return false }
+            state.enabled = enabled
+            return true
+        }
+        if changed { updateComposedPreviewDriver() }
+    }
 
     /// Get available screens
     public static func availableScreens() -> [ScreenInfo] {
@@ -757,13 +845,11 @@ public final class RecordingSession: Sendable {
 
     /// Starts screen capture purely for preview purposes (no recording).
     public func startScreenPreview() throws {
-        isScreenPreviewOnly = true
         try screenCapture.startCapture(displayID: selectedDisplayID)
     }
 
     /// Stops screen preview capture.
     public func stopScreenPreview() {
-        isScreenPreviewOnly = false
         screenCapture.stopCapture()
     }
 
@@ -773,6 +859,7 @@ public final class RecordingSession: Sendable {
     /// pass through processFrameSync since streaming is active.
     /// Also starts audio routing so mic audio reaches the encoder.
     private func startStreamingFrameGeneration() {
+        updateComposedPreviewDriver()
         let mode = inputMode
 
         // Start camera/avatar frame driver if not using desktop capture
@@ -842,6 +929,7 @@ public final class RecordingSession: Sendable {
         await encoder.stopStreaming()
         await encoder.stopNTDFStreaming()
         if !_isRecording { resetAudioMixer() }
+        inputsDidChange()
     }
 
     /// Stop streaming to a single destination (others continue)
@@ -851,6 +939,7 @@ public final class RecordingSession: Sendable {
         if await encoder.activeDestinationIds.isEmpty {
             _streamingActive.withLock { $0 = false }
             if !_isRecording { resetAudioMixer() }
+            inputsDidChange()
         }
     }
 

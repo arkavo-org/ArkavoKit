@@ -1,10 +1,33 @@
 import AVFoundation
 import CoreGraphics
+import os
 import Testing
 @testable import ArkavoRecorder
 
 @MainActor
 struct ScreenCaptureLifecycleTests {
+    @Test("Callbacks from a replaced display are discarded while the current display still delivers")
+    func replacedDisplayCannotDeliverFrames() throws {
+        let captureSession = ConfigurationOnlyCaptureSession()
+        let manager = ScreenCaptureManager(captureSession: captureSession)
+        let frames = OSAllocatedUnfairLock(initialState: 0)
+        manager.onFrame = { _ in frames.withLock { $0 += 1 } }
+        try manager.startCapture()
+        let output = try #require(captureSession.outputs.first)
+        let oldConnection = try #require(output.connection(with: .video))
+        try manager.startCapture()
+        let newConnection = try #require(output.connection(with: .video))
+        let pixel = try #require(createTestPixelBuffer(width: 16, height: 16, red: 255, green: 0, blue: 0))
+        let sample = try #require(createTestSampleBuffer(from: pixel))
+        manager.captureOutput(output, didOutput: sample, from: oldConnection)
+        #expect(frames.withLock { $0 } == 0)
+        manager.captureOutput(output, didOutput: sample, from: newConnection)
+        #expect(frames.withLock { $0 } == 1)
+        manager.stopCapture()
+        manager.captureOutput(output, didOutput: sample, from: newConnection)
+        #expect(frames.withLock { $0 } == 1)
+    }
+
     @Test("Stopping then restarting capture keeps the newly selected screen input")
     func stopThenRestartKeepsReplacementInput() async throws {
         let captureSession = ConfigurationOnlyCaptureSession()

@@ -1,6 +1,7 @@
 #if os(macOS)
 @preconcurrency import AVFoundation
 import CoreGraphics
+import os
 #if canImport(AppKit)
 import AppKit
 #endif
@@ -17,6 +18,16 @@ public final class ScreenCaptureManager: NSObject, Sendable {
     private let outputQueue = DispatchQueue(label: "com.arkavo.screencapture")
 
     nonisolated(unsafe) public var onFrame: (@Sendable (CMSampleBuffer) -> Void)?
+    nonisolated(unsafe) var onFrameForCapture: (@Sendable (CMSampleBuffer, UUID) -> Void)?
+    private struct ActiveCapture {
+        let input: ObjectIdentifier
+        let id = UUID()
+    }
+    private let activeCapture = OSAllocatedUnfairLock<ActiveCapture?>(initialState: nil)
+
+    nonisolated func isCurrentCapture(_ id: UUID) -> Bool {
+        activeCapture.withLock { $0?.id == id }
+    }
 
     /// Continuation for async first-frame signaling
     private var firstFrameContinuation: CheckedContinuation<Void, Never>?
@@ -77,6 +88,7 @@ public final class ScreenCaptureManager: NSObject, Sendable {
         input.capturesCursor = true
         input.capturesMouseClicks = false
 
+        activeCapture.withLock { $0 = nil }
         captureSession.beginConfiguration()
 
         // Remove existing input if any
@@ -95,6 +107,7 @@ public final class ScreenCaptureManager: NSObject, Sendable {
         }
 
         captureSession.commitConfiguration()
+        activeCapture.withLock { $0 = ActiveCapture(input: ObjectIdentifier(input)) }
 
         // Reset first frame tracking
         hasDeliveredFirstFrame = false
@@ -133,6 +146,7 @@ public final class ScreenCaptureManager: NSObject, Sendable {
 
     /// Stops screen capture
     public func stopCapture() {
+        activeCapture.withLock { $0 = nil }
         captureSession.stopRunning()
 
         captureSession.beginConfiguration()
@@ -173,13 +187,11 @@ public final class ScreenCaptureManager: NSObject, Sendable {
     }
 
     /// Signal that first frame was received (called from delegate on background queue)
-    private func signalFirstFrame() {
-        Task { @MainActor in
-            guard !self.hasDeliveredFirstFrame else { return }
-            self.hasDeliveredFirstFrame = true
-            self.firstFrameContinuation?.resume()
-            self.firstFrameContinuation = nil
-        }
+    private func signalFirstFrame(captureID: UUID) {
+        guard isCurrentCapture(captureID), !hasDeliveredFirstFrame else { return }
+        hasDeliveredFirstFrame = true
+        firstFrameContinuation?.resume()
+        firstFrameContinuation = nil
     }
 }
 
@@ -191,13 +203,18 @@ extension ScreenCaptureManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
+        guard let input = connection.inputPorts.first?.input,
+              let captureID = activeCapture.withLock({ state in
+                  state?.input == ObjectIdentifier(input) ? state?.id : nil
+              }) else { return }
         // Forward frame to handler - calling directly on callback queue
         // CMSampleBuffer is not Sendable but we handle it synchronously
         onFrame?(sampleBuffer)
+        onFrameForCapture?(sampleBuffer, captureID)
 
         // Signal first frame for async startup
         Task { @MainActor [weak self] in
-            self?.signalFirstFrame()
+            self?.signalFirstFrame(captureID: captureID)
         }
     }
 }
