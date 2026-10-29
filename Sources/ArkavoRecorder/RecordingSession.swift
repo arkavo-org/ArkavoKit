@@ -85,7 +85,9 @@ public final class RecordingSession: Sendable {
     // This is updated when recording starts/stops
     nonisolated(unsafe) private var _isRecording: Bool = false
     private let _streamingActive = OSAllocatedUnfairLock(initialState: false)
-    nonisolated(unsafe) private var recordingStartTime: Date?
+    private var recordingStartTime: ContinuousClock.Instant?
+    private var pauseStartTime: ContinuousClock.Instant?
+    private var pausedDuration: Duration = .zero
     private let previewCIContext = CIContext()
 
     // Cache for floating head segmentation to avoid running it twice per frame
@@ -97,7 +99,9 @@ public final class RecordingSession: Sendable {
 
     public var duration: TimeInterval {
         guard _isRecording, let startTime = recordingStartTime else { return 0 }
-        return Date().timeIntervalSince(startTime)
+        let elapsed = startTime.duration(to: pauseStartTime ?? .now) - pausedDuration
+        let components = elapsed.components
+        return Double(components.seconds) + Double(components.attoseconds) / 1e18
     }
 
     nonisolated(unsafe) public var audioLevel: Float = 0.0
@@ -296,6 +300,7 @@ public final class RecordingSession: Sendable {
 
     /// Starts a new recording session
     public func startRecording(outputURL: URL, title: String) async throws {
+        guard !_isRecording else { return }
         let mode = inputMode
 
         // Validate at least one input is enabled
@@ -399,7 +404,9 @@ public final class RecordingSession: Sendable {
 
         // STEP 5: NOW mark recording as active (all sources are ready)
         _isRecording = true
-        recordingStartTime = Date()
+        recordingStartTime = .now
+        pauseStartTime = nil
+        pausedDuration = .zero
 
         // STEP 6: Start audio sources (after encoder is ready to receive samples)
         print("🎙️ RecordingSession: Starting all audio sources...")
@@ -478,6 +485,8 @@ public final class RecordingSession: Sendable {
         defer {
             _isRecording = false
             recordingStartTime = nil
+            pauseStartTime = nil
+            pausedDuration = .zero
         }
 
         // Finish encoding
@@ -490,6 +499,8 @@ public final class RecordingSession: Sendable {
 
     /// Pauses the current recording
     public func pauseRecording() {
+        guard _isRecording, pauseStartTime == nil else { return }
+        pauseStartTime = .now
         Task {
             await encoder.pause()
         }
@@ -497,6 +508,9 @@ public final class RecordingSession: Sendable {
 
     /// Resumes a paused recording
     public func resumeRecording() {
+        guard _isRecording, let pauseStartTime else { return }
+        pausedDuration += pauseStartTime.duration(to: .now)
+        self.pauseStartTime = nil
         Task {
             await encoder.resume()
         }

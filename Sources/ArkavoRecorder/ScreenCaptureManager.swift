@@ -24,8 +24,12 @@ public final class ScreenCaptureManager: NSObject, Sendable {
 
     // MARK: - Initialization
 
-    public override init() {
-        self.captureSession = AVCaptureSession()
+    public override convenience init() {
+        self.init(captureSession: AVCaptureSession())
+    }
+
+    init(captureSession: AVCaptureSession) {
+        self.captureSession = captureSession
         self.videoOutput = AVCaptureVideoDataOutput()
 
         super.init()
@@ -78,6 +82,7 @@ public final class ScreenCaptureManager: NSObject, Sendable {
         // Remove existing input if any
         if let existingInput = screenInput {
             captureSession.removeInput(existingInput)
+            screenInput = nil
         }
 
         // Add new input
@@ -94,10 +99,9 @@ public final class ScreenCaptureManager: NSObject, Sendable {
         // Reset first frame tracking
         hasDeliveredFirstFrame = false
 
-        // Start the session
-        Task {
-            captureSession.startRunning()
-        }
+        // Keep start, stop and configuration on the same actor, in caller order.
+        // Deferring only start/stop lets an earlier stop remove a replacement input.
+        captureSession.startRunning()
         #else
         throw RecorderError.screenCaptureUnavailable
         #endif
@@ -129,16 +133,14 @@ public final class ScreenCaptureManager: NSObject, Sendable {
 
     /// Stops screen capture
     public func stopCapture() {
-        Task {
-            captureSession.stopRunning()
+        captureSession.stopRunning()
 
-            captureSession.beginConfiguration()
-            if let input = screenInput {
-                captureSession.removeInput(input)
-                screenInput = nil
-            }
-            captureSession.commitConfiguration()
+        captureSession.beginConfiguration()
+        if let input = screenInput {
+            captureSession.removeInput(input)
+            screenInput = nil
         }
+        captureSession.commitConfiguration()
 
         // Reset state
         hasDeliveredFirstFrame = false

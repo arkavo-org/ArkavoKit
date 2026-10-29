@@ -743,9 +743,20 @@ public actor VideoEncoder {
         metadata.append(creatorItem)
 
         // Software
+        let appInfo = Bundle.main.infoDictionary ?? [:]
+        let appName = appInfo["CFBundleDisplayName"] as? String
+            ?? appInfo["CFBundleName"] as? String
+            ?? ProcessInfo.processInfo.processName
+        var software = appName
+        if let version = appInfo["CFBundleShortVersionString"] as? String, !version.isEmpty {
+            software += " v\(version)"
+        }
+        if let build = appInfo["CFBundleVersion"] as? String, !build.isEmpty {
+            software += " (\(build))"
+        }
         let softwareItem = AVMutableMetadataItem()
         softwareItem.identifier = .commonIdentifierSoftware
-        softwareItem.value = "Arkavo Creator v1.0" as NSString
+        softwareItem.value = software as NSString
         metadata.append(softwareItem)
 
         // Creation date
