@@ -494,7 +494,11 @@ public final class RecordingSession: Sendable {
 
         // STEP 2: Add audio sources to audio router (but don't start yet)
         await removeUnwantedAudioSources(microphone: mode.needsMicrophone)
-        resetAudioMixer()
+        // A live stream's mix carries on into the recording: resetting it would drop its queued
+        // audio and clock choice mid-stream, a dropout while sources build their lead again.
+        if !_streamingActive.withLock({ $0 }) {
+            resetAudioMixer()
+        }
         // A stream that outlived the last recording still runs its microphone and screen audio;
         // the recording takes those over rather than adding a second of each.
         if mode.needsMicrophone && !audioRouter.allSourceIDs.contains("microphone") {
@@ -1080,6 +1084,9 @@ public final class RecordingSession: Sendable {
             startStreamingFrameGeneration()
         }
     }
+
+    /// Tests: the mixer every audio source reaches the encoder through.
+    var audioMixerForTesting: AudioMixer { audioMixer }
 
     /// Tests: `startStreaming(to:streamKey:)` without RTMP. The encoder's stream output goes to
     /// `onEncodedVideo` instead of a destination; `stopStreaming()` ends it.

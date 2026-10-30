@@ -390,6 +390,33 @@ struct RecordingSessionStopTests {
         _ = try? await session.stopRecording()
     }
 
+    @Test("Starting a recording while a stream runs keeps the stream's mix: its clock and the voice it has queued")
+    func recordingStartedMidStreamKeepsTheMix() async throws {
+        let url = Self.outputURL("mid-stream-mix")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let session = try Self.avatarSession()
+        let clock = FakeAudioSource(sourceID: "test-clock")
+        let voice = FakeAudioSource(sourceID: "muse-voice")
+        session.addMuseAudioSource(clock)
+        session.addMuseAudioSource(voice)
+        try await session.startStreamingForTesting { _ in }
+        try await Self.waitUntil { clock.isActive && voice.isActive }
+        // The clock delivers first and sets the cadence; the voice is queued, short of its lead.
+        clock.onSample?(Self.tone(frames: 1024, amplitude: 0))
+        voice.onSample?(Self.tone(frames: 960, amplitude: 8000))
+        let mixer = session.audioMixerForTesting
+        let queued = mixer.queuedSampleCountForTesting(of: "muse-voice")
+        try #require(mixer.clockSourceIDForTesting == "test-clock")
+        try #require(queued > 0)
+
+        try await session.startRecording(outputURL: url, title: "mid-stream mix")
+
+        #expect(mixer.clockSourceIDForTesting == "test-clock")
+        #expect(mixer.queuedSampleCountForTesting(of: "muse-voice") == queued)
+        _ = try? await session.stopRecording()
+        await session.stopStreaming()
+    }
+
     /// An avatar session with the microphone on, whose permission request is held until answered.
     private static func sessionWithHeldPermission() throws -> (RecordingSession, HeldPermission) {
         let permission = HeldPermission()
