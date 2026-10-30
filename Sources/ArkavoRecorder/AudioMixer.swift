@@ -5,10 +5,14 @@
 //  Mixes multiple audio CMSampleBuffer streams into a single output.
 //  Clock-driven FIFO: one source (the first to deliver, or `clockSourceID`)
 //  sets the frame cadence; every other source is a FIFO of samples drained
-//  by the clock's frame length and zero-filled when short. A configured voice
-//  source ducks the others while it has audio queued. The voice is never
-//  auto-picked as the clock while other sources are registered, and every FIFO
-//  is capped at `maxQueuedSeconds` (oldest samples dropped).
+//  by the clock's frame length. A FIFO is a jitter buffer: it starts playing
+//  only once it holds `prefillSeconds` of audio or its oldest sample has waited
+//  that long in clock frames, so a producer whose chunks don't line up with the
+//  clock's buffers isn't zero-filled mid-stream; it is zero-filled only when it
+//  runs dry, and then builds its lead again. A configured voice source ducks the
+//  others while it has audio queued. The voice is never auto-picked as the clock
+//  while other sources are registered, and every FIFO is capped at
+//  `maxQueuedSeconds` (oldest samples dropped).
 //
 
 import AVFoundation
@@ -24,6 +28,10 @@ public final class AudioMixer: @unchecked Sendable {
     private var registeredSourceIDs: Set<String> = []
     private var sourceGains: [String: Float] = [:]
     private var lastVoiceActivity: TimeInterval = -.infinity
+    /// Non-clock sources whose FIFO has built its lead and is being drained.
+    private var primed: Set<String> = []
+    /// Clock frames drained since an unprimed source's oldest queued sample arrived.
+    private var framesWaited: [String: Int] = [:]
 
     /// The source whose activity ducks the others (the Muse voice). nil = no ducking.
     public let voiceSourceID: String?
@@ -33,17 +41,33 @@ public final class AudioMixer: @unchecked Sendable {
     public var voiceDuckHangover: TimeInterval = 0.3
 
     /// Longest a non-clock source may queue, in seconds. Older samples are dropped.
-    public let maxQueuedSeconds: Double = 0.2
+    public let maxQueuedSeconds: Double = AudioMixer.queueCapSeconds
+    private static let queueCapSeconds = 0.2
+
+    /// Default lead a non-clock source builds before it plays: about two 20 ms voice chunks.
+    public static let defaultPrefillSeconds = 0.04
+
+    /// Lead, in seconds, a non-clock source builds before it plays, and how long (in clock
+    /// frames) a shorter sound waits before playing anyway. It delays every non-clock source
+    /// by about this much relative to the clock. At most half of `maxQueuedSeconds`, so a
+    /// source that has built its lead keeps headroom below the cap and is never trimmed.
+    public let prefillSeconds: Double
 
     /// The source ID the mix reaches the encoder under.
     public static let outputSourceID = "mixed"
 
     public var onMixedSample: ((CMSampleBuffer) -> Void)?
 
-    public init(sampleRate: Double = 48000, channels: UInt32 = 2, voiceSourceID: String? = nil) {
+    public init(
+        sampleRate: Double = 48000,
+        channels: UInt32 = 2,
+        voiceSourceID: String? = nil,
+        prefillSeconds: Double = AudioMixer.defaultPrefillSeconds
+    ) {
         self.sampleRate = sampleRate
         self.channels = channels
         self.voiceSourceID = voiceSourceID
+        self.prefillSeconds = min(max(0, prefillSeconds), Self.queueCapSeconds / 2)
     }
 
     /// Pins the clock source. Otherwise the first source to deliver becomes the clock.
@@ -51,7 +75,7 @@ public final class AudioMixer: @unchecked Sendable {
     public func setClockSource(_ sourceID: String?) {
         lock.lock()
         clockSourceID = sourceID
-        if let sourceID { fifos.removeValue(forKey: sourceID) }
+        if let sourceID { dropQueue(of: sourceID) }
         lock.unlock()
     }
 
@@ -67,7 +91,7 @@ public final class AudioMixer: @unchecked Sendable {
     func unregisterSource(_ sourceID: String) {
         lock.lock()
         registeredSourceIDs.remove(sourceID)
-        fifos.removeValue(forKey: sourceID)
+        dropQueue(of: sourceID)
         if clockSourceID == sourceID { clockSourceID = nil }
         lock.unlock()
     }
@@ -105,17 +129,38 @@ public final class AudioMixer: @unchecked Sendable {
             lock.unlock()
             return
         }
-        // Drain every other FIFO by the clock's frame count.
+        // Drain every other FIFO by the clock's frame count, once it has built its lead.
         let frameSamples = incoming.count
+        let clockFrames = frameSamples / Int(channels)
+        let prefillFrames = Int((sampleRate * prefillSeconds).rounded())
+        let prefillSamples = prefillFrames * Int(channels)
         var contributions: [(id: String, samples: [Int16])] = []
         for id in Array(fifos.keys) where id != clockSourceID {
             guard var fifo = fifos[id] else { continue }
+            if !primed.contains(id) {
+                guard !fifo.isEmpty else { continue }
+                // Wait for a full lead, or for a sound shorter than one to have waited as long.
+                let waited = (framesWaited[id] ?? 0) + clockFrames
+                guard fifo.count >= prefillSamples || waited >= prefillFrames else {
+                    framesWaited[id] = waited
+                    continue
+                }
+                primed.insert(id)
+                framesWaited[id] = nil
+            }
             fifos[id] = nil
             let take = min(frameSamples, fifo.count)
-            contributions.append((id, Array(fifo.prefix(take))))
-            fifo.removeFirst(take)
+            // Short of a full buffer, the source has run dry: the rest is silence, and its next
+            // audio builds a fresh lead rather than playing with a hole every few buffers.
+            if take < frameSamples { primed.remove(id) }
+            if take > 0 {
+                contributions.append((id, Array(fifo.prefix(take))))
+                fifo.removeFirst(take)
+            }
             fifos[id] = fifo
         }
+        // Queued voice ducks even while it builds its lead, so the duck starts up to one prefill
+        // before the voice is audible and its first syllable never lands on unducked audio.
         let voiceQueued = voiceSourceID.map { (fifos[$0]?.isEmpty == false) } ?? false
         let voiceRecent = CACurrentMediaTime() - lastVoiceActivity <= voiceDuckHangover
         let ducking = voiceSourceID != nil && (voiceQueued || voiceRecent || contributions.contains { $0.id == voiceSourceID && !$0.samples.isEmpty })
@@ -140,11 +185,25 @@ public final class AudioMixer: @unchecked Sendable {
 
     /// Drops a source's queued audio (e.g. the voice was cut).
     public func deactivateSource(_ sourceID: String) {
-        lock.lock(); fifos.removeValue(forKey: sourceID); lock.unlock()
+        lock.lock(); dropQueue(of: sourceID); lock.unlock()
     }
 
     public func reset() {
-        lock.lock(); fifos.removeAll(); clockSourceID = nil; lastVoiceActivity = -.infinity; lock.unlock()
+        lock.lock()
+        fifos.removeAll()
+        primed.removeAll()
+        framesWaited.removeAll()
+        clockSourceID = nil
+        lastVoiceActivity = -.infinity
+        lock.unlock()
+    }
+
+    /// Drops a source's queued audio and its lead, so its next audio builds a fresh one.
+    /// Call with `lock` held.
+    private func dropQueue(of sourceID: String) {
+        fifos.removeValue(forKey: sourceID)
+        primed.remove(sourceID)
+        framesWaited.removeValue(forKey: sourceID)
     }
 
     // MARK: - Buffers

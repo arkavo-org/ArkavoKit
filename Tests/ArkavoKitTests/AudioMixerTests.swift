@@ -3,6 +3,8 @@ import AVFoundation
 import CoreMedia
 @testable import ArkavoRecorder
 
+/// Tests of mixing, ducking and clock selection build an unbuffered mixer (`prefillSeconds: 0`),
+/// so a queued source plays at the next clock buffer; the jitter-buffer tests use the default.
 struct AudioMixerTests {
     /// 48 kHz stereo Int16 interleaved buffer filled with `value`, `frames` long, PTS `pts`.
     static func buffer(frames: Int, value: Int16, pts: CMTime) -> CMSampleBuffer {
@@ -44,7 +46,7 @@ struct AudioMixerTests {
 
     @Test("A voice buffer is mixed once, then the mic continues alone")
     func voiceIsConsumedOnce() {
-        let mixer = AudioMixer(voiceSourceID: "muse-voice")
+        let mixer = AudioMixer(voiceSourceID: "muse-voice", prefillSeconds: 0)
         mixer.voiceDuckAmount = 1.0
         var out: [CMSampleBuffer] = []
         mixer.onMixedSample = { out.append($0) }
@@ -70,7 +72,7 @@ struct AudioMixerTests {
 
     @Test("A partial voice buffer is zero-filled to the clock frame length")
     func shortVoiceIsZeroFilled() {
-        let mixer = AudioMixer(voiceSourceID: "muse-voice")
+        let mixer = AudioMixer(voiceSourceID: "muse-voice", prefillSeconds: 0)
         mixer.voiceDuckAmount = 1.0
         var out: [CMSampleBuffer] = []
         mixer.onMixedSample = { out.append($0) }
@@ -84,7 +86,7 @@ struct AudioMixerTests {
 
     @Test("The mic is ducked while voice is queued and for the hangover after")
     func duckingFollowsVoiceActivity() {
-        let mixer = AudioMixer(voiceSourceID: "muse-voice")
+        let mixer = AudioMixer(voiceSourceID: "muse-voice", prefillSeconds: 0)
         mixer.voiceDuckAmount = 0.5
         mixer.voiceDuckHangover = 0   // exactly one frame after the FIFO empties is undocked
         var out: [CMSampleBuffer] = []
@@ -122,7 +124,7 @@ struct AudioMixerTests {
 
     @Test("A pinned clock is not displaced by the voice delivering first")
     func pinnedClockWithVoiceFirst() {
-        let mixer = AudioMixer(voiceSourceID: "muse-voice")
+        let mixer = AudioMixer(voiceSourceID: "muse-voice", prefillSeconds: 0)
         mixer.voiceDuckAmount = 1.0
         mixer.setClockSource("microphone")
         var out: [CMSampleBuffer] = []
@@ -148,7 +150,7 @@ struct AudioMixerTests {
 
     @Test("An unpinned voice is queued, not the clock, while another source is registered")
     func voiceIsNotAutoClockWhenOthersRegistered() {
-        let mixer = AudioMixer(voiceSourceID: "muse-voice")
+        let mixer = AudioMixer(voiceSourceID: "muse-voice", prefillSeconds: 0)
         mixer.voiceDuckAmount = 1.0
         mixer.registerSource("microphone")
         var out: [CMSampleBuffer] = []
@@ -209,5 +211,149 @@ struct AudioMixerTests {
         #expect(s[0] == 81)                 // only buffers 81...100 (last 200 ms = 20 x 10 ms) survive
         #expect(s[19_199] == 100)
         #expect(s[19_200] == 0)             // 9,600 frames of voice, rest zero-filled
+    }
+
+    // MARK: - Jitter buffer
+
+    /// Clock phases (in frames) at which paced voice starts. Different phases put the 960-frame
+    /// chunk boundaries in different places relative to the 1024-frame clock buffers.
+    static let phases = [0, 1, 64, 250, 500, 700, 959, 960, 1000, 1023]
+
+    @Test("Paced 960-frame voice against a 1024-frame clock plays without holes", arguments: phases)
+    func pacedVoiceHasNoHoles(phase: Int) {
+        let mixer = AudioMixer(voiceSourceID: "muse-voice")
+        // 50 chunks (1 s) delivered in real time, with no lead.
+        let chunks = (0..<50).map { phase + $0 * 960 }
+        let out = Self.mixPaced(mixer, voiceChunksAt: chunks, until: phase + 50 * 960 + 8 * 1024)
+        // One unbroken run holding every voice sample: no zero-filled holes and nothing trimmed.
+        #expect(Self.soundRuns(out) == [50 * 960 * 2])
+    }
+
+    @Test("A voice that runs dry builds its lead again before the next utterance", arguments: phases)
+    func voiceReprimesAfterUnderrun(phase: Int) {
+        let mixer = AudioMixer(voiceSourceID: "muse-voice")
+        let first = (0..<25).map { phase + $0 * 960 }
+        // 10,000 frames (about 208 ms) of silence between the utterances.
+        let secondStart = phase + 25 * 960 + 10_000
+        let second = (0..<25).map { secondStart + $0 * 960 }
+        let out = Self.mixPaced(mixer, voiceChunksAt: first + second, until: secondStart + 25 * 960 + 8 * 1024)
+        #expect(Self.soundRuns(out) == [25 * 960 * 2, 25 * 960 * 2])
+    }
+
+    @Test("A sound shorter than the prefill plays once one prefill of clock frames has passed")
+    func shortSoundPlaysAfterOnePrefill() {
+        let mixer = AudioMixer()
+        mixer.setClockSource("microphone")
+        var out: [[Int16]] = []
+        mixer.onMixedSample = { out.append(Self.samples($0)) }
+        mixer.addSample(Self.buffer(frames: 1024, value: 0, pts: .zero), from: "microphone")
+        // A 5 ms desktop-audio click, far below the 40 ms (1,920-frame) prefill.
+        mixer.addSample(Self.buffer(frames: 240, value: 500, pts: .zero), from: "screen")
+        for tick in 1...4 {
+            mixer.addSample(Self.buffer(frames: 1024, value: 0, pts: CMTime(value: Int64(tick * 1024), timescale: 48000)),
+                            from: "microphone")
+        }
+        // 1,024 clock frames after the click: still waiting. 2,048 >= 1,920: it plays, whole.
+        #expect(out[1].allSatisfy { $0 == 0 })
+        #expect(out[2].prefix(480).allSatisfy { $0 == 500 })
+        #expect(out[2].dropFirst(480).allSatisfy { $0 == 0 })
+        #expect(out[3].allSatisfy { $0 == 0 } && out[4].allSatisfy { $0 == 0 })
+    }
+
+    @Test("Ducking starts while the voice builds its lead, before the voice is audible")
+    func duckingLeadsTheBufferedVoice() {
+        let mixer = AudioMixer(voiceSourceID: "muse-voice")
+        mixer.voiceDuckAmount = 0.5
+        mixer.voiceDuckHangover = 0   // only queued or playing voice can duck
+        mixer.setClockSource("microphone")
+        var out: [[Int16]] = []
+        mixer.onMixedSample = { out.append(Self.samples($0)) }
+        mixer.addSample(Self.buffer(frames: 1024, value: 100, pts: .zero), from: "microphone")
+        mixer.addSample(Self.buffer(frames: 960, value: 1000, pts: .zero), from: "muse-voice")
+        for tick in 1...3 {
+            mixer.addSample(Self.buffer(frames: 1024, value: 100, pts: CMTime(value: Int64(tick * 1024), timescale: 48000)),
+                            from: "microphone")
+        }
+        #expect(out[0].allSatisfy { $0 == 100 })
+        #expect(out[1].allSatisfy { $0 == 50 })                      // voice queued but silent: mic ducked
+        #expect(out[2].prefix(1920).allSatisfy { $0 == 1050 })       // voice plays over the ducked mic
+        #expect(out[2].dropFirst(1920).allSatisfy { $0 == 50 })
+        #expect(out[3].allSatisfy { $0 == 100 })                     // voice gone: duck released
+    }
+
+    @Test("Dropping a source's queue makes it build its lead again",
+          arguments: ["deactivateSource", "unregisterSource", "setClockSource", "reset"])
+    func droppingAQueueClearsItsLead(path: String) {
+        let mixer = AudioMixer(voiceSourceID: "muse-voice")
+        mixer.voiceDuckAmount = 1.0
+        mixer.registerSource("microphone")
+        mixer.registerSource("muse-voice")
+        mixer.setClockSource("microphone")
+        var out: [[Int16]] = []
+        mixer.onMixedSample = { out.append(Self.samples($0)) }
+        mixer.addSample(Self.buffer(frames: 1024, value: 0, pts: .zero), from: "microphone")
+        // A full prefill of voice plays at the next tick and leaves 896 frames queued.
+        mixer.addSample(Self.buffer(frames: 1920, value: 1000, pts: .zero), from: "muse-voice")
+        mixer.addSample(Self.buffer(frames: 1024, value: 0, pts: .zero), from: "microphone")
+        #expect(out[1].allSatisfy { $0 == 1000 })
+
+        switch path {
+        case "deactivateSource": mixer.deactivateSource("muse-voice")
+        case "unregisterSource": mixer.unregisterSource("muse-voice")
+        case "setClockSource":
+            mixer.setClockSource("muse-voice")
+            mixer.setClockSource("microphone")
+        default:
+            mixer.reset()
+            mixer.setClockSource("microphone")
+        }
+        mixer.addSample(Self.buffer(frames: 960, value: 1000, pts: .zero), from: "muse-voice")
+        mixer.addSample(Self.buffer(frames: 1024, value: 0, pts: .zero), from: "microphone")
+        // Not still primed: a lone chunk waits for its lead instead of playing with a hole after it.
+        #expect(out.last?.allSatisfy { $0 == 0 } == true)
+    }
+
+    @Test("The prefill defaults to 40 ms and stays at most half the queue cap")
+    func prefillIsBoundedBelowTheCap() {
+        #expect(AudioMixer().prefillSeconds == 0.04)
+        #expect(AudioMixer(prefillSeconds: 1).prefillSeconds == AudioMixer().maxQueuedSeconds / 2)
+        #expect(AudioMixer(prefillSeconds: -1).prefillSeconds == 0)
+    }
+
+    /// Feeds a silent 1024-frame microphone clock and 960-frame voice chunks (value 1000)
+    /// through `mixer` in time order, as the router delivers them in real time. A chunk due at
+    /// the same frame as a clock buffer is delivered first. Returns the mixed samples.
+    static func mixPaced(_ mixer: AudioMixer, voiceChunksAt chunkTimes: [Int], until end: Int) -> [Int16] {
+        var out: [Int16] = []
+        mixer.onMixedSample = { out.append(contentsOf: Self.samples($0)) }
+        mixer.setClockSource("microphone")
+        var pending = chunkTimes.sorted()[...]
+        var tick = 1024
+        while tick <= end {
+            while let due = pending.first, due <= tick {
+                mixer.addSample(Self.buffer(frames: 960, value: 1000, pts: .zero), from: "muse-voice")
+                pending = pending.dropFirst()
+            }
+            mixer.addSample(Self.buffer(frames: 1024, value: 0, pts: CMTime(value: Int64(tick - 1024), timescale: 48000)),
+                            from: "microphone")
+            tick += 1024
+        }
+        return out
+    }
+
+    /// Lengths, in samples, of the runs of non-zero samples, in order.
+    static func soundRuns(_ samples: [Int16]) -> [Int] {
+        var runs: [Int] = []
+        var current = 0
+        for sample in samples {
+            if sample != 0 {
+                current += 1
+            } else if current > 0 {
+                runs.append(current)
+                current = 0
+            }
+        }
+        if current > 0 { runs.append(current) }
+        return runs
     }
 }
