@@ -264,6 +264,10 @@ public final class RecordingSession: Sendable {
     /// When every requested source fails, `startCameraPreview(for:)` additionally throws
     /// `RecorderError.allCameraSourcesFailed`.
     public var cameraStartFailureHandler: (@Sendable (CameraStartFailure) -> Void)?
+    /// Called on the main actor when screen capture can't switch to the selected display, e.g.
+    /// `RecorderError.cannotAddInput` after `startScreenPreview()`. The display captured before,
+    /// if any, keeps capturing.
+    public var screenCaptureFailureHandler: (@MainActor (any Error) -> Void)?
     nonisolated(unsafe) public var screenPreviewHandler: (@Sendable (CGImage) -> Void)?
     public var remoteSourcesHandler: (@Sendable ([String]) -> Void)?
     /// Handler for monitor frames - receives the final composed frame before encoding
@@ -284,6 +288,7 @@ public final class RecordingSession: Sendable {
         self.encoder = VideoEncoder()
 
         setupCapture()
+        screenCapture.onCaptureError = { [weak self] error in self?.screenCaptureFailureHandler?(error) }
     }
 
     // MARK: - Setup

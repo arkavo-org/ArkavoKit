@@ -24,11 +24,11 @@ public final class ScreenCaptureManager: NSObject, Sendable {
     private let outputQueue = DispatchQueue(label: "com.arkavo.screencapture")
 
     nonisolated(unsafe) public var onFrame: (@Sendable (CMSampleBuffer) -> Void)?
+    /// Called on the main actor when `startCapture` can't attach its display because the session
+    /// can't take its input (`RecorderError.cannotAddInput`). The display captured before keeps
+    /// capturing. `startCaptureAndWaitForFirstFrame` throws instead.
+    public var onCaptureError: (@MainActor (any Error) -> Void)?
     nonisolated(unsafe) var onFrameForCapture: (@Sendable (CMSampleBuffer, UUID) -> Void)?
-    private struct ActiveCapture {
-        let input: ObjectIdentifier
-        let id = UUID()
-    }
     private let activeCapture = OSAllocatedUnfairLock<ActiveCapture?>(initialState: nil)
 
     nonisolated func isCurrentCapture(_ id: UUID) -> Bool {
@@ -64,11 +64,13 @@ public final class ScreenCaptureManager: NSObject, Sendable {
     ///
     /// Returns once the request is queued; the session is reconfigured and started on the
     /// session queue, after any earlier start or stop. Throws
-    /// `RecorderError.screenCaptureUnavailable` when the display can't be captured.
+    /// `RecorderError.screenCaptureUnavailable` when the display can't be captured. If the
+    /// session then can't take the display's input, the display captured before keeps
+    /// capturing and `onCaptureError` receives `RecorderError.cannotAddInput`.
     public func startCapture(displayID: CGDirectDisplayID? = nil) throws {
         #if os(macOS)
         let request = try beginCapture(displayID: displayID)
-        enqueueStart(request)
+        enqueueStart(request, reportsFailure: true)
         #else
         throw RecorderError.screenCaptureUnavailable
         #endif
@@ -87,7 +89,7 @@ public final class ScreenCaptureManager: NSObject, Sendable {
 
         // Throw if the session can't take the input, rather than wait for a frame that won't come.
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
-            enqueueStart(request) { continuation.resume(with: $0) }
+            enqueueStart(request, reportsFailure: false) { continuation.resume(with: $0) }
         }
 
         // A stop or a newer start while this one was queued has replaced it: no frame will come.
@@ -162,7 +164,7 @@ public final class ScreenCaptureManager: NSObject, Sendable {
         input.capturesCursor = true
         input.capturesMouseClicks = false
 
-        let capture = ActiveCapture(input: ObjectIdentifier(input))
+        let capture = ActiveCapture(input: ObjectIdentifier(input), id: UUID())
         activeCapture.withLock { $0 = capture }
 
         // Reset first frame tracking; a wait for the replaced capture's frame can't succeed now.
@@ -180,19 +182,29 @@ public final class ScreenCaptureManager: NSObject, Sendable {
     }
 
     /// Attaches the request's input and starts the session on the session queue. If the session
-    /// can't take the input, frames stay unrouted until the next start.
+    /// can't take the input, the graph keeps the capture it had attached, and frames route back
+    /// to it, unless a later start or stop has changed routing since. Only a failure of the
+    /// current request is reported to `onCaptureError`, and only when `reportsFailure`.
     private func enqueueStart(
         _ request: StartRequest,
+        reportsFailure: Bool,
         completion: @escaping @Sendable (Result<Void, any Error>) -> Void = { _ in }
     ) {
         let graph = graph, activeCapture = activeCapture
-        graph.queue.async {
+        graph.queue.async { [weak self] in
             do {
-                try graph.start(with: request.input)
+                try graph.start(with: request.input, captureID: request.captureID)
                 completion(.success(()))
             } catch {
-                activeCapture.withLock { if $0?.id == request.captureID { $0 = nil } }
+                let wasCurrent = activeCapture.withLock { state in
+                    guard state?.id == request.captureID else { return false }
+                    state = graph.attachedCapture
+                    return true
+                }
                 print("🖥️ [ScreenCaptureManager] Screen capture couldn't start: \(error)")
+                if wasCurrent && reportsFailure {
+                    Task { @MainActor [weak self] in self?.onCaptureError?(error) }
+                }
                 completion(.failure(error))
             }
         }
@@ -259,6 +271,12 @@ extension ScreenCaptureManager: AVCaptureVideoDataOutputSampleBufferDelegate {
 
 // MARK: - Capture Graph
 
+/// The capture frames must belong to: the input they come from, and the capture's ID.
+private struct ActiveCapture: Sendable {
+    let input: ObjectIdentifier
+    let id: UUID
+}
+
 /// The capture session, its video output and its screen input. Every member is used only on
 /// `queue`: a serial queue that applies configuration, `startRunning` and `stopRunning` in the
 /// order they were enqueued, so a stop can't remove the input of a start requested after it.
@@ -267,7 +285,14 @@ private final class CaptureGraph: @unchecked Sendable {
 
     private let session: AVCaptureSession
     private let videoOutput = AVCaptureVideoDataOutput()
-    private var screenInput: AVCaptureScreenInput?
+    /// The attached screen input and the capture it was started for.
+    private var attached: (input: AVCaptureScreenInput, captureID: UUID)?
+
+    /// The capture whose input is attached, to route frames back to after a failed replacement.
+    var attachedCapture: ActiveCapture? {
+        dispatchPrecondition(condition: .onQueue(queue))
+        return attached.map { ActiveCapture(input: ObjectIdentifier($0.input), id: $0.captureID) }
+    }
 
     init(session: AVCaptureSession) {
         self.session = session
@@ -299,24 +324,28 @@ private final class CaptureGraph: @unchecked Sendable {
         session.commitConfiguration()
     }
 
-    /// Replaces any attached input with `input`, then starts the session (blocking).
-    func start(with input: AVCaptureScreenInput) throws {
+    /// Replaces any attached input with `input` for capture `captureID`, then starts the session
+    /// (blocking). Throws `RecorderError.cannotAddInput` if the session can't take `input`; the
+    /// attached input then stays attached, the session never having seen it removed.
+    func start(with input: AVCaptureScreenInput, captureID: UUID) throws {
         dispatchPrecondition(condition: .onQueue(queue))
         session.beginConfiguration()
 
-        // Remove existing input if any
-        if let existingInput = screenInput {
-            session.removeInput(existingInput)
-            screenInput = nil
-        }
-
-        // Add new input
+        // Swap within one configuration change. Asking `canAddInput` while the old input is
+        // still attached would ask about adding a second input, not about the replacement.
+        let previous = attached
+        if let previous { session.removeInput(previous.input) }
         guard session.canAddInput(input) else {
+            if let previous, session.canAddInput(previous.input) {
+                session.addInput(previous.input)
+            } else {
+                attached = nil
+            }
             session.commitConfiguration()
             throw RecorderError.cannotAddInput
         }
         session.addInput(input)
-        screenInput = input
+        attached = (input, captureID)
 
         session.commitConfiguration()
         session.startRunning()
@@ -328,9 +357,9 @@ private final class CaptureGraph: @unchecked Sendable {
         session.stopRunning()
 
         session.beginConfiguration()
-        if let input = screenInput {
+        if let input = attached?.input {
             session.removeInput(input)
-            screenInput = nil
+            attached = nil
         }
         session.commitConfiguration()
     }

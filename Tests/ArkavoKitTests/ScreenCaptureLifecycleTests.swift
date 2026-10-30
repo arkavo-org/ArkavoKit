@@ -212,6 +212,88 @@ struct ScreenCaptureLifecycleTests {
         #expect(wait.outcome == .cancelled)
         manager.stopCapture()
     }
+
+    @Test("A replacement the session can't take leaves the working display capturing and reports it")
+    func rejectedReplacementKeepsTheWorkingCapture() async throws {
+        let captureSession = SelectiveCaptureSession()
+        let manager = ScreenCaptureManager(captureSession: captureSession)
+        let frames = OSAllocatedUnfairLock(initialState: 0)
+        manager.onFrame = { _ in frames.withLock { $0 += 1 } }
+        let errors = OSAllocatedUnfairLock(initialState: [RecorderError?]())
+        manager.onCaptureError = { error in errors.withLock { $0.append(error as? RecorderError) } }
+        let sample = try Self.testSample()
+        try manager.startCapture(displayID: CGMainDisplayID())
+        await manager.waitForSessionQueue()
+        let original = try #require(captureSession.inputs.first)
+        let output = try #require(captureSession.outputs.first)
+
+        captureSession.rejectsNewInputs = true
+        try manager.startCapture(displayID: CGMainDisplayID())
+        await manager.waitForSessionQueue()
+        try await waitUntil { !errors.withLock { $0 }.isEmpty }
+
+        #expect(errors.withLock { $0 } == [.cannotAddInput])
+        #expect(captureSession.inputs.count == 1)
+        #expect(captureSession.inputs.first === original)
+        // The original display's frames still route. Its connection may be new after the rollback.
+        let connection = try #require(output.connection(with: .video))
+        manager.captureOutput(output, didOutput: sample, from: connection)
+        #expect(frames.withLock { $0 } == 1)
+        manager.stopCapture()
+    }
+
+    @Test("A first-frame wait for a display the session can't take throws; the working display keeps capturing")
+    func rejectedReplacementWaitThrows() async throws {
+        let captureSession = SelectiveCaptureSession()
+        let manager = ScreenCaptureManager(captureSession: captureSession)
+        let frames = OSAllocatedUnfairLock(initialState: 0)
+        manager.onFrame = { _ in frames.withLock { $0 += 1 } }
+        let errors = OSAllocatedUnfairLock(initialState: 0)
+        manager.onCaptureError = { _ in errors.withLock { $0 += 1 } }
+        let sample = try Self.testSample()
+        try manager.startCapture(displayID: CGMainDisplayID())
+        await manager.waitForSessionQueue()
+        let output = try #require(captureSession.outputs.first)
+
+        captureSession.rejectsNewInputs = true
+        var thrown: (any Error)?
+        do {
+            try await manager.startCaptureAndWaitForFirstFrame(displayID: CGMainDisplayID())
+        } catch {
+            thrown = error
+        }
+        #expect(thrown as? RecorderError == .cannotAddInput)
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(errors.withLock { $0 } == 0)   // the waiter's caller gets the error, not the callback
+
+        let connection = try #require(output.connection(with: .video))
+        manager.captureOutput(output, didOutput: sample, from: connection)
+        #expect(frames.withLock { $0 } == 1)
+        manager.stopCapture()
+    }
+
+    @Test("RecordingSession reports a screen preview switch the session can't take")
+    func recordingSessionReportsRejectedPreviewSwitch() async throws {
+        let captureSession = SelectiveCaptureSession()
+        let capture = ScreenCaptureManager(captureSession: captureSession)
+        let session = try RecordingSession(screenCapture: capture)
+        let errors = OSAllocatedUnfairLock(initialState: [RecorderError?]())
+        session.screenCaptureFailureHandler = { error in errors.withLock { $0.append(error as? RecorderError) } }
+        try session.startScreenPreview()
+        await capture.waitForSessionQueue()
+
+        captureSession.rejectsNewInputs = true
+        try session.startScreenPreview()
+        await capture.waitForSessionQueue()
+        try await waitUntil { !errors.withLock { $0 }.isEmpty }
+        #expect(errors.withLock { $0 } == [.cannotAddInput])
+        session.stopScreenPreview()
+    }
+
+    private static func testSample() throws -> CMSampleBuffer {
+        let pixel = try #require(createTestPixelBuffer(width: 16, height: 16, red: 255, green: 0, blue: 0))
+        return try #require(createTestSampleBuffer(from: pixel))
+    }
 }
 
 private enum FirstFrameWaitOutcome: Equatable { case returned, cancelled, failed }
@@ -258,6 +340,33 @@ private func waitUntil(_ condition: () -> Bool) async throws {
 
 /// Exercise AVFoundation's real input configuration without capturing the user's screen.
 private final class ConfigurationOnlyCaptureSession: AVCaptureSession, @unchecked Sendable {
+    override func startRunning() {}
+    override func stopRunning() {}
+}
+
+/// Takes inputs until `rejectsNewInputs` is set, then refuses any input it hasn't held before,
+/// as a session does when it can't take a display's input, while still taking back one it held.
+/// Captures nothing.
+private final class SelectiveCaptureSession: AVCaptureSession, @unchecked Sendable {
+    private let state = OSAllocatedUnfairLock(initialState: (rejecting: false, held: Set<ObjectIdentifier>()))
+
+    var rejectsNewInputs: Bool {
+        get { state.withLock { $0.rejecting } }
+        set { state.withLock { $0.rejecting = newValue } }
+    }
+
+    override func canAddInput(_ input: AVCaptureInput) -> Bool {
+        let id = ObjectIdentifier(input)
+        let refused = state.withLock { $0.rejecting && !$0.held.contains(id) }
+        return !refused && super.canAddInput(input)
+    }
+
+    override func addInput(_ input: AVCaptureInput) {
+        let id = ObjectIdentifier(input)
+        state.withLock { _ = $0.held.insert(id) }
+        super.addInput(input)
+    }
+
     override func startRunning() {}
     override func stopRunning() {}
 }
