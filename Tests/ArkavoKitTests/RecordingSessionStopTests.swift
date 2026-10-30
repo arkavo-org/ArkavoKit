@@ -355,6 +355,51 @@ struct RecordingSessionStopTests {
         #expect(!audio.isActive)
     }
 
+    @Test("A second start while the first is still starting fails with it")
+    func secondStartDuringAStartSharesItsFailure() async throws {
+        let (session, permission) = try Self.sessionWithHeldPermission()
+        let first = Task { try await session.startRecording(outputURL: Self.outputURL("first"), title: "first") }
+        try await Self.waitUntil { permission.asked }
+        let second = SecondStart(session)
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(!second.hasEnded, "the second start returned before the first had an outcome")
+
+        permission.answer(false)
+
+        await #expect(throws: RecorderError.permissionDenied) { try await first.value }
+        await #expect(throws: RecorderError.permissionDenied) { try await second.task.value }
+        #expect(!session.isRecording)
+    }
+
+    @Test("A second start while the first is still starting returns once the first has started")
+    func secondStartDuringAStartSharesItsSuccess() async throws {
+        let (session, permission) = try Self.sessionWithHeldPermission()
+        let url = Self.outputURL("shared-start")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let first = Task { try await session.startRecording(outputURL: url, title: "first") }
+        try await Self.waitUntil { permission.asked }
+        let second = SecondStart(session)
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(!second.hasEnded, "the second start returned before the first had an outcome")
+
+        permission.answer(true)
+
+        try await first.value
+        try await second.task.value
+        #expect(session.isRecording)
+        _ = try? await session.stopRecording()
+    }
+
+    /// An avatar session with the microphone on, whose permission request is held until answered.
+    private static func sessionWithHeldPermission() throws -> (RecordingSession, HeldPermission) {
+        let permission = HeldPermission()
+        var inputs = StandInAudioInputs().audioInputs
+        inputs.microphonePermission = { await permission.request() }
+        let session = try avatarSession(audioInputs: inputs)
+        session.enableMicrophone = true
+        return (session, permission)
+    }
+
     private static func outputURL(_ name: String) -> URL {
         FileManager.default.temporaryDirectory.appendingPathComponent("\(name)-\(UUID().uuidString).mov")
     }
@@ -561,4 +606,39 @@ private final class SlowStartingAudioSource: AudioSource, @unchecked Sendable {
     func stop() async throws {
         active.withLock { $0 = false }
     }
+}
+
+/// A permission request that waits until the test answers it.
+private final class HeldPermission: Sendable {
+    private let state = OSAllocatedUnfairLock<(asked: Bool, answer: Bool?)>(initialState: (false, nil))
+
+    var asked: Bool { state.withLock { $0.asked } }
+
+    func answer(_ granted: Bool) { state.withLock { $0.answer = granted } }
+
+    func request() async -> Bool {
+        state.withLock { $0.asked = true }
+        while true {
+            if let answer = state.withLock({ $0.answer }) { return answer }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+    }
+}
+
+/// A second `startRecording` call, made with a throwaway URL, that records when it ends.
+@MainActor
+private final class SecondStart {
+    let task: Task<Void, any Error>
+    private let ended = OSAllocatedUnfairLock(initialState: false)
+
+    init(_ session: RecordingSession) {
+        let ended = ended
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("second-\(UUID().uuidString).mov")
+        task = Task {
+            defer { ended.withLock { $0 = true } }
+            try await session.startRecording(outputURL: url, title: "second")
+        }
+    }
+
+    var hasEnded: Bool { ended.withLock { $0 } }
 }

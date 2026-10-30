@@ -133,6 +133,9 @@ public final class RecordingSession: Sendable {
     private var recordingStarting = false
     /// A stream ended while a recording was starting and left the sources to it.
     private var streamLeftSourcesToStartingRecording = false
+    /// Other `startRecording` calls made while one is starting: they get its outcome. Nil when
+    /// no start is under way.
+    private var startJoiners: [CheckedContinuation<Void, any Error>]?
     private let _streamingActive = OSAllocatedUnfairLock(initialState: false)
     private var recordingStartTime: ContinuousClock.Instant?
     private var pauseStartTime: ContinuousClock.Instant?
@@ -386,16 +389,41 @@ public final class RecordingSession: Sendable {
 
     // MARK: - Recording Control
 
-    /// Starts a new recording session. Returns at once while a recording is running or starting.
+    /// Starts a new recording session. Returns at once while a recording is running. A call made
+    /// while another is still starting waits for it, and returns or throws as it does; its own
+    /// URL and title are not used.
     public func startRecording(outputURL: URL, title: String) async throws {
-        guard !_isRecording, !recordingStarting else { return }
+        if startJoiners != nil {
+            try await withCheckedThrowingContinuation { startJoiners?.append($0) }
+            return
+        }
+        guard !_isRecording else { return }
+        startJoiners = []
+        do {
+            try await startRecordingOnce(outputURL: outputURL, title: title)
+        } catch {
+            endStart(with: .failure(error))
+            throw error
+        }
+        endStart(with: .success(()))
+    }
+
+    /// Hands a start's outcome to the calls that joined it.
+    private func endStart(with outcome: Result<Void, any Error>) {
+        let joiners = startJoiners ?? []
+        startJoiners = nil
+        for joiner in joiners { joiner.resume(with: outcome) }
+    }
+
+    private func startRecordingOnce(outputURL: URL, title: String) async throws {
         recordingStarting = true
         do {
             try await beginRecording(outputURL: outputURL, title: title)
         } catch {
             // Both cleared before the sources stop. This start owns nothing from here on, so
             // during that await a stream that ends releases the sources itself, and a stream that
-            // starts or a recording that starts doesn't see this start's claim on them.
+            // starts doesn't see this start's claim on them. (A startRecording made meanwhile
+            // joins this start and gets its failure.)
             let streamLeftSources = streamLeftSourcesToStartingRecording
             recordingStarting = false
             streamLeftSourcesToStartingRecording = false
