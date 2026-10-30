@@ -342,6 +342,19 @@ struct RecordingSessionStopTests {
         #expect(zip(pts, pts.dropFirst()).allSatisfy { CMTimeCompare($0, $1) < 0 }, "the stream's timestamps went back")
     }
 
+    @Test("A stream stopped right after it starts leaves no audio source running")
+    func streamStoppedRightAfterItStartsLeavesNoAudioRunning() async throws {
+        let session = try Self.avatarSession()
+        let audio = SlowStartingAudioSource(sourceID: "muse-voice")
+        session.addMuseAudioSource(audio)
+
+        try await session.startStreamingForTesting { _ in }
+        await session.stopStreaming()
+
+        try await Task.sleep(for: .milliseconds(500))   // longer than a start takes
+        #expect(!audio.isActive)
+    }
+
     private static func outputURL(_ name: String) -> URL {
         FileManager.default.temporaryDirectory.appendingPathComponent("\(name)-\(UUID().uuidString).mov")
     }
@@ -523,5 +536,29 @@ private final class StandInAudioInputs {
                 return audio
             }
         )
+    }
+}
+
+/// An audio source whose start takes 100 ms, as opening a capture device does.
+private final class SlowStartingAudioSource: AudioSource, @unchecked Sendable {
+    let sourceID: String
+    let sourceName = "Slow"
+    let format = AudioFormat(sampleRate: 48000, channels: 2, bitDepth: 16, formatID: kAudioFormatLinearPCM)
+    var onSample: ((CMSampleBuffer) -> Void)?
+    private let active = OSAllocatedUnfairLock(initialState: false)
+
+    init(sourceID: String) {
+        self.sourceID = sourceID
+    }
+
+    var isActive: Bool { active.withLock { $0 } }
+
+    func start() async throws {
+        try await Task.sleep(for: .milliseconds(100))
+        active.withLock { $0 = true }
+    }
+
+    func stop() async throws {
+        active.withLock { $0 = false }
     }
 }

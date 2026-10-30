@@ -993,9 +993,11 @@ public final class RecordingSession: Sendable {
         // Fresh mixer state for this stream (before any audio source starts delivering)
         resetAudioMixer()
 
-        // Add audio sources if not already added (streaming without recording)
+        // Add audio sources if not already added (streaming without recording). This runs after
+        // the call returns, so the stream may have stopped before or while its audio starts.
         Task { @MainActor in
             await removeUnwantedAudioSources(microphone: mode.needsMicrophone)
+            guard _streamingActive.withLock({ $0 }) else { return }
             if mode.needsMicrophone && !audioRouter.allSourceIDs.contains("microphone") {
                 addMicrophone()
             }
@@ -1004,6 +1006,10 @@ public final class RecordingSession: Sendable {
             }
             syncAudioMixerRouting()
             try? await audioRouter.startAll()
+            // A stop that came while the sources were starting stopped only those running then.
+            if !_streamingActive.withLock({ $0 }) && !_isRecording && !recordingStarting {
+                try? await audioRouter.stopAll()
+            }
         }
 
         print("📡 Started frame generation for streaming (mode: \(mode))")
