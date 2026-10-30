@@ -79,7 +79,8 @@ public final class ScreenCaptureManager: NSObject, Sendable {
     ///
     /// Throws `RecorderError.cannotAddInput` if the session can't take the display's input, and
     /// `CancellationError` if `stopCapture` or another start replaces this capture before its
-    /// first frame arrives.
+    /// first frame arrives, or if the calling task is cancelled first. Cancelling ends only the
+    /// wait: the capture keeps running.
     public func startCaptureAndWaitForFirstFrame(displayID: CGDirectDisplayID? = nil) async throws {
         #if os(macOS)
         let request = try beginCapture(displayID: displayID)
@@ -93,15 +94,25 @@ public final class ScreenCaptureManager: NSObject, Sendable {
         guard isCurrentCapture(request.captureID) else { throw CancellationError() }
 
         // Wait for first frame
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
-            if hasDeliveredFirstFrame {
-                // Already got a frame
-                continuation.resume()
-            } else {
-                // Resumed when this capture's first frame arrives, or ended when it's replaced
-                endFirstFrameWait()
-                firstFrameWaiter = (request.captureID, continuation)
+        let captureID = request.captureID
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                if hasDeliveredFirstFrame {
+                    // Already got a frame
+                    continuation.resume()
+                } else if Task.isCancelled {
+                    // Cancelled before the wait began (e.g. during the start): don't begin it.
+                    continuation.resume(throwing: CancellationError())
+                } else {
+                    // Resumed when this capture's first frame arrives, or ended when it's replaced
+                    endFirstFrameWait()
+                    firstFrameWaiter = (captureID, continuation)
+                }
             }
+        } onCancel: { [weak self] in
+            // Runs on the cancelling thread. The hop reaches the main actor after the wait is
+            // stored, which happens in the same main-actor job that enters this handler.
+            Task { @MainActor [weak self] in self?.endFirstFrameWait(of: captureID) }
         }
 
         print("🖥️ [ScreenCaptureManager] First frame delivered, capture ready")
@@ -160,9 +171,10 @@ public final class ScreenCaptureManager: NSObject, Sendable {
         return StartRequest(input: input, captureID: capture.id)
     }
 
-    /// Ends a pending first-frame wait whose capture is no longer current.
-    private func endFirstFrameWait() {
-        guard let waiter = firstFrameWaiter else { return }
+    /// Ends a pending first-frame wait with `CancellationError`: any wait, or only the one for
+    /// `captureID`, so a late cancellation can't end a newer capture's wait.
+    private func endFirstFrameWait(of captureID: UUID? = nil) {
+        guard let waiter = firstFrameWaiter, captureID == nil || waiter.captureID == captureID else { return }
         firstFrameWaiter = nil
         waiter.continuation.resume(throwing: CancellationError())
     }

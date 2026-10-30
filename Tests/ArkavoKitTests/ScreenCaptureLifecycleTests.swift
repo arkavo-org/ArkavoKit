@@ -139,8 +139,8 @@ struct ScreenCaptureLifecycleTests {
         manager.stopCapture()
         captureSession.releaseStart()
 
-        try await waitUntil { wait.withLock { $0 } != nil }
-        #expect(wait.withLock { $0 } == .cancelled)
+        try await waitUntil { wait.outcome != nil }
+        #expect(wait.outcome == .cancelled)
     }
 
     @Test("Stopping while waiting for the first frame ends the wait")
@@ -150,11 +150,11 @@ struct ScreenCaptureLifecycleTests {
         let wait = startFirstFrameWait(manager)
         try await waitUntil { captureSession.calls.count == 1 }
         try await Task.sleep(for: .milliseconds(50))   // its start has run; no frame will come
-        #expect(wait.withLock { $0 } == nil)
+        #expect(wait.outcome == nil)
 
         manager.stopCapture()
-        try await waitUntil { wait.withLock { $0 } != nil }
-        #expect(wait.withLock { $0 } == .cancelled)
+        try await waitUntil { wait.outcome != nil }
+        #expect(wait.outcome == .cancelled)
     }
 
     @Test("A first-frame wait returns on its own capture's first frame and ends when a newer start replaces it")
@@ -169,36 +169,82 @@ struct ScreenCaptureLifecycleTests {
         let output = try #require(captureSession.outputs.first)
         let connection = try #require(output.connection(with: .video))
         manager.captureOutput(output, didOutput: sample, from: connection)
-        try await waitUntil { first.withLock { $0 } != nil }
-        #expect(first.withLock { $0 } == .returned)
+        try await waitUntil { first.outcome != nil }
+        #expect(first.outcome == .returned)
 
         let second = startFirstFrameWait(manager)
         try await waitUntil { captureSession.calls.count == 2 }
         try await Task.sleep(for: .milliseconds(50))
         try manager.startCapture(displayID: CGMainDisplayID())
-        try await waitUntil { second.withLock { $0 } != nil }
-        #expect(second.withLock { $0 } == .cancelled)
+        try await waitUntil { second.outcome != nil }
+        #expect(second.outcome == .cancelled)
+        manager.stopCapture()
+    }
+
+    @Test("Cancelling the task waiting for the first frame ends the wait")
+    func cancellingTheWaitingTaskEndsTheWait() async throws {
+        let captureSession = LifecycleRecordingCaptureSession()
+        let manager = ScreenCaptureManager(captureSession: captureSession)
+        let wait = startFirstFrameWait(manager)
+        try await waitUntil { captureSession.calls.count == 1 }
+        try await Task.sleep(for: .milliseconds(50))   // its start has run; no frame will come
+        #expect(wait.outcome == nil)
+
+        // CaptureSourceRegistry cancels a start that outlives its timeout.
+        wait.task.cancel()
+        try await waitUntil { wait.outcome != nil }
+        #expect(wait.outcome == .cancelled)
+        manager.stopCapture()
+    }
+
+    @Test("A task cancelled while its start is still running doesn't wait for the first frame")
+    func taskCancelledDuringStartDoesNotWait() async throws {
+        let captureSession = LifecycleRecordingCaptureSession()
+        captureSession.holdStart()
+        let manager = ScreenCaptureManager(captureSession: captureSession)
+        let wait = startFirstFrameWait(manager)
+        try await waitUntil { captureSession.startsEntered == 1 }
+
+        // Cancelled before the wait for the frame begins.
+        wait.task.cancel()
+        captureSession.releaseStart()
+        try await waitUntil { wait.outcome != nil }
+        #expect(wait.outcome == .cancelled)
         manager.stopCapture()
     }
 }
 
 private enum FirstFrameWaitOutcome: Equatable { case returned, cancelled, failed }
 
-/// Starts `startCaptureAndWaitForFirstFrame` in a task; the lock holds how it ended, once it has.
+/// A `startCaptureAndWaitForFirstFrame` call running in `task`.
+private struct FirstFrameWait {
+    let task: Task<Void, Never>
+    private let ending: OSAllocatedUnfairLock<FirstFrameWaitOutcome?>
+
+    init(task: Task<Void, Never>, ending: OSAllocatedUnfairLock<FirstFrameWaitOutcome?>) {
+        self.task = task
+        self.ending = ending
+    }
+
+    /// How the call ended, once it has.
+    var outcome: FirstFrameWaitOutcome? { ending.withLock { $0 } }
+}
+
+/// Starts `startCaptureAndWaitForFirstFrame` in a task.
 @MainActor
-private func startFirstFrameWait(_ manager: ScreenCaptureManager) -> OSAllocatedUnfairLock<FirstFrameWaitOutcome?> {
-    let outcome = OSAllocatedUnfairLock<FirstFrameWaitOutcome?>(initialState: nil)
-    Task { @MainActor in
+private func startFirstFrameWait(_ manager: ScreenCaptureManager) -> FirstFrameWait {
+    let ending = OSAllocatedUnfairLock<FirstFrameWaitOutcome?>(initialState: nil)
+    let task = Task { @MainActor in
         do {
             try await manager.startCaptureAndWaitForFirstFrame(displayID: CGMainDisplayID())
-            outcome.withLock { $0 = .returned }
+            ending.withLock { $0 = .returned }
         } catch is CancellationError {
-            outcome.withLock { $0 = .cancelled }
+            ending.withLock { $0 = .cancelled }
         } catch {
-            outcome.withLock { $0 = .failed }
+            ending.withLock { $0 = .failed }
         }
     }
-    return outcome
+    return FirstFrameWait(task: task, ending: ending)
 }
 
 /// Polls `condition` for up to two seconds, so a wait that never ends fails instead of hanging.
