@@ -172,6 +172,8 @@ public final class RecordingSession: Sendable {
     nonisolated(unsafe) public var audioLevel: Float = 0.0
 
     // Configuration
+
+    /// The corner a camera PiP goes to; avatar and Muse use `avatarSlot` / `museSlot`.
     public var pipPosition: PiPPosition {
         get { compositor.pipPosition }
         set { compositor.pipPosition = newValue }

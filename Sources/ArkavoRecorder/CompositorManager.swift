@@ -191,9 +191,11 @@ public final class CompositorManager: Sendable {
     /// Core composition logic: fits the base into the output, then overlays the avatar and Muse in
     /// their slots, the camera PiPs, the watermark and the scene overlay, all placed in output space.
     ///
-    /// The base (`baseSize` is its size) is scaled uniformly and centred over black, so a base
-    /// whose shape differs from the output gets bars rather than being stretched. Every overlay
-    /// is sized and positioned against `outputSize`, independent of the base.
+    /// The base (`baseSize` is its size) is fitted inside the output and centred over black, so a
+    /// base whose shape differs from the output gets bars rather than being stretched. Its scale is
+    /// uniform, except that an axis within a pixel of the output is stretched to fill it, by under a
+    /// pixel (`fittedBase`). Every overlay is sized and positioned against `outputSize`, independent
+    /// of the base.
     private func compositeWithBase(
         baseImage: CIImage,
         baseSize: CGSize,
