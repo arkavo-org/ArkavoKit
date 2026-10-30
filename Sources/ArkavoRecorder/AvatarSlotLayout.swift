@@ -9,8 +9,11 @@ public struct AvatarSlot: Sendable, Equatable {
     /// The edge of the slot the fitted avatar stays on. The avatar always rests on
     /// the slot's bottom edge; this picks the horizontal alignment.
     public enum Anchor: Sendable, Equatable {
+        /// The avatar's left edge stays on the slot's left edge.
         case bottomLeft
+        /// The avatar's right edge stays on the slot's right edge.
         case bottomRight
+        /// The avatar is centred horizontally in the slot.
         case bottomCenter
     }
 
@@ -19,6 +22,7 @@ public struct AvatarSlot: Sendable, Equatable {
     /// The horizontal alignment of the avatar within the slot.
     public var anchor: Anchor
 
+    /// A slot from a normalized, top-left-origin output rect and the anchor that aligns the avatar in it.
     public init(slot: CGRect, anchor: Anchor) {
         self.slot = slot
         self.anchor = anchor
@@ -48,7 +52,7 @@ public enum AvatarSlotLayout {
     /// - Returns: `visible`, where the visible part lands, and `textureFrame`, where the
     ///   whole texture lands so that its visible part coincides with `visible`. Both are
     ///   in top-left output pixels. Both are `.zero` when `output` or `textureSize` is
-    ///   degenerate.
+    ///   degenerate, or when the slot has no area.
     public static func frame(
         slot: AvatarSlot,
         visibleRect: CGRect,
