@@ -468,12 +468,14 @@ public final class RecordingSession: Sendable {
             // A stream that ended meanwhile left its sources to this recording; nothing owns them now.
             if streamLeftSources && !_streamingActive.withLock({ $0 }) {
                 await stopSources()
-                resetAudioMixer()
-                // A stream that started during that await started its frames (no recording was
-                // running or starting), but the screen and cameras had already stopped, and the
-                // audio it started may have been stopped too. It gets those back, not its frames.
+                // A stream that started during that await started its frames and a fresh mix (no
+                // recording was running or starting), but the screen and cameras had already
+                // stopped, and the audio it started may have been stopped too. It gets those back;
+                // its frames and its mix (the audio it has queued, its clock) are left as they are.
                 if _streamingActive.withLock({ $0 }) {
                     restartSourcesForStream(includingFrames: false)
+                } else {
+                    resetAudioMixer()
                 }
             }
             throw error
