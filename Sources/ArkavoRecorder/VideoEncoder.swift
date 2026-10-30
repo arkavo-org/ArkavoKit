@@ -15,7 +15,8 @@ struct DroppedMedia: Equatable, Sendable, CustomStringConvertible {
         var beforeSession = 0
         /// Stamped before the recording's start
         var beforeStart = 0
-        /// Video stamped no later than the previous frame
+        /// Video stamped no later than the previous frame; audio that would take its input's
+        /// track back (see `VideoEncoder.encodeAudioSample(_:sourceID:)`)
         var outOfOrder = 0
         /// Audio for a source the recording has no input for
         var noInput = 0
@@ -69,6 +70,9 @@ public actor VideoEncoder {
     private var totalPausedDuration: CMTime = .zero
     /// End of the latest media appended to the file, on the file's timeline
     private var appendedMediaEnd: CMTime = .zero
+    /// Each audio input's latest appended buffer, on the file's timeline. Forgotten at a resume,
+    /// which moves the rest of the recording back to close the pause.
+    private var lastAudioAppended: [String: (start: CMTime, end: CMTime)] = [:]
     private var sessionStarted: Bool = false
     /// Whether the file got at least one video frame or audio sample
     private var appendedMedia: Bool = false
@@ -311,6 +315,7 @@ public actor VideoEncoder {
         resumePending = false
         totalPausedDuration = .zero
         appendedMediaEnd = .zero
+        lastAudioAppended = [:]
         sessionStarted = false
         appendedMedia = false
         droppedMedia = DroppedMedia()
@@ -440,6 +445,7 @@ public actor VideoEncoder {
         guard isRecording, isPaused else { return }
         isPaused = false
         resumePending = true
+        lastAudioAppended = [:]
     }
 
     /// After a resume, moves the rest of the recording back so it continues where the
@@ -694,6 +700,24 @@ public actor VideoEncoder {
                 adjustedTimestamp = CMTimeSubtract(adjustedTimestamp, totalPausedDuration)
             }
 
+            // Keep each audio track moving forward, as video is. A buffer that starts no later
+            // than its input's previous one, or overlaps what the input already wrote by more
+            // than half its own length, is late (e.g. a capture callback that landed after a
+            // recording's drained tail) and would take the track back. Smaller overlaps are clock
+            // drift and resampling, which leave consecutive buffers a little early.
+            let duration = CMSampleBufferGetDuration(sampleBuffer)
+            if let last = lastAudioAppended[sourceID] {
+                let startsBack = CMTimeCompare(adjustedTimestamp, last.start) <= 0
+                let overlapsBack = duration.isValid && CMTimeCompare(
+                    CMTimeSubtract(last.end, adjustedTimestamp),
+                    CMTimeMultiplyByRatio(duration, multiplier: 1, divisor: 2)
+                ) > 0
+                if startsBack || overlapsBack {
+                    droppedMedia.audio.outOfOrder += 1
+                    return
+                }
+            }
+
             // Create adjusted sample buffer with normalized timing
             guard let finalBuffer = Self.retimed(sampleBuffer, to: adjustedTimestamp) else {
                 print("⚠️ Failed to create adjusted audio buffer")
@@ -709,7 +733,9 @@ public actor VideoEncoder {
                 return
             }
             appendedMedia = true
-            appendedMediaEnd = CMTimeMaximum(appendedMediaEnd, CMTimeAdd(adjustedTimestamp, CMSampleBufferGetDuration(sampleBuffer)))
+            let end = duration.isValid ? CMTimeAdd(adjustedTimestamp, duration) : adjustedTimestamp
+            lastAudioAppended[sourceID] = (adjustedTimestamp, end)
+            appendedMediaEnd = CMTimeMaximum(appendedMediaEnd, CMTimeAdd(adjustedTimestamp, duration))
         }
 
         // Stream audio for RTMP — accept mixed output (from AudioMixer) or direct microphone
