@@ -520,16 +520,15 @@ public final class RecordingSession: Sendable {
 
     /// Stops the current recording session.
     ///
-    /// While a stream is live, only the file finishes: the frame driver, the screen, the cameras
-    /// and the audio keep feeding the stream as before. Frames and audio that arrive while the
-    /// file is being finished go to the stream only; the encoder takes nothing more into the file
-    /// once finishing has begun.
+    /// Stops the frame driver and the screen, camera and audio captures. While a stream is live,
+    /// only the file finishes: they keep feeding the stream as before, until `stopStreaming()`
+    /// stops them, or until the file is finished if the stream ends first. Frames and audio that
+    /// arrive while the file is being finished go to the stream only; the encoder takes nothing
+    /// more into the file once finishing has begun.
     public func stopRecording() async throws -> URL {
-        if !_streamingActive.withLock({ $0 }) {
-            stopCameraFrameDriver()
-            screenCapture.stopCapture()
-            stopCameraCaptures()
-            try? await audioRouter.stopAll()
+        let streamKeepsSources = _streamingActive.withLock { $0 }
+        if !streamKeepsSources {
+            await stopSources()
         }
         if !_streamingActive.withLock({ $0 }) {
             // Nothing arrives now. Emit what the mixer still holds (a sound shorter than its
@@ -551,11 +550,30 @@ public final class RecordingSession: Sendable {
         }
 
         // Finish encoding
-        let result = try await encoder.finishRecording()
+        let finished: Result<URL, any Error>
+        do {
+            finished = .success(try await encoder.finishRecording())
+        } catch {
+            finished = .failure(error)
+        }
+        // A stream that ended while the file finished left its sources running for the recording.
+        if streamKeepsSources && !_streamingActive.withLock({ $0 }) {
+            await stopSources()
+            resetAudioMixer()
+        }
+        let result = try finished.get()
 
         print("🛑 [RecordingSession] Recording stopped")
 
         return result
+    }
+
+    /// Stops the frame driver and every capture: the screen, the cameras and the audio.
+    private func stopSources() async {
+        stopCameraFrameDriver()
+        screenCapture.stopCapture()
+        stopCameraCaptures()
+        try? await audioRouter.stopAll()
     }
 
     /// Pauses the current recording
@@ -989,24 +1007,35 @@ public final class RecordingSession: Sendable {
         }
     }
 
-    /// Stop streaming to all destinations
+    /// Stop streaming to all destinations.
+    ///
+    /// With no recording running, this also stops the frame driver and the screen, camera and
+    /// audio captures, as stopping a recording does with no stream. A recording keeps them.
     public func stopStreaming() async {
         _streamingActive.withLock { $0 = false }
         await encoder.stopStreaming()
         await encoder.stopNTDFStreaming()
-        if !_isRecording { resetAudioMixer() }
-        inputsDidChange()
+        await streamDidEnd()
     }
 
-    /// Stop streaming to a single destination (others continue)
+    /// Stop streaming to a single destination (others continue). Stopping the last one ends the
+    /// stream as `stopStreaming()` does.
     public func stopStreaming(id: String) async {
         await encoder.stopStreaming(id: id)
         // If no destinations remain, deactivate streaming
         if await encoder.activeDestinationIds.isEmpty {
             _streamingActive.withLock { $0 = false }
-            if !_isRecording { resetAudioMixer() }
-            inputsDidChange()
+            await streamDidEnd()
         }
+    }
+
+    /// With no recording either, nothing uses the sources any more.
+    private func streamDidEnd() async {
+        if !_isRecording {
+            await stopSources()
+            resetAudioMixer()
+        }
+        inputsDidChange()
     }
 
     /// Get streaming statistics

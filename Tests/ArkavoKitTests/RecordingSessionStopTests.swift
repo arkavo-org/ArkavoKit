@@ -6,7 +6,11 @@ import os
 
 /// A stop that fails still ends the recording: the session must not keep reporting
 /// that it is recording and routing frames to a finished encoder.
+///
+/// Serialized: each session composes 1080p frames at 30 fps, and several at once can starve the
+/// tests' own tasks.
 @MainActor
+@Suite(.serialized)
 struct RecordingSessionStopTests {
     @Test("A failed stop leaves the session not recording")
     func failedStopEndsRecording() async throws {
@@ -87,11 +91,9 @@ struct RecordingSessionStopTests {
             streamFramesWhileFinishing.withLock { $0 = after - before }
         }
         let session = try Self.avatarSession(encoder: encoder)
-        session.avatarTextureProvider = {
-            finishing.withLock { $0 }
-                ? createTestPixelBuffer(width: 1920, height: 1080, red: 255, green: 0, blue: 0)
-                : createTestPixelBuffer(width: 1920, height: 1080, red: 0, green: 255, blue: 0)
-        }
+        let green = try SolidFrame(red: 0, green: 255, blue: 0)
+        let red = try SolidFrame(red: 255, green: 0, blue: 0)
+        session.avatarTextureProvider = { finishing.withLock { $0 } ? red.buffer : green.buffer }
         try await session.startRecording(outputURL: url, title: "stream continues")
         try await session.startStreamingForTesting { _ in streamFrames.withLock { $0 += 1 } }
         try await Self.waitUntil { streamFrames.withLock { $0 } >= 10 }
@@ -114,34 +116,69 @@ struct RecordingSessionStopTests {
 
     @Test("A stream keeps the screen capture and audio feeding it when a recording stops")
     func streamKeepsItsSourcesWhenARecordingStops() async throws {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("stream-sources-\(UUID().uuidString).mov")
+        let url = Self.outputURL("stream-sources")
         defer { try? FileManager.default.removeItem(at: url) }
+        let live = try SharedSources()
+        try await live.startRecordingAndStream(to: url)
+        #expect(live.audio.isActive)
 
-        let captureSession = NonCapturingSession()
-        let capture = ScreenCaptureManager(captureSession: captureSession)
-        let screenFrames = OSAllocatedUnfairLock(initialState: 0)
-        capture.onFrame = { _ in screenFrames.withLock { $0 += 1 } }
-        let session = try Self.avatarSession(screenCapture: capture)
-        let voice = FakeAudioSource(sourceID: "muse-voice")
-        session.addMuseAudioSource(voice)
-        try session.startScreenPreview()
-        await capture.waitForSessionQueue()
-        try await session.startRecording(outputURL: url, title: "stream sources")
-        try await session.startStreamingForTesting { _ in }
-        try await Task.sleep(for: .milliseconds(200))
-        #expect(voice.isActive)
+        _ = try await live.session.stopRecording()
+
+        #expect(live.audio.isActive)
+        #expect(await live.screenIsCapturing())
+        await live.session.stopStreaming()
+    }
+
+    @Test("Stopping the recording, then the stream, releases the screen capture and audio")
+    func stoppingTheRecordingThenTheStreamReleasesEverything() async throws {
+        let url = Self.outputURL("record-then-stream")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let live = try SharedSources()
+        try await live.startRecordingAndStream(to: url)
+        _ = try await live.session.stopRecording()
+
+        await live.session.stopStreaming()
+
+        #expect(!live.audio.isActive)
+        #expect(!(await live.screenIsCapturing()))
+    }
+
+    @Test("Stopping the stream, then the recording, releases the screen capture and audio")
+    func stoppingTheStreamThenTheRecordingReleasesEverything() async throws {
+        let url = Self.outputURL("stream-then-record")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let live = try SharedSources()
+        try await live.startRecordingAndStream(to: url)
+        await live.session.stopStreaming()
+        // The recording still uses them.
+        #expect(live.audio.isActive)
+        #expect(await live.screenIsCapturing())
+
+        _ = try await live.session.stopRecording()
+
+        #expect(!live.audio.isActive)
+        #expect(!(await live.screenIsCapturing()))
+    }
+
+    @Test("A stream that ends while the recording's file finishes releases the screen capture and audio")
+    func streamEndingWhileTheFileFinishesReleasesEverything() async throws {
+        let url = Self.outputURL("stream-ends-while-finishing")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let encoder = VideoEncoder()
+        let live = try SharedSources(encoder: encoder)
+        try await live.startRecordingAndStream(to: url)
+        let session = live.session
+        await encoder.setFinishingHookForTesting { await session.stopStreaming() }
 
         _ = try await session.stopRecording()
+        await encoder.setFinishingHookForTesting(nil)
 
-        #expect(voice.isActive)
-        let output = try #require(captureSession.outputs.first)
-        let connection = try #require(output.connection(with: .video))
-        let pixel = try #require(createTestPixelBuffer(width: 16, height: 16, red: 255, green: 0, blue: 0))
-        capture.captureOutput(output, didOutput: try #require(createTestSampleBuffer(from: pixel)), from: connection)
-        #expect(screenFrames.withLock { $0 } == 1)
-        await session.stopStreaming()
-        session.stopScreenPreview()
+        #expect(!live.audio.isActive)
+        #expect(!(await live.screenIsCapturing()))
+    }
+
+    private static func outputURL(_ name: String) -> URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("\(name)-\(UUID().uuidString).mov")
     }
 
     /// Avatar mode, which needs no devices or permissions.
@@ -156,7 +193,8 @@ struct RecordingSessionStopTests {
         session.enableScreenAudio = false
         session.enableAvatar = true
         session.watermarkEnabled = false
-        session.avatarTextureProvider = { createTestPixelBuffer(width: 1920, height: 1080, red: 0, green: 255, blue: 0) }
+        let green = try SolidFrame(red: 0, green: 255, blue: 0)
+        session.avatarTextureProvider = { green.buffer }
         return session
     }
 
@@ -226,4 +264,67 @@ struct RecordingSessionStopTests {
 private final class NonCapturingSession: AVCaptureSession, @unchecked Sendable {
     override func startRunning() {}
     override func stopRunning() {}
+}
+
+/// An avatar-mode session with a screen preview and a stand-in audio source: the sources a
+/// recording and a stream share. Captures nothing.
+@MainActor
+private struct SharedSources {
+    let session: RecordingSession
+    let audio = FakeAudioSource(sourceID: "muse-voice")
+    private let capture: ScreenCaptureManager
+    private let captureSession = NonCapturingSession()
+    private let screenFrames = OSAllocatedUnfairLock(initialState: 0)
+
+    init(encoder: VideoEncoder = VideoEncoder()) throws {
+        capture = ScreenCaptureManager(captureSession: captureSession)
+        let screenFrames = screenFrames
+        capture.onFrame = { _ in screenFrames.withLock { $0 += 1 } }
+        session = try RecordingSession(screenCapture: capture, encoder: encoder)
+        session.enableDesktop = false
+        session.enableCamera = false
+        session.enableMicrophone = false
+        session.enableScreenAudio = false
+        session.enableAvatar = true
+        session.watermarkEnabled = false
+        let green = try SolidFrame(red: 0, green: 255, blue: 0)
+        session.avatarTextureProvider = { green.buffer }
+        session.addMuseAudioSource(audio)
+    }
+
+    /// Starts the screen preview, a recording and a stream, and returns once frames reach both.
+    func startRecordingAndStream(to url: URL) async throws {
+        try session.startScreenPreview()
+        await capture.waitForSessionQueue()
+        try await session.startRecording(outputURL: url, title: "shared sources")
+        let streamFrames = OSAllocatedUnfairLock(initialState: 0)
+        try await session.startStreamingForTesting { _ in streamFrames.withLock { $0 += 1 } }
+        // Each frame reaches the file before the stream.
+        let deadline = ContinuousClock.now + .seconds(5)
+        while streamFrames.withLock({ $0 }) < 5 && .now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try #require(streamFrames.withLock { $0 } >= 5)
+    }
+
+    /// Whether the screen capture still delivers a frame, once its queued session work has run.
+    func screenIsCapturing() async -> Bool {
+        await capture.waitForSessionQueue()
+        guard let output = captureSession.outputs.first,
+              let connection = output.connection(with: .video),
+              let pixel = createTestPixelBuffer(width: 16, height: 16, red: 255, green: 0, blue: 0),
+              let sample = createTestSampleBuffer(from: pixel) else { return false }
+        let before = screenFrames.withLock { $0 }
+        capture.captureOutput(output, didOutput: sample, from: connection)
+        return screenFrames.withLock { $0 } > before
+    }
+}
+
+/// One 1080p frame of a solid color, made once: building a frame per call is slow in a debug build.
+private struct SolidFrame: @unchecked Sendable {
+    let buffer: CVPixelBuffer
+
+    init(red: UInt8, green: UInt8, blue: UInt8) throws {
+        buffer = try #require(createTestPixelBuffer(width: 1920, height: 1080, red: red, green: green, blue: blue))
+    }
 }
