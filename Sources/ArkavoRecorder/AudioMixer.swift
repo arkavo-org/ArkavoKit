@@ -122,7 +122,12 @@ public final class AudioMixer: @unchecked Sendable {
             let isVoice = sourceID == voiceSourceID
             let othersExist = !registeredSourceIDs.subtracting([sourceID]).isEmpty
             // The voice is intermittent: it only becomes the clock when nothing else could be.
-            if !(isVoice && othersExist) { clockSourceID = sourceID }
+            // Like `setClockSource`, the new clock's queue is stale: it would never drain while the
+            // source is the clock, keep a queued voice ducking the others, and play if it stopped.
+            if !(isVoice && othersExist) {
+                clockSourceID = sourceID
+                dropQueue(of: sourceID)
+            }
         }
         let isClock = clockSourceID == sourceID
         if sourceID == voiceSourceID { lastVoiceActivity = CACurrentMediaTime() }

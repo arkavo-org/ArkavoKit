@@ -178,6 +178,27 @@ struct AudioMixerTests {
         #expect(Self.samples(out[1]).first == 100)   // not 600
     }
 
+    @Test("A source that becomes the clock by delivering first drops its stale queued audio")
+    func autoPickedClockDropsStaleFifo() {
+        let mixer = AudioMixer(voiceSourceID: "muse-voice", prefillSeconds: 0)
+        mixer.voiceDuckAmount = 1.0
+        mixer.registerSource("microphone")
+        mixer.registerSource("muse-voice")
+        mixer.setClockSource("microphone")
+        var out: [CMSampleBuffer] = []
+        mixer.onMixedSample = { out.append($0) }
+        mixer.addSample(Self.buffer(frames: 960, value: 500, pts: .zero), from: "muse-voice")  // queued behind the mic
+        mixer.unregisterSource("microphone")
+        mixer.addSample(Self.buffer(frames: 960, value: 7, pts: .zero), from: "muse-voice")    // alone: becomes the clock
+        #expect(out.count == 1)
+        #expect(Self.samples(out[0]).first == 7)
+        mixer.registerSource("microphone")
+        mixer.setClockSource("microphone")
+        mixer.addSample(Self.buffer(frames: 960, value: 100, pts: .zero), from: "microphone")
+        #expect(out.count == 2)
+        #expect(Self.samples(out[1]).first == 100)   // not 600: the voice's old queue is gone
+    }
+
     @Test("reset() clears queued audio and the clock")
     func resetClearsFifosAndClock() {
         let mixer = AudioMixer(voiceSourceID: "muse-voice")
