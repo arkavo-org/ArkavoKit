@@ -336,10 +336,151 @@ struct ScreenCaptureLifecycleTests {
         session.stopScreenPreview()
     }
 
+    @Test("A frame validated for a replaced display is never delivered once the switch returns")
+    func noFrameFromAReplacedCaptureAfterTheSwitchReturns() async throws {
+        let captureSession = ConfigurationOnlyCaptureSession()
+        let manager = ScreenCaptureManager(captureSession: captureSession)
+        let delivered = OSAllocatedUnfairLock(initialState: [ObjectIdentifier]())
+        manager.onFrame = { sample in
+            let id = ObjectIdentifier(sample)
+            delivered.withLock { $0.append(id) }
+        }
+        let frameA = try Self.testSample()
+        let frameB = try Self.testSample()
+        try manager.startCapture(displayID: CGMainDisplayID())
+        await manager.waitForSessionQueue()
+        let output = try #require(captureSession.outputs.first as? AVCaptureVideoDataOutput)
+
+        // On the capture's callback queue, display A's frame is validated, then held there.
+        let gate = CallbackGate()
+        manager.frameValidatedForTesting = { _ in gate.hold() }
+        let callback = try Self.deliverOnCallbackQueue(frameA, from: output, to: manager)
+        try await waitUntil { gate.isHolding }
+        try #require(gate.isHolding)
+
+        try manager.startCapture(displayID: CGMainDisplayID())
+        gate.release()
+        try await waitUntil { callback.hasReturned }
+        try #require(callback.hasReturned)
+        #expect(delivered.withLock { $0 }.isEmpty)
+
+        // Display B delivers.
+        await manager.waitForSessionQueue()
+        let connectionB = try #require(output.connection(with: .video))
+        manager.captureOutput(output, didOutput: frameB, from: connectionB)
+        #expect(delivered.withLock { $0 } == [ObjectIdentifier(frameB)])
+        manager.stopCapture()
+    }
+
+    @Test("A frame validated for a stopped display is never delivered once stop returns")
+    func noFrameFromAStoppedCaptureAfterStopReturns() async throws {
+        let captureSession = ConfigurationOnlyCaptureSession()
+        let manager = ScreenCaptureManager(captureSession: captureSession)
+        let frames = OSAllocatedUnfairLock(initialState: 0)
+        manager.onFrame = { _ in frames.withLock { $0 += 1 } }
+        try manager.startCapture(displayID: CGMainDisplayID())
+        await manager.waitForSessionQueue()
+        let output = try #require(captureSession.outputs.first as? AVCaptureVideoDataOutput)
+
+        let gate = CallbackGate()
+        manager.frameValidatedForTesting = { _ in gate.hold() }
+        let callback = try Self.deliverOnCallbackQueue(try Self.testSample(), from: output, to: manager)
+        try await waitUntil { gate.isHolding }
+        try #require(gate.isHolding)
+
+        manager.stopCapture()
+        gate.release()
+        try await waitUntil { callback.hasReturned }
+        try #require(callback.hasReturned)
+        #expect(frames.withLock { $0 } == 0)
+    }
+
+    @Test("A frame already being delivered when capture stops finishes before stop returns")
+    func deliveryUnderWayFinishesBeforeStopReturns() async throws {
+        let captureSession = ConfigurationOnlyCaptureSession()
+        let manager = ScreenCaptureManager(captureSession: captureSession)
+        let gate = CallbackGate()
+        let finished = OSAllocatedUnfairLock(initialState: false)
+        manager.onFrame = { _ in
+            gate.hold()
+            finished.withLock { $0 = true }
+        }
+        try manager.startCapture(displayID: CGMainDisplayID())
+        await manager.waitForSessionQueue()
+        let output = try #require(captureSession.outputs.first as? AVCaptureVideoDataOutput)
+        let callback = try Self.deliverOnCallbackQueue(try Self.testSample(), from: output, to: manager)
+        try await waitUntil { gate.isHolding }
+        try #require(gate.isHolding)
+
+        // Released from elsewhere: stop waits for this delivery, holding the main actor.
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { gate.release() }
+        manager.stopCapture()
+        #expect(finished.withLock { $0 })
+        try await waitUntil { callback.hasReturned }
+    }
+
     private static func testSample() throws -> CMSampleBuffer {
         let pixel = try #require(createTestPixelBuffer(width: 16, height: 16, red: 255, green: 0, blue: 0))
         return try #require(createTestSampleBuffer(from: pixel))
     }
+
+    /// Calls the delegate with `sample` on `output`'s callback queue, the queue capture delivers on,
+    /// from the connection of the input attached now.
+    private static func deliverOnCallbackQueue(
+        _ sample: CMSampleBuffer,
+        from output: AVCaptureVideoDataOutput,
+        to manager: ScreenCaptureManager
+    ) throws -> DelegateCall {
+        let queue = try #require(output.sampleBufferCallbackQueue)
+        let connection = try #require(output.connection(with: .video))
+        let call = DelegateCall(manager: manager, output: output, sample: sample, connection: connection)
+        queue.async { call.run() }
+        return call
+    }
+}
+
+/// One `captureOutput(_:didOutput:from:)` call, made off the main actor.
+private final class DelegateCall: @unchecked Sendable {
+    private let manager: ScreenCaptureManager
+    private let output: AVCaptureOutput
+    private let sample: CMSampleBuffer
+    private let connection: AVCaptureConnection
+    private let returned = OSAllocatedUnfairLock(initialState: false)
+
+    init(manager: ScreenCaptureManager, output: AVCaptureOutput, sample: CMSampleBuffer, connection: AVCaptureConnection) {
+        self.manager = manager
+        self.output = output
+        self.sample = sample
+        self.connection = connection
+    }
+
+    var hasReturned: Bool { returned.withLock { $0 } }
+
+    func run() {
+        manager.captureOutput(output, didOutput: sample, from: connection)
+        returned.withLock { $0 = true }
+    }
+}
+
+/// Holds the first thread that calls `hold()` until `release()` (or a five-second safety timeout).
+private final class CallbackGate: Sendable {
+    private let state = OSAllocatedUnfairLock(initialState: (armed: true, holding: false))
+    private let released = DispatchSemaphore(value: 0)
+
+    var isHolding: Bool { state.withLock { $0.holding } }
+
+    func hold() {
+        let first = state.withLock { state -> Bool in
+            guard state.armed else { return false }
+            state.armed = false
+            state.holding = true
+            return true
+        }
+        guard first else { return }
+        _ = released.wait(timeout: .now() + 5)
+    }
+
+    func release() { released.signal() }
 }
 
 private enum FirstFrameWaitOutcome: Equatable { case returned, cancelled, failed }
