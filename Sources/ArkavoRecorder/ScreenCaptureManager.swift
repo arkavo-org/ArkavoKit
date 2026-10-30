@@ -35,8 +35,10 @@ public final class ScreenCaptureManager: NSObject, Sendable {
         activeCapture.withLock { $0?.id == id }
     }
 
-    /// The `startCaptureAndWaitForFirstFrame` call waiting for its capture's first frame.
-    /// A frame of that capture resumes it; a stop or a newer start ends it with `CancellationError`.
+    /// The `startCaptureAndWaitForFirstFrame` call waiting for its capture to start and deliver a
+    /// first frame. Registered before the start is queued, and resumed exactly once, on the main
+    /// actor, by whichever comes first: that capture's first frame, its failed start, a stop, a
+    /// newer start, or cancellation of the calling task.
     private var firstFrameWaiter: (captureID: UUID, continuation: CheckedContinuation<Void, any Error>)?
     private var hasDeliveredFirstFrame: Bool = false
 
@@ -79,41 +81,35 @@ public final class ScreenCaptureManager: NSObject, Sendable {
     /// Starts screen capture and waits for the first frame to be delivered
     /// This ensures the screen capture is actually producing frames before returning
     ///
-    /// Throws `RecorderError.cannotAddInput` if the session can't take the display's input, and
-    /// `CancellationError` if `stopCapture` or another start replaces this capture before its
-    /// first frame arrives, or if the calling task is cancelled first. Cancelling ends only the
-    /// wait: the capture keeps running.
+    /// Throws `RecorderError.cannotAddInput` if the session can't take the display's input; the
+    /// display captured before keeps capturing. Throws `CancellationError` as soon as
+    /// `stopCapture`, another start or cancelling the calling task ends the wait, even while the
+    /// session is still starting. Ending the wait doesn't undo the start: the session work runs
+    /// to completion, and a cancelled call's capture keeps running.
     public func startCaptureAndWaitForFirstFrame(displayID: CGDirectDisplayID? = nil) async throws {
         #if os(macOS)
         let request = try beginCapture(displayID: displayID)
-
-        // Throw if the session can't take the input, rather than wait for a frame that won't come.
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
-            enqueueStart(request, reportsFailure: false) { continuation.resume(with: $0) }
-        }
-
-        // A stop or a newer start while this one was queued has replaced it: no frame will come.
-        guard isCurrentCapture(request.captureID) else { throw CancellationError() }
-
-        // Wait for first frame
         let captureID = request.captureID
+
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
-                if hasDeliveredFirstFrame {
-                    // Already got a frame
-                    continuation.resume()
-                } else if Task.isCancelled {
-                    // Cancelled before the wait began (e.g. during the start): don't begin it.
+                // Register the wait while this capture is current, before its start is queued,
+                // so a stop, a newer start or cancellation can end it while startRunning blocks.
+                if Task.isCancelled {
                     continuation.resume(throwing: CancellationError())
                 } else {
-                    // Resumed when this capture's first frame arrives, or ended when it's replaced
-                    endFirstFrameWait()
                     firstFrameWaiter = (captureID, continuation)
+                }
+                // Start even when already cancelled: routing points at this capture now.
+                enqueueStart(request, reportsFailure: false) { [weak self] result in
+                    // A successful start waits for the frame; a failed one ends the wait.
+                    guard case .failure(let error) = result else { return }
+                    Task { @MainActor [weak self] in self?.endFirstFrameWait(of: captureID, throwing: error) }
                 }
             }
         } onCancel: { [weak self] in
             // Runs on the cancelling thread. The hop reaches the main actor after the wait is
-            // stored, which happens in the same main-actor job that enters this handler.
+            // registered, which happens in the same main-actor job that enters this handler.
             Task { @MainActor [weak self] in self?.endFirstFrameWait(of: captureID) }
         }
 
@@ -173,12 +169,13 @@ public final class ScreenCaptureManager: NSObject, Sendable {
         return StartRequest(input: input, captureID: capture.id)
     }
 
-    /// Ends a pending first-frame wait with `CancellationError`: any wait, or only the one for
-    /// `captureID`, so a late cancellation can't end a newer capture's wait.
-    private func endFirstFrameWait(of captureID: UUID? = nil) {
+    /// Ends a pending first-frame wait with `error`: any wait, or only the one for `captureID`,
+    /// so a late cancellation or start failure can't end a newer capture's wait. A wait already
+    /// ended isn't resumed again.
+    private func endFirstFrameWait(of captureID: UUID? = nil, throwing error: any Error = CancellationError()) {
         guard let waiter = firstFrameWaiter, captureID == nil || waiter.captureID == captureID else { return }
         firstFrameWaiter = nil
-        waiter.continuation.resume(throwing: CancellationError())
+        waiter.continuation.resume(throwing: error)
     }
 
     /// Attaches the request's input and starts the session on the session queue. If the session

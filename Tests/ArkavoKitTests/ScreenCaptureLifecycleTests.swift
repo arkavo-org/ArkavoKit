@@ -127,20 +127,41 @@ struct ScreenCaptureLifecycleTests {
         #expect(captureSession.calls.allSatisfy { !$0.onMainThread })
     }
 
-    @Test("Stopping while a first-frame wait is still starting ends the wait")
+    @Test("Stopping while a first-frame wait is still starting ends the wait before the start finishes")
     func stopDuringStartEndsFirstFrameWait() async throws {
         let captureSession = LifecycleRecordingCaptureSession()
         captureSession.holdStart()
         let manager = ScreenCaptureManager(captureSession: captureSession)
         let wait = startFirstFrameWait(manager)
 
-        // The waiter is suspended across its start, blocked in startRunning on the session queue.
+        // Its start is blocked in startRunning on the session queue.
         try await waitUntil { captureSession.startsEntered == 1 }
         manager.stopCapture()
-        captureSession.releaseStart()
-
         try await waitUntil { wait.outcome != nil }
         #expect(wait.outcome == .cancelled)
+
+        // The start then finishes on its own and doesn't resume the ended wait again.
+        captureSession.releaseStart()
+        await manager.waitForSessionQueue()
+        try await Task.sleep(for: .milliseconds(50))
+    }
+
+    @Test("A newer start ends a first-frame wait whose start is still blocked")
+    func replacementDuringStartEndsFirstFrameWait() async throws {
+        let captureSession = LifecycleRecordingCaptureSession()
+        captureSession.holdStart()
+        let manager = ScreenCaptureManager(captureSession: captureSession)
+        let wait = startFirstFrameWait(manager)
+        try await waitUntil { captureSession.startsEntered == 1 }
+
+        try manager.startCapture(displayID: CGMainDisplayID())
+        try await waitUntil { wait.outcome != nil }
+        #expect(wait.outcome == .cancelled)
+
+        captureSession.releaseStart()
+        await manager.waitForSessionQueue()
+        try await Task.sleep(for: .milliseconds(50))
+        manager.stopCapture()
     }
 
     @Test("Stopping while waiting for the first frame ends the wait")
@@ -197,7 +218,7 @@ struct ScreenCaptureLifecycleTests {
         manager.stopCapture()
     }
 
-    @Test("A task cancelled while its start is still running doesn't wait for the first frame")
+    @Test("Cancelling a task whose start is still blocked ends its wait before the start finishes")
     func taskCancelledDuringStartDoesNotWait() async throws {
         let captureSession = LifecycleRecordingCaptureSession()
         captureSession.holdStart()
@@ -205,11 +226,36 @@ struct ScreenCaptureLifecycleTests {
         let wait = startFirstFrameWait(manager)
         try await waitUntil { captureSession.startsEntered == 1 }
 
-        // Cancelled before the wait for the frame begins.
         wait.task.cancel()
-        captureSession.releaseStart()
         try await waitUntil { wait.outcome != nil }
         #expect(wait.outcome == .cancelled)
+
+        // The start then succeeds on its own and doesn't resume the ended wait again.
+        captureSession.releaseStart()
+        await manager.waitForSessionQueue()
+        try await Task.sleep(for: .milliseconds(50))
+        manager.stopCapture()
+    }
+
+    @Test("A start that fails after its wait was cancelled doesn't resume the wait again")
+    func startFailingAfterCancelDoesNotResumeAgain() async throws {
+        let captureSession = LifecycleRecordingCaptureSession()
+        captureSession.holdStart()
+        let manager = ScreenCaptureManager(captureSession: captureSession)
+        // A first start holds the session queue in startRunning; the waited start queues behind it.
+        try manager.startCapture(displayID: CGMainDisplayID())
+        try await waitUntil { captureSession.startsEntered == 1 }
+        captureSession.rejectsInputs = true
+        let wait = startFirstFrameWait(manager)
+        try await Task.sleep(for: .milliseconds(20))
+
+        wait.task.cancel()
+        try await waitUntil { wait.outcome != nil }
+        #expect(wait.outcome == .cancelled)
+
+        captureSession.releaseStart()
+        await manager.waitForSessionQueue()   // the waited start now fails: cannotAddInput
+        try await Task.sleep(for: .milliseconds(50))
         manager.stopCapture()
     }
 
@@ -374,14 +420,14 @@ private final class SelectiveCaptureSession: AVCaptureSession, @unchecked Sendab
 /// Records each `startRunning` / `stopRunning` with the thread it ran on, in completion order,
 /// without capturing the user's screen. Each call takes `latency` seconds; `holdStart()` makes
 /// `startRunning` block, as a real session does while it starts, until `releaseStart()` (or a
-/// one-second timeout).
+/// five-second safety timeout, longer than any test's deadline). `rejectsInputs` refuses inputs.
 private final class LifecycleRecordingCaptureSession: AVCaptureSession, @unchecked Sendable {
     enum Kind: Equatable { case start, stop }
     struct Call { let kind: Kind; let onMainThread: Bool }
 
     private let latency: TimeInterval
     private let state = OSAllocatedUnfairLock(
-        initialState: (calls: [Call](), running: false, holdsStart: false, startsEntered: 0)
+        initialState: (calls: [Call](), running: false, holdsStart: false, startsEntered: 0, rejectsInputs: false)
     )
     private let startGate = DispatchSemaphore(value: 0)
 
@@ -395,6 +441,11 @@ private final class LifecycleRecordingCaptureSession: AVCaptureSession, @uncheck
     /// `startRunning` calls that have begun, including one still blocked.
     var startsEntered: Int { state.withLock { $0.startsEntered } }
 
+    var rejectsInputs: Bool {
+        get { state.withLock { $0.rejectsInputs } }
+        set { state.withLock { $0.rejectsInputs = newValue } }
+    }
+
     func holdStart() { state.withLock { $0.holdsStart = true } }
 
     func releaseStart() {
@@ -405,13 +456,17 @@ private final class LifecycleRecordingCaptureSession: AVCaptureSession, @uncheck
     override func startRunning() {
         state.withLock { $0.startsEntered += 1 }
         if state.withLock({ $0.holdsStart }) {
-            _ = startGate.wait(timeout: .now() + 1)
+            _ = startGate.wait(timeout: .now() + 5)
         }
         record(.start, running: true)
     }
 
     override func stopRunning() {
         record(.stop, running: false)
+    }
+
+    override func canAddInput(_ input: AVCaptureInput) -> Bool {
+        !rejectsInputs && super.canAddInput(input)
     }
 
     private func record(_ kind: Kind, running: Bool) {
