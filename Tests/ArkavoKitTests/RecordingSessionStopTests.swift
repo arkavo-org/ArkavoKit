@@ -223,6 +223,67 @@ struct RecordingSessionStopTests {
         #expect(inputs.microphones.allSatisfy { !$0.isActive })
     }
 
+    @Test("Stopping the stream while a recording is starting leaves that recording its screen and audio")
+    func stoppingTheStreamWhileARecordingStartsKeepsItsSources() async throws {
+        let url = Self.outputURL("stream-stops-during-start")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let live = try SharedSources()
+        live.session.enableAvatar = false
+        live.session.enableDesktop = true
+        try live.session.startScreenPreview()
+        let preview = await live.screenInput()
+        try await live.session.startStreamingForTesting { _ in }
+        try await Self.waitUntil { live.audio.isActive }
+
+        // The recording's start waits for the first frame of its own screen capture.
+        let start = Task { try await live.session.startRecording(outputURL: url, title: "starting") }
+        let deadline = ContinuousClock.now + .seconds(5)
+        while await live.screenInput().map({ $0 === preview }) ?? true, .now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        await live.session.stopStreaming()
+        #expect(await live.screenIsCapturing())   // the first frame
+        try await start.value
+
+        #expect(live.session.isRecording)
+        #expect(live.audio.isActive)
+        #expect(await live.screenIsCapturing())
+        _ = try? await live.session.stopRecording()
+        #expect(!live.audio.isActive)
+    }
+
+    @Test("A recording start that fails after the stream ended releases the screen and audio")
+    func failedStartAfterTheStreamEndedReleasesTheSources() async throws {
+        let url = Self.outputURL("failed-start-after-stream")
+        defer { try? FileManager.default.removeItem(at: url) }
+        // The microphone permission request is held until released, then refused.
+        let released = OSAllocatedUnfairLock(initialState: false)
+        let asked = OSAllocatedUnfairLock(initialState: false)
+        let stand = StandInAudioInputs()
+        var inputs = stand.audioInputs
+        inputs.microphonePermission = {
+            asked.withLock { $0 = true }
+            while !released.withLock({ $0 }) { try? await Task.sleep(for: .milliseconds(10)) }
+            return false
+        }
+        let live = try SharedSources(audioInputs: inputs)
+        live.session.enableMicrophone = true
+        try live.session.startScreenPreview()
+        try await live.session.startStreamingForTesting { _ in }
+        try await Self.waitUntil { stand.microphones.first?.isActive == true }
+
+        let start = Task { try await live.session.startRecording(outputURL: url, title: "refused") }
+        try await Self.waitUntil { asked.withLock { $0 } }
+        await live.session.stopStreaming()
+        #expect(stand.microphones.first?.isActive == true)   // the starting recording owns it
+        released.withLock { $0 = true }
+        await #expect(throws: RecorderError.permissionDenied) { try await start.value }
+
+        #expect(stand.microphones.allSatisfy { !$0.isActive })
+        #expect(!live.audio.isActive)
+        #expect(!(await live.screenIsCapturing()))
+    }
+
     private static func outputURL(_ name: String) -> URL {
         FileManager.default.temporaryDirectory.appendingPathComponent("\(name)-\(UUID().uuidString).mov")
     }
@@ -323,11 +384,11 @@ private struct SharedSources {
     private let captureSession = NonCapturingSession()
     private let screenFrames = OSAllocatedUnfairLock(initialState: 0)
 
-    init(encoder: VideoEncoder = VideoEncoder()) throws {
+    init(encoder: VideoEncoder = VideoEncoder(), audioInputs: AudioInputs = .system) throws {
         capture = ScreenCaptureManager(captureSession: captureSession)
         let screenFrames = screenFrames
         capture.onFrame = { _ in screenFrames.withLock { $0 += 1 } }
-        session = try RecordingSession(screenCapture: capture, encoder: encoder)
+        session = try RecordingSession(screenCapture: capture, encoder: encoder, audioInputs: audioInputs)
         session.enableDesktop = false
         session.enableCamera = false
         session.enableMicrophone = false
@@ -352,6 +413,12 @@ private struct SharedSources {
             try await Task.sleep(for: .milliseconds(10))
         }
         try #require(streamFrames.withLock { $0 } >= 5)
+    }
+
+    /// The screen input attached once queued session work has run.
+    func screenInput() async -> AVCaptureInput? {
+        await capture.waitForSessionQueue()
+        return captureSession.inputs.first
     }
 
     /// Whether the screen capture still delivers a frame, once its queued session work has run.

@@ -128,6 +128,11 @@ public final class RecordingSession: Sendable {
     // Recording state tracked locally for synchronous access
     // This is updated when recording starts/stops
     nonisolated(unsafe) private var _isRecording: Bool = false
+    /// From the start of `startRecording` until it returns or throws. A recording that is still
+    /// starting owns the sources it is starting, as a running one does.
+    private var recordingStarting = false
+    /// A stream ended while a recording was starting and left the sources to it.
+    private var streamLeftSourcesToStartingRecording = false
     private let _streamingActive = OSAllocatedUnfairLock(initialState: false)
     private var recordingStartTime: ContinuousClock.Instant?
     private var pauseStartTime: ContinuousClock.Instant?
@@ -381,9 +386,27 @@ public final class RecordingSession: Sendable {
 
     // MARK: - Recording Control
 
-    /// Starts a new recording session
+    /// Starts a new recording session. Returns at once while a recording is running or starting.
     public func startRecording(outputURL: URL, title: String) async throws {
-        guard !_isRecording else { return }
+        guard !_isRecording, !recordingStarting else { return }
+        recordingStarting = true
+        do {
+            try await beginRecording(outputURL: outputURL, title: title)
+        } catch {
+            recordingStarting = false
+            // A stream that ended meanwhile left its sources to this recording; nothing owns them now.
+            if streamLeftSourcesToStartingRecording && !_streamingActive.withLock({ $0 }) {
+                await stopSources()
+                resetAudioMixer()
+            }
+            streamLeftSourcesToStartingRecording = false
+            throw error
+        }
+        recordingStarting = false
+        streamLeftSourcesToStartingRecording = false
+    }
+
+    private func beginRecording(outputURL: URL, title: String) async throws {
         let mode = inputMode
 
         // Validate at least one input is enabled
@@ -1052,9 +1075,11 @@ public final class RecordingSession: Sendable {
         }
     }
 
-    /// With no recording either, nothing uses the sources any more.
+    /// With no recording running or starting either, nothing uses the sources any more.
     private func streamDidEnd() async {
-        if !_isRecording {
+        if recordingStarting {
+            streamLeftSourcesToStartingRecording = true
+        } else if !_isRecording {
             await stopSources()
             resetAudioMixer()
         }
