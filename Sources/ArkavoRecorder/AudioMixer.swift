@@ -6,13 +6,14 @@
 //  Clock-driven FIFO: one source (the first to deliver, or `clockSourceID`)
 //  sets the frame cadence; every other source is a FIFO of samples drained
 //  by the clock's frame length. A FIFO is a jitter buffer: it starts playing
-//  only once it holds `prefillSeconds` of audio or its oldest sample has waited
-//  that long in clock frames, so a producer whose chunks don't line up with the
-//  clock's buffers isn't zero-filled mid-stream; it is zero-filled only when it
-//  runs dry, and then builds its lead again. A configured voice source ducks the
-//  others while it has audio queued. The voice is never auto-picked as the clock
-//  while other sources are registered, and every FIFO is capped at
-//  `maxQueuedSeconds` (oldest samples dropped).
+//  only once it holds `prefillSeconds` of audio (60 ms by default) or its oldest
+//  sample has waited that long in clock frames, so a producer whose chunks don't
+//  line up with the clock's buffers, or that delivers a chunk late, isn't
+//  zero-filled mid-stream; it is zero-filled only when it runs dry, and then
+//  builds its lead again. A configured voice source ducks the others while it
+//  has audio queued. The voice is never auto-picked as the clock while other
+//  sources are registered, and every FIFO is capped at `maxQueuedSeconds`
+//  (oldest samples dropped).
 //
 
 import AVFoundation
@@ -44,8 +45,10 @@ public final class AudioMixer: @unchecked Sendable {
     public let maxQueuedSeconds: Double = AudioMixer.queueCapSeconds
     private static let queueCapSeconds = 0.2
 
-    /// Default lead a non-clock source builds before it plays: about two 20 ms voice chunks.
-    public static let defaultPrefillSeconds = 0.04
+    /// Default lead a non-clock source builds before it plays: three 20 ms voice chunks. Against
+    /// a 512- or 1024-frame clock it absorbs a chunk about 20 ms late at any phase; 40 ms
+    /// absorbed none at the worst phase of a 1024-frame clock.
+    public static let defaultPrefillSeconds = 0.06
 
     /// Lead, in seconds, a non-clock source builds before it plays, and how long (in clock
     /// frames) a shorter sound waits before playing anyway. It delays every non-clock source
@@ -58,6 +61,10 @@ public final class AudioMixer: @unchecked Sendable {
 
     public var onMixedSample: ((CMSampleBuffer) -> Void)?
 
+    /// - Parameter prefillSeconds: The lead each non-clock source builds before it plays
+    ///   (`defaultPrefillSeconds`, 60 ms). Every non-clock source lands about this much later
+    ///   on the clock's timeline. Clamped to 0...half of `maxQueuedSeconds`; 0 mixes queued
+    ///   audio at the next clock buffer, with no jitter buffer.
     public init(
         sampleRate: Double = 48000,
         channels: UInt32 = 2,

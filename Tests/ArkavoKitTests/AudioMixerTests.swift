@@ -240,24 +240,35 @@ struct AudioMixerTests {
         #expect(Self.soundRuns(out) == [25 * 960 * 2, 25 * 960 * 2])
     }
 
+    @Test("A voice chunk 20 ms late still plays without a hole", arguments: phases)
+    func lateChunkPlaysWithoutAHole(phase: Int) {
+        let mixer = AudioMixer(voiceSourceID: "muse-voice")
+        // A producer tick 20 ms (960 frames) late: chunk 10 arrives together with chunk 11.
+        let chunks = (0..<50).map { phase + $0 * 960 + ($0 == 10 ? 960 : 0) }
+        let out = Self.mixPaced(mixer, voiceChunksAt: chunks, until: phase + 50 * 960 + 8 * 1024)
+        #expect(Self.soundRuns(out) == [50 * 960 * 2])
+    }
+
     @Test("A sound shorter than the prefill plays once one prefill of clock frames has passed")
     func shortSoundPlaysAfterOnePrefill() {
         let mixer = AudioMixer()
+        let due = Self.ticksToDrainOnePrefill(mixer)
         mixer.setClockSource("microphone")
         var out: [[Int16]] = []
         mixer.onMixedSample = { out.append(Self.samples($0)) }
         mixer.addSample(Self.buffer(frames: 1024, value: 0, pts: .zero), from: "microphone")
-        // A 5 ms desktop-audio click, far below the 40 ms (1,920-frame) prefill.
+        // A 5 ms desktop-audio click, far below the prefill.
         mixer.addSample(Self.buffer(frames: 240, value: 500, pts: .zero), from: "screen")
-        for tick in 1...4 {
+        for tick in 1...(due + 2) {
             mixer.addSample(Self.buffer(frames: 1024, value: 0, pts: CMTime(value: Int64(tick * 1024), timescale: 48000)),
                             from: "microphone")
         }
-        // 1,024 clock frames after the click: still waiting. 2,048 >= 1,920: it plays, whole.
-        #expect(out[1].allSatisfy { $0 == 0 })
-        #expect(out[2].prefix(480).allSatisfy { $0 == 500 })
-        #expect(out[2].dropFirst(480).allSatisfy { $0 == 0 })
-        #expect(out[3].allSatisfy { $0 == 0 } && out[4].allSatisfy { $0 == 0 })
+        // It waits until the clock has drained one prefill of frames, then plays whole, once.
+        #expect(due >= 2)
+        #expect(out[1..<due].allSatisfy { $0.allSatisfy { $0 == 0 } })
+        #expect(out[due].prefix(480).allSatisfy { $0 == 500 })
+        #expect(out[due].dropFirst(480).allSatisfy { $0 == 0 })
+        #expect(out[(due + 1)...].allSatisfy { $0.allSatisfy { $0 == 0 } })
     }
 
     @Test("Ducking starts while the voice builds its lead, before the voice is audible")
@@ -265,20 +276,22 @@ struct AudioMixerTests {
         let mixer = AudioMixer(voiceSourceID: "muse-voice")
         mixer.voiceDuckAmount = 0.5
         mixer.voiceDuckHangover = 0   // only queued or playing voice can duck
+        let due = Self.ticksToDrainOnePrefill(mixer)
         mixer.setClockSource("microphone")
         var out: [[Int16]] = []
         mixer.onMixedSample = { out.append(Self.samples($0)) }
         mixer.addSample(Self.buffer(frames: 1024, value: 100, pts: .zero), from: "microphone")
+        // One 20 ms chunk, shorter than the prefill: it plays once `due` clock buffers have passed.
         mixer.addSample(Self.buffer(frames: 960, value: 1000, pts: .zero), from: "muse-voice")
-        for tick in 1...3 {
+        for tick in 1...(due + 1) {
             mixer.addSample(Self.buffer(frames: 1024, value: 100, pts: CMTime(value: Int64(tick * 1024), timescale: 48000)),
                             from: "microphone")
         }
         #expect(out[0].allSatisfy { $0 == 100 })
-        #expect(out[1].allSatisfy { $0 == 50 })                      // voice queued but silent: mic ducked
-        #expect(out[2].prefix(1920).allSatisfy { $0 == 1050 })       // voice plays over the ducked mic
-        #expect(out[2].dropFirst(1920).allSatisfy { $0 == 50 })
-        #expect(out[3].allSatisfy { $0 == 100 })                     // voice gone: duck released
+        #expect(out[1..<due].allSatisfy { $0.allSatisfy { $0 == 50 } })  // voice queued but silent: mic ducked
+        #expect(out[due].prefix(1920).allSatisfy { $0 == 1050 })         // voice plays over the ducked mic
+        #expect(out[due].dropFirst(1920).allSatisfy { $0 == 50 })
+        #expect(out[due + 1].allSatisfy { $0 == 100 })                   // voice gone: duck released
     }
 
     @Test("Dropping a source's queue makes it build its lead again",
@@ -292,8 +305,8 @@ struct AudioMixerTests {
         var out: [[Int16]] = []
         mixer.onMixedSample = { out.append(Self.samples($0)) }
         mixer.addSample(Self.buffer(frames: 1024, value: 0, pts: .zero), from: "microphone")
-        // A full prefill of voice plays at the next tick and leaves 896 frames queued.
-        mixer.addSample(Self.buffer(frames: 1920, value: 1000, pts: .zero), from: "muse-voice")
+        // A full prefill of voice plays at the next tick and leaves the rest queued, still primed.
+        mixer.addSample(Self.buffer(frames: Self.prefillFrames(mixer), value: 1000, pts: .zero), from: "muse-voice")
         mixer.addSample(Self.buffer(frames: 1024, value: 0, pts: .zero), from: "microphone")
         #expect(out[1].allSatisfy { $0 == 1000 })
 
@@ -313,11 +326,23 @@ struct AudioMixerTests {
         #expect(out.last?.allSatisfy { $0 == 0 } == true)
     }
 
-    @Test("The prefill defaults to 40 ms and stays at most half the queue cap")
+    @Test("The prefill defaults to 60 ms and stays at most half the queue cap")
     func prefillIsBoundedBelowTheCap() {
-        #expect(AudioMixer().prefillSeconds == 0.04)
+        #expect(AudioMixer.defaultPrefillSeconds == 0.06)
+        #expect(AudioMixer().prefillSeconds == 0.06)
         #expect(AudioMixer(prefillSeconds: 1).prefillSeconds == AudioMixer().maxQueuedSeconds / 2)
         #expect(AudioMixer(prefillSeconds: -1).prefillSeconds == 0)
+    }
+
+    /// The mixer's prefill in frames at 48 kHz.
+    static func prefillFrames(_ mixer: AudioMixer) -> Int {
+        Int((48000 * mixer.prefillSeconds).rounded())
+    }
+
+    /// Clock buffers of 1,024 frames a queued sound shorter than the prefill waits, counting the
+    /// buffer it plays in: the first whose drained frames since it arrived reach the prefill.
+    static func ticksToDrainOnePrefill(_ mixer: AudioMixer) -> Int {
+        (prefillFrames(mixer) + 1023) / 1024
     }
 
     /// Feeds a silent 1024-frame microphone clock and 960-frame voice chunks (value 1000)
