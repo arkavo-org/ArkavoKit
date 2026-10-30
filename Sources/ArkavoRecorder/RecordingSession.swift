@@ -469,10 +469,11 @@ public final class RecordingSession: Sendable {
             if streamLeftSources && !_streamingActive.withLock({ $0 }) {
                 await stopSources()
                 resetAudioMixer()
-                // A stream that started during that await started its frames, but the screen and
-                // cameras had already stopped, and the audio it started may have been stopped too.
+                // A stream that started during that await started its frames (no recording was
+                // running or starting), but the screen and cameras had already stopped, and the
+                // audio it started may have been stopped too. It gets those back, not its frames.
                 if _streamingActive.withLock({ $0 }) {
-                    restartSourcesForStream()
+                    restartSourcesForStream(includingFrames: false)
                 }
             }
             throw error
@@ -682,7 +683,7 @@ public final class RecordingSession: Sendable {
             // No await since the check: a stream that starts after it sees no recording and
             // starts its sources and frames itself.
             if stoppedSources && _streamingActive.withLock({ $0 }) {
-                restartSourcesForStream()
+                restartSourcesForStream(includingFrames: true)
             }
             inputsDidChange()
         }
@@ -709,8 +710,10 @@ public final class RecordingSession: Sendable {
 
     /// Starts what a live stream needs after `stopSources()`: the screen capture in desktop
     /// modes and the cameras (a stream that starts by itself uses the running previews), then
-    /// the frame driver and the audio, as starting the stream does.
-    private func restartSourcesForStream() {
+    /// the frame driver and the audio, as starting the stream does. With `includingFrames` false
+    /// (a stream that started its own frames) only the screen, the cameras and the audio start;
+    /// its frame driver and mixer are left as they are.
+    private func restartSourcesForStream(includingFrames: Bool) {
         if inputMode.needsDesktop {
             do {
                 try screenCapture.startCapture(displayID: selectedDisplayID)
@@ -723,7 +726,11 @@ public final class RecordingSession: Sendable {
         if enableCamera {
             try? startCameraCapturesIfNeeded()
         }
-        startStreamingFrameGeneration()
+        if includingFrames {
+            startStreamingFrameGeneration()
+        } else {
+            startStreamingAudio()
+        }
     }
 
     /// Stops the frame driver and every capture: the screen, the cameras and the audio.
@@ -1102,6 +1109,7 @@ public final class RecordingSession: Sendable {
     /// pass through processFrameSync since streaming is active.
     /// Also starts audio routing so mic audio reaches the encoder.
     private func startStreamingFrameGeneration() {
+        streamFrameGenerationStartsForTesting += 1
         updateComposedPreviewDriver()
         let mode = inputMode
 
@@ -1113,8 +1121,16 @@ public final class RecordingSession: Sendable {
         // Fresh mixer state for this stream (before any audio source starts delivering)
         resetAudioMixer()
 
-        // Add audio sources if not already added (streaming without recording). This runs after
-        // the call returns, so the stream may have stopped before or while its audio starts.
+        startStreamingAudio()
+
+        print("📡 Started frame generation for streaming (mode: \(mode))")
+    }
+
+    /// Adds the audio sources a stream needs if they aren't added yet (streaming without
+    /// recording), and starts any that aren't running. This runs after the call returns, so the
+    /// stream may have stopped before or while its audio starts.
+    private func startStreamingAudio() {
+        let mode = inputMode
         Task { @MainActor in
             await removeUnwantedAudioSources(microphone: mode.needsMicrophone)
             guard _streamingActive.withLock({ $0 }) else { return }
@@ -1131,8 +1147,6 @@ public final class RecordingSession: Sendable {
                 try? await audioRouter.stopAll()
             }
         }
-
-        print("📡 Started frame generation for streaming (mode: \(mode))")
     }
 
     // MARK: - Streaming
@@ -1171,6 +1185,9 @@ public final class RecordingSession: Sendable {
 
     /// Tests: the mixer every audio source reaches the encoder through.
     var audioMixerForTesting: AudioMixer { audioMixer }
+
+    /// Tests: how many times a stream's frame generation has started.
+    private(set) var streamFrameGenerationStartsForTesting = 0
 
     /// Tests: `startStreaming(to:streamKey:)` without RTMP. The encoder's stream output goes to
     /// `onEncodedVideo` instead of a destination; `stopStreaming()` ends it.

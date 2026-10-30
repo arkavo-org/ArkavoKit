@@ -364,7 +364,7 @@ struct RecordingSessionStopTests {
         #expect(!(await live.screenIsCapturing()))
     }
 
-    @Test("A stream that starts while a failed recording start releases the sources gets the screen and cameras back")
+    @Test("A stream that starts while a failed recording start releases the sources gets the screen and cameras back, and starts its frames once")
     func streamStartingWhileAFailedStartReleasesTheSourcesGetsThemBack() async throws {
         let url = Self.outputURL("stream-starts-after-failed-start")
         defer { try? FileManager.default.removeItem(at: url) }
@@ -392,6 +392,8 @@ struct RecordingSessionStopTests {
         try await session.startStreamingForTesting { _ in }
         try await Self.waitUntil { live.audio.isActive }
 
+        let frameStarts = session.streamFrameGenerationStartsForTesting
+
         let start = Task { try await session.startRecording(outputURL: url, title: "refused") }
         try await Self.waitUntil { asked.withLock { $0 } }
         await session.stopStreaming()   // leaves the sources to the starting recording
@@ -400,6 +402,8 @@ struct RecordingSessionStopTests {
         await #expect(throws: RecorderError.permissionDenied) { try await start.value }
 
         #expect(startsAStream.startedAStream)
+        // The new stream started its own frames; getting its sources back doesn't start them again.
+        #expect(session.streamFrameGenerationStartsForTesting == frameStarts + 1)
         #expect(await live.screenIsCapturing())
         #expect(cameraStarts.attempted == [CameraStartAttempts.cameraID])
         try await Self.waitUntil { live.audio.isActive }
