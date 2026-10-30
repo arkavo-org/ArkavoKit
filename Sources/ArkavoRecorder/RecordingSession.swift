@@ -393,13 +393,17 @@ public final class RecordingSession: Sendable {
         do {
             try await beginRecording(outputURL: outputURL, title: title)
         } catch {
+            // Both cleared before the sources stop. This start owns nothing from here on, so
+            // during that await a stream that ends releases the sources itself, and a stream that
+            // starts or a recording that starts doesn't see this start's claim on them.
+            let streamLeftSources = streamLeftSourcesToStartingRecording
             recordingStarting = false
+            streamLeftSourcesToStartingRecording = false
             // A stream that ended meanwhile left its sources to this recording; nothing owns them now.
-            if streamLeftSourcesToStartingRecording && !_streamingActive.withLock({ $0 }) {
+            if streamLeftSources && !_streamingActive.withLock({ $0 }) {
                 await stopSources()
                 resetAudioMixer()
             }
-            streamLeftSourcesToStartingRecording = false
             throw error
         }
         recordingStarting = false
