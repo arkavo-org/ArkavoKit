@@ -308,15 +308,11 @@ public final class CompositorManager: Sendable {
         return renderToPixelBuffer(image: composited.cropped(to: outputRect), size: outputSize)
     }
 
-    /// The texture size slot placement assumes. Avatar and Muse providers render 16:9, at 1920×1080
-    /// in production, and the live preview places its slot layers with the same size, so preview and
-    /// output agree. A 16:9 texture of another size lands in the same place.
-    private static let slotTextureSize = CGSize(width: 1920, height: 1080)
-
     /// An avatar or Muse texture placed in its slot: the whole texture, drawn at the slot's
     /// `textureFrame` with one uniform scale, so its visible part lands on the fitted `visible` rect.
-    /// It has no rounded PiP mask; only the output crop clips it. Nil when the texture or the slot
-    /// is empty, so the frame goes on without that layer.
+    /// The fit uses the texture's own size, so a texture of any shape lands inside its slot; every
+    /// 16:9 size lands in the same place. It has no rounded PiP mask; only the output crop clips it.
+    /// Nil when the texture or the slot is empty, so the frame goes on without that layer.
     private func slotLayer(
         _ buffer: CVPixelBuffer, slot: AvatarSlot, visibleRect: CGRect, outputSize: CGSize
     ) -> CIImage? {
@@ -324,7 +320,7 @@ public final class CompositorManager: Sendable {
         let extent = image.extent
         guard extent.width > 0, extent.height > 0 else { return nil }
         let textureFrame = AvatarSlotLayout.frame(
-            slot: slot, visibleRect: visibleRect, textureSize: Self.slotTextureSize, output: outputSize
+            slot: slot, visibleRect: visibleRect, textureSize: extent.size, output: outputSize
         ).textureFrame
         guard textureFrame.width > 0, textureFrame.height > 0 else { return nil }
         let target = AvatarSlotLayout.coreImageRect(textureFrame, outputHeight: outputSize.height)

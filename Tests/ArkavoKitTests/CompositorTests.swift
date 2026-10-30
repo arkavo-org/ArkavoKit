@@ -864,6 +864,26 @@ struct CompositorTests {
         try expectRed(out, 940, 520)
     }
 
+    @Test("A square avatar texture lands inside its slot, neither stretched nor shifted")
+    func squareTextureLandsInsideItsSlot() throws {
+        // The visible part (0.25, 0.1, 0.5, 0.9) of a 1080×1080 texture fits Conversation as
+        // (684, 86.4, 552, 993.6); the red marker is its top 0.1, landing at y 86.4…196.8.
+        let visible = CGRect(x: 0.25, y: 0.1, width: 0.5, height: 0.9)
+        let avatar = try #require(createMaskedPixelBuffer(
+            width: 1080, height: 1080, opaque: visible, color: (0, 0, 255),
+            marker: CGRect(x: 0.25, y: 0.1, width: 0.5, height: 0.1)))
+        let out = try compositeScreen(color: (0, 255, 0), avatarTexture: avatar) { compositor in
+            compositor.avatarSlot = Self.conversation
+            compositor.avatarVisibleRect = visible
+        }
+        try expectRed(out, 940, 120)
+        try expectBlue(out, 940, 520)
+        try expectBlue(out, 940, 1040)
+        try expectGreen(out, 940, 40)
+        try expectGreen(out, 620, 520)
+        try expectGreen(out, 1260, 520)
+    }
+
     @Test("pipPosition moves only the camera")
     func pipPositionMovesOnlyTheCamera() throws {
         let compositor = try CompositorManager()
@@ -1006,6 +1026,8 @@ struct CompositorTests {
         slot: CGRect(x: 0.71, y: 0.38, width: 0.28, height: 0.62), anchor: .bottomRight)
     private static let gameplayLeft = AvatarSlot(
         slot: CGRect(x: 0.01, y: 0.38, width: 0.28, height: 0.62), anchor: .bottomLeft)
+    private static let conversation = AvatarSlot(
+        slot: CGRect(x: 0.22, y: 0.08, width: 0.56, height: 0.92), anchor: .bottomCenter)
     /// The opaque body in `compositeMaskedAvatar`'s texture: 604.8 × 864 px, aspect 0.70.
     private static let body = CGRect(x: 0.3425, y: 0.1, width: 0.315, height: 0.8)
 
