@@ -6,14 +6,20 @@ import os
 import AppKit
 #endif
 
-/// Manages screen capture using AVFoundation
+/// Manages screen capture using AVFoundation.
+///
+/// `AVCaptureSession.startRunning()` and `stopRunning()` block until the session has started
+/// or stopped, and must not run on the main thread. Every change to the session (its outputs
+/// and inputs, `startRunning` and `stopRunning`) therefore runs on `CaptureGraph.queue`, a
+/// private serial queue, in the order the calls were made; `startCapture` and `stopCapture`
+/// return without waiting for it. Frame routing doesn't wait for the queue either: the
+/// capture a frame must belong to changes before each call returns, so frames from a replaced
+/// or stopped display are dropped at once.
 @MainActor
 public final class ScreenCaptureManager: NSObject, Sendable {
     // MARK: - Properties
 
-    private let captureSession: AVCaptureSession
-    private var screenInput: AVCaptureScreenInput?
-    private let videoOutput: AVCaptureVideoDataOutput
+    private let graph: CaptureGraph
 
     private let outputQueue = DispatchQueue(label: "com.arkavo.screencapture")
 
@@ -40,81 +46,28 @@ public final class ScreenCaptureManager: NSObject, Sendable {
     }
 
     init(captureSession: AVCaptureSession) {
-        self.captureSession = captureSession
-        self.videoOutput = AVCaptureVideoDataOutput()
+        self.graph = CaptureGraph(session: captureSession)
 
         super.init()
 
-        setupSession()
-    }
-
-    // MARK: - Setup
-
-    private func setupSession() {
-        captureSession.beginConfiguration()
-
-        // Configure for high quality
-        if captureSession.canSetSessionPreset(.high) {
-            captureSession.sessionPreset = .high
+        let graph = graph, outputQueue = outputQueue
+        graph.queue.async { [self] in
+            graph.configure(delegate: self, callbackQueue: outputQueue)
         }
-
-        // Setup video output
-        videoOutput.videoSettings = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
-        ]
-        videoOutput.alwaysDiscardsLateVideoFrames = true
-        videoOutput.setSampleBufferDelegate(self, queue: outputQueue)
-
-        if captureSession.canAddOutput(videoOutput) {
-            captureSession.addOutput(videoOutput)
-        }
-
-        captureSession.commitConfiguration()
     }
 
     // MARK: - Public Methods
 
-    /// Starts screen capture for the specified display (or main display if nil)
+    /// Starts screen capture for the specified display (or main display if nil), replacing
+    /// any display already being captured.
+    ///
+    /// Returns once the request is queued; the session is reconfigured and started on the
+    /// session queue, after any earlier start or stop. Throws
+    /// `RecorderError.screenCaptureUnavailable` when the display can't be captured.
     public func startCapture(displayID: CGDirectDisplayID? = nil) throws {
         #if os(macOS)
-        let targetDisplay = displayID ?? CGMainDisplayID()
-
-        // Create screen input
-        guard let input = AVCaptureScreenInput(displayID: targetDisplay) else {
-            throw RecorderError.screenCaptureUnavailable
-        }
-
-        input.minFrameDuration = CMTime(value: 1, timescale: 30) // 30 fps
-        input.capturesCursor = true
-        input.capturesMouseClicks = false
-
-        activeCapture.withLock { $0 = nil }
-        captureSession.beginConfiguration()
-
-        // Remove existing input if any
-        if let existingInput = screenInput {
-            captureSession.removeInput(existingInput)
-            screenInput = nil
-        }
-
-        // Add new input
-        if captureSession.canAddInput(input) {
-            captureSession.addInput(input)
-            screenInput = input
-        } else {
-            captureSession.commitConfiguration()
-            throw RecorderError.cannotAddInput
-        }
-
-        captureSession.commitConfiguration()
-        activeCapture.withLock { $0 = ActiveCapture(input: ObjectIdentifier(input)) }
-
-        // Reset first frame tracking
-        hasDeliveredFirstFrame = false
-
-        // Keep start, stop and configuration on the same actor, in caller order.
-        // Deferring only start/stop lets an earlier stop remove a replacement input.
-        captureSession.startRunning()
+        let request = try beginCapture(displayID: displayID)
+        enqueueStart(request)
         #else
         throw RecorderError.screenCaptureUnavailable
         #endif
@@ -124,8 +77,12 @@ public final class ScreenCaptureManager: NSObject, Sendable {
     /// This ensures the screen capture is actually producing frames before returning
     public func startCaptureAndWaitForFirstFrame(displayID: CGDirectDisplayID? = nil) async throws {
         #if os(macOS)
-        // Start capture
-        try startCapture(displayID: displayID)
+        let request = try beginCapture(displayID: displayID)
+
+        // Throw if the session can't take the input, rather than wait for a frame that won't come.
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+            enqueueStart(request) { continuation.resume(with: $0) }
+        }
 
         // Wait for first frame
         await withCheckedContinuation { continuation in
@@ -144,21 +101,72 @@ public final class ScreenCaptureManager: NSObject, Sendable {
         #endif
     }
 
-    /// Stops screen capture
+    /// Stops screen capture.
+    ///
+    /// Frames stop being delivered before this returns; the session is stopped and its input
+    /// removed on the session queue, after any earlier start.
     public func stopCapture() {
         activeCapture.withLock { $0 = nil }
-        captureSession.stopRunning()
-
-        captureSession.beginConfiguration()
-        if let input = screenInput {
-            captureSession.removeInput(input)
-            screenInput = nil
-        }
-        captureSession.commitConfiguration()
+        let graph = graph
+        graph.queue.async { graph.stop() }
 
         // Reset state
         hasDeliveredFirstFrame = false
         firstFrameContinuation = nil
+    }
+
+    /// Returns once every session change requested before the call has run on the session queue.
+    func waitForSessionQueue() async {
+        let queue = graph.queue
+        await withCheckedContinuation { continuation in
+            queue.async { continuation.resume() }
+        }
+    }
+
+    // MARK: - Capture Requests
+
+    private struct StartRequest: @unchecked Sendable {
+        /// Created and configured on the caller's thread, then used only on the session queue.
+        let input: AVCaptureScreenInput
+        let captureID: UUID
+    }
+
+    /// Creates the input for `displayID` and routes frames to it from now on. Until the session
+    /// queue attaches it, no frame belongs to it, so frames of the input it replaces are dropped.
+    private func beginCapture(displayID: CGDirectDisplayID?) throws -> StartRequest {
+        guard let input = AVCaptureScreenInput(displayID: displayID ?? CGMainDisplayID()) else {
+            throw RecorderError.screenCaptureUnavailable
+        }
+
+        input.minFrameDuration = CMTime(value: 1, timescale: 30) // 30 fps
+        input.capturesCursor = true
+        input.capturesMouseClicks = false
+
+        let capture = ActiveCapture(input: ObjectIdentifier(input))
+        activeCapture.withLock { $0 = capture }
+
+        // Reset first frame tracking
+        hasDeliveredFirstFrame = false
+        return StartRequest(input: input, captureID: capture.id)
+    }
+
+    /// Attaches the request's input and starts the session on the session queue. If the session
+    /// can't take the input, frames stay unrouted until the next start.
+    private func enqueueStart(
+        _ request: StartRequest,
+        completion: @escaping @Sendable (Result<Void, any Error>) -> Void = { _ in }
+    ) {
+        let graph = graph, activeCapture = activeCapture
+        graph.queue.async {
+            do {
+                try graph.start(with: request.input)
+                completion(.success(()))
+            } catch {
+                activeCapture.withLock { if $0?.id == request.captureID { $0 = nil } }
+                print("🖥️ [ScreenCaptureManager] Screen capture couldn't start: \(error)")
+                completion(.failure(error))
+            }
+        }
     }
 
     /// Returns available screens with display IDs
@@ -216,6 +224,85 @@ extension ScreenCaptureManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         Task { @MainActor [weak self] in
             self?.signalFirstFrame(captureID: captureID)
         }
+    }
+}
+
+// MARK: - Capture Graph
+
+/// The capture session, its video output and its screen input. Every member is used only on
+/// `queue`: a serial queue that applies configuration, `startRunning` and `stopRunning` in the
+/// order they were enqueued, so a stop can't remove the input of a start requested after it.
+private final class CaptureGraph: @unchecked Sendable {
+    let queue = DispatchQueue(label: "com.arkavo.screencapture.session", qos: .userInitiated)
+
+    private let session: AVCaptureSession
+    private let videoOutput = AVCaptureVideoDataOutput()
+    private var screenInput: AVCaptureScreenInput?
+
+    init(session: AVCaptureSession) {
+        self.session = session
+    }
+
+    func configure(
+        delegate: any AVCaptureVideoDataOutputSampleBufferDelegate,
+        callbackQueue: DispatchQueue
+    ) {
+        dispatchPrecondition(condition: .onQueue(queue))
+        session.beginConfiguration()
+
+        // Configure for high quality
+        if session.canSetSessionPreset(.high) {
+            session.sessionPreset = .high
+        }
+
+        // Setup video output
+        videoOutput.videoSettings = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+        ]
+        videoOutput.alwaysDiscardsLateVideoFrames = true
+        videoOutput.setSampleBufferDelegate(delegate, queue: callbackQueue)
+
+        if session.canAddOutput(videoOutput) {
+            session.addOutput(videoOutput)
+        }
+
+        session.commitConfiguration()
+    }
+
+    /// Replaces any attached input with `input`, then starts the session (blocking).
+    func start(with input: AVCaptureScreenInput) throws {
+        dispatchPrecondition(condition: .onQueue(queue))
+        session.beginConfiguration()
+
+        // Remove existing input if any
+        if let existingInput = screenInput {
+            session.removeInput(existingInput)
+            screenInput = nil
+        }
+
+        // Add new input
+        guard session.canAddInput(input) else {
+            session.commitConfiguration()
+            throw RecorderError.cannotAddInput
+        }
+        session.addInput(input)
+        screenInput = input
+
+        session.commitConfiguration()
+        session.startRunning()
+    }
+
+    /// Stops the session (blocking), then removes its input.
+    func stop() {
+        dispatchPrecondition(condition: .onQueue(queue))
+        session.stopRunning()
+
+        session.beginConfiguration()
+        if let input = screenInput {
+            session.removeInput(input)
+            screenInput = nil
+        }
+        session.commitConfiguration()
     }
 }
 

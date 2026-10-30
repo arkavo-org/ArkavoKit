@@ -29,6 +29,7 @@ struct ComposedPreviewTests {
             session.stopScreenPreview()
         }
         try session.startScreenPreview()
+        await capture.waitForSessionQueue()
         let output = try #require(captureSession.outputs.first)
         let oldConnection = try #require(output.connection(with: .video))
         let oldPixel = try #require(createTestPixelBuffer(width: 1920, height: 1080, red: 255, green: 0, blue: 0))
@@ -36,6 +37,7 @@ struct ComposedPreviewTests {
         capture.captureOutput(output, didOutput: oldFrame, from: oldConnection)
         // Replace the source before the queued frame's async composition can run.
         try session.startScreenPreview()
+        await capture.waitForSessionQueue()
         let newConnection = try #require(output.connection(with: .video))
         let newPixel = try #require(createTestPixelBuffer(width: 1920, height: 1080, red: 255, green: 255, blue: 0))
         let newFrame = try #require(createTestSampleBuffer(from: newPixel))
