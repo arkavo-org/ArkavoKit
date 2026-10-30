@@ -101,8 +101,13 @@ public actor VideoEncoder {
     private var ntdfStreamingManager: NTDFStreamingManager?
     private var isNTDFStreaming: Bool = false
 
+    /// Tests: streaming with no RTMP destination (see `startStreamingForTesting(onEncodedVideo:)`)
+    private var streamsWithoutDestinationForTesting = false
+    /// Tests: awaited once `finishRecording()` has begun, before the file is finished
+    private var finishingHookForTesting: (@Sendable () async -> Void)?
+
     /// Whether any streaming (regular RTMP or NTDF) is active
-    private var isStreaming: Bool { !streamDestinations.isEmpty }
+    private var isStreaming: Bool { !streamDestinations.isEmpty || streamsWithoutDestinationForTesting }
     public var isStreamingActive: Bool { isStreaming || isNTDFStreaming }
 
     private var videoFormatDescription: CMFormatDescription?
@@ -343,6 +348,7 @@ public actor VideoEncoder {
         isRecording = false
         isFinishing = true
         defer { isFinishing = false }
+        if let finishingHookForTesting { await finishingHookForTesting() }
 
         print("📊 Media appended: \(appendedMedia), Asset writer status: \(assetWriter.status.rawValue)")
         if droppedMedia.video.total + droppedMedia.audio.total > 0 {
@@ -999,6 +1005,7 @@ public actor VideoEncoder {
             print("📡 [\(id)] Disconnected")
         }
         streamDestinations.removeAll()
+        streamsWithoutDestinationForTesting = false
 
         streamVideoEncoder?.stop()
         streamAudioEncoder = nil
@@ -1006,6 +1013,27 @@ public actor VideoEncoder {
         streamStartTime = nil
 
         print("✅ RTMP stream stopped")
+    }
+
+    // MARK: - Test Seams
+
+    /// Tests: streams without an RTMP destination. Frames take the stream path through the
+    /// stream's own video encoder, whose output reaches `onEncodedVideo` as it reaches each
+    /// destination's send task. `stopStreaming()` ends it.
+    func startStreamingForTesting(onEncodedVideo: @escaping @Sendable (EncodedVideoFrame) -> Void) throws {
+        let videoEncoder = ArkavoMedia.VideoEncoder(quality: .auto)
+        try videoEncoder.start()
+        videoEncoder.onFrame = onEncodedVideo
+        streamVideoEncoder = videoEncoder
+        streamStartTime = startTime ?? CMClockGetTime(CMClockGetHostTimeClock())
+        streamsWithoutDestinationForTesting = true
+    }
+
+    /// Tests: `hook` is awaited once `finishRecording()` has begun, when the file takes no more
+    /// media, and before the file is finished. Media arriving meanwhile runs as it does while the
+    /// file is being finished.
+    func setFinishingHookForTesting(_ hook: (@Sendable () async -> Void)?) {
+        finishingHookForTesting = hook
     }
 
     /// Stop streaming to a single destination (others continue)

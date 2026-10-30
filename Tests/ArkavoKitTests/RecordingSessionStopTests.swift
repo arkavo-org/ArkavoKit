@@ -1,6 +1,7 @@
 import Testing
 import AVFoundation
 import Foundation
+import os
 @testable import ArkavoRecorder
 
 /// A stop that fails still ends the recording: the session must not keep reporting
@@ -67,6 +68,126 @@ struct RecordingSessionStopTests {
         #expect(try await Self.peakAudioSample(in: url) > 2000)
     }
 
+    @Test("Stream frames keep flowing while a recording stops, and none of them reaches the finished file")
+    func streamFramesKeepFlowingWhileARecordingStops() async throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("stream-continues-\(UUID().uuidString).mov")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        // From the moment the file stops taking frames, the avatar turns red.
+        let finishing = OSAllocatedUnfairLock(initialState: false)
+        let streamFrames = OSAllocatedUnfairLock(initialState: 0)
+        let streamFramesWhileFinishing = OSAllocatedUnfairLock<Int?>(initialState: nil)
+        let encoder = VideoEncoder()
+        await encoder.setFinishingHookForTesting {
+            finishing.withLock { $0 = true }
+            let before = streamFrames.withLock { $0 }
+            try? await Task.sleep(for: .seconds(1))
+            let after = streamFrames.withLock { $0 }
+            streamFramesWhileFinishing.withLock { $0 = after - before }
+        }
+        let session = try Self.avatarSession(encoder: encoder)
+        session.avatarTextureProvider = {
+            finishing.withLock { $0 }
+                ? createTestPixelBuffer(width: 1920, height: 1080, red: 255, green: 0, blue: 0)
+                : createTestPixelBuffer(width: 1920, height: 1080, red: 0, green: 255, blue: 0)
+        }
+        try await session.startRecording(outputURL: url, title: "stream continues")
+        try await session.startStreamingForTesting { _ in streamFrames.withLock { $0 += 1 } }
+        try await Self.waitUntil { streamFrames.withLock { $0 } >= 10 }
+
+        _ = try await session.stopRecording()
+        let atStop = streamFrames.withLock { $0 }
+        try await Self.waitUntil { streamFrames.withLock { $0 } >= atStop + 10 }
+        let afterStop = streamFrames.withLock { $0 } - atStop
+        await session.stopStreaming()
+
+        // About 30 frames at 30 fps while the file finished, and the stream went on after it. A
+        // stopped driver still shows a few: frames from before the stop leave the stream's encoder late.
+        let whileFinishing = try #require(streamFramesWhileFinishing.withLock { $0 })
+        #expect(whileFinishing >= 15)
+        #expect(afterStop >= 10)
+        let colors = try await Self.centerColors(in: url)
+        #expect(!colors.isEmpty)
+        #expect(colors.allSatisfy { $0.g > 150 && $0.r < 100 }, "a frame composed after finishing began reached the file")
+    }
+
+    @Test("A stream keeps the screen capture and audio feeding it when a recording stops")
+    func streamKeepsItsSourcesWhenARecordingStops() async throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("stream-sources-\(UUID().uuidString).mov")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let captureSession = NonCapturingSession()
+        let capture = ScreenCaptureManager(captureSession: captureSession)
+        let screenFrames = OSAllocatedUnfairLock(initialState: 0)
+        capture.onFrame = { _ in screenFrames.withLock { $0 += 1 } }
+        let session = try Self.avatarSession(screenCapture: capture)
+        let voice = FakeAudioSource(sourceID: "muse-voice")
+        session.addMuseAudioSource(voice)
+        try session.startScreenPreview()
+        await capture.waitForSessionQueue()
+        try await session.startRecording(outputURL: url, title: "stream sources")
+        try await session.startStreamingForTesting { _ in }
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(voice.isActive)
+
+        _ = try await session.stopRecording()
+
+        #expect(voice.isActive)
+        let output = try #require(captureSession.outputs.first)
+        let connection = try #require(output.connection(with: .video))
+        let pixel = try #require(createTestPixelBuffer(width: 16, height: 16, red: 255, green: 0, blue: 0))
+        capture.captureOutput(output, didOutput: try #require(createTestSampleBuffer(from: pixel)), from: connection)
+        #expect(screenFrames.withLock { $0 } == 1)
+        await session.stopStreaming()
+        session.stopScreenPreview()
+    }
+
+    /// Avatar mode, which needs no devices or permissions.
+    private static func avatarSession(
+        screenCapture: ScreenCaptureManager = ScreenCaptureManager(),
+        encoder: VideoEncoder = VideoEncoder()
+    ) throws -> RecordingSession {
+        let session = try RecordingSession(screenCapture: screenCapture, encoder: encoder)
+        session.enableDesktop = false
+        session.enableCamera = false
+        session.enableMicrophone = false
+        session.enableScreenAudio = false
+        session.enableAvatar = true
+        session.watermarkEnabled = false
+        session.avatarTextureProvider = { createTestPixelBuffer(width: 1920, height: 1080, red: 0, green: 255, blue: 0) }
+        return session
+    }
+
+    /// Polls `condition` for up to five seconds.
+    private static func waitUntil(_ condition: () -> Bool) async throws {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !condition() && .now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    /// The average color at the center of each video frame in the file.
+    private static func centerColors(in url: URL) async throws -> [(r: UInt8, g: UInt8, b: UInt8, a: UInt8)] {
+        let asset = AVURLAsset(url: url)
+        let track = try #require(try await asset.loadTracks(withMediaType: .video).first)
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+        ])
+        reader.add(output)
+        #expect(reader.startReading())
+        var colors: [(r: UInt8, g: UInt8, b: UInt8, a: UInt8)] = []
+        while let sample = output.copyNextSampleBuffer() {
+            guard let pixel = CMSampleBufferGetImageBuffer(sample) else { continue }
+            let width = CVPixelBufferGetWidth(pixel), height = CVPixelBufferGetHeight(pixel)
+            let center = CGRect(x: width / 2 - 20, y: height / 2 - 20, width: 40, height: 40)
+            if let color = getAverageColor(in: pixel, region: center) { colors.append(color) }
+        }
+        return colors
+    }
+
     /// A 1 kHz tone (silence at amplitude 0) stamped with the host clock, as capture sources are.
     private static func tone(frames: Int, amplitude: Double) -> CMSampleBuffer {
         AudioMixerTests.buffer(frames: frames, pts: CMClockGetTime(CMClockGetHostTimeClock())) { frame in
@@ -99,4 +220,10 @@ struct RecordingSessionStopTests {
         }
         return peak
     }
+}
+
+/// Takes real inputs and outputs but captures nothing.
+private final class NonCapturingSession: AVCaptureSession, @unchecked Sendable {
+    override func startRunning() {}
+    override func stopRunning() {}
 }

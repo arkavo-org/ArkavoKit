@@ -4,6 +4,7 @@ import os
 
 #if os(macOS)
 @preconcurrency import AVFoundation
+import ArkavoMedia
 import ArkavoStreaming
 import CoreImage
 import VideoToolbox
@@ -305,13 +306,13 @@ public final class RecordingSession: Sendable {
         try self.init(screenCapture: ScreenCaptureManager())
     }
 
-    init(screenCapture: ScreenCaptureManager) throws {
+    init(screenCapture: ScreenCaptureManager, encoder: VideoEncoder = VideoEncoder()) throws {
         self.screenCapture = screenCapture
         self.cameraCaptures = [:]
         self.audioRouter = AudioRouter()
         self.audioMixer = AudioMixer(voiceSourceID: "muse-voice")
         self.compositor = try CompositorManager()
-        self.encoder = VideoEncoder()
+        self.encoder = encoder
 
         setupCapture()
         screenCapture.onCaptureError = { [weak self] error in self?.screenCaptureFailureHandler?(error) }
@@ -517,21 +518,24 @@ public final class RecordingSession: Sendable {
         }
     }
 
-    /// Stops the current recording session
+    /// Stops the current recording session.
+    ///
+    /// While a stream is live, only the file finishes: the frame driver, the screen, the cameras
+    /// and the audio keep feeding the stream as before. Frames and audio that arrive while the
+    /// file is being finished go to the stream only; the encoder takes nothing more into the file
+    /// once finishing has begun.
     public func stopRecording() async throws -> URL {
-        // Stop frame driver if running
-        stopCameraFrameDriver()
-
-        // Stop captures
-        screenCapture.stopCapture()
-        stopCameraCaptures()
-
-        // Stop all audio sources
-        try? await audioRouter.stopAll()
+        if !_streamingActive.withLock({ $0 }) {
+            stopCameraFrameDriver()
+            screenCapture.stopCapture()
+            stopCameraCaptures()
+            try? await audioRouter.stopAll()
+        }
         if !_streamingActive.withLock({ $0 }) {
             // Nothing arrives now. Emit what the mixer still holds (a sound shorter than its
             // prefill, a source's buffered tail) and let it reach the encoder before the file
-            // closes. A stream that continues keeps the mixer running instead.
+            // closes. A stream that continues keeps the mixer running instead, including one
+            // that started while the sources were stopping.
             audioMixer.drain()
             await mixedAudioDelivery.waitUntilDelivered()
             resetAudioMixer()
@@ -970,6 +974,16 @@ public final class RecordingSession: Sendable {
         try await encoder.startNTDFStreaming(kasURL: kasURL, rtmpURL: rtmpURL, streamKey: streamKey)
         _streamingActive.withLock { $0 = true }
         // Start frame generation if not already recording
+        if !_isRecording {
+            startStreamingFrameGeneration()
+        }
+    }
+
+    /// Tests: `startStreaming(to:streamKey:)` without RTMP. The encoder's stream output goes to
+    /// `onEncodedVideo` instead of a destination; `stopStreaming()` ends it.
+    func startStreamingForTesting(onEncodedVideo: @escaping @Sendable (EncodedVideoFrame) -> Void) async throws {
+        try await encoder.startStreamingForTesting(onEncodedVideo: onEncodedVideo)
+        _streamingActive.withLock { $0 = true }
         if !_isRecording {
             startStreamingFrameGeneration()
         }
