@@ -39,7 +39,8 @@ public final class CompositorManager: Sendable {
 
     /// Where the avatar and Muse slot layers go. Each value is written under one lock and a frame
     /// snapshots all four once, so a rect never tears mid-composite. Each setter writes one value,
-    /// so a frame composed between two writes can pair a slot set this turn with the rect before it.
+    /// so a frame composed between two writes can pair a slot set this turn with the rect before it;
+    /// `setLayerPlacement` writes all four at once.
     private struct LayerPlacement: Sendable {
         var avatarSlot = AvatarSlot(slot: CGRect(x: 0.71, y: 0.38, width: 0.28, height: 0.62), anchor: .bottomRight)
         var avatarVisibleRect = AvatarSlotLayout.fullTexture
@@ -73,6 +74,16 @@ public final class CompositorManager: Sendable {
     public var museVisibleRect: CGRect {
         get { layerPlacement.withLock { $0.museVisibleRect } }
         set { layerPlacement.withLock { $0.museVisibleRect = newValue } }
+    }
+
+    /// Swaps both slots and both visible rects in one step, so no frame pairs a new slot with an old rect.
+    public func setLayerPlacement(
+        avatarSlot: AvatarSlot, avatarVisibleRect: CGRect, museSlot: AvatarSlot, museVisibleRect: CGRect
+    ) {
+        let placement = LayerPlacement(
+            avatarSlot: avatarSlot, avatarVisibleRect: avatarVisibleRect,
+            museSlot: museSlot, museVisibleRect: museVisibleRect)
+        layerPlacement.withLock { $0 = placement }
     }
 
     // Watermark configuration

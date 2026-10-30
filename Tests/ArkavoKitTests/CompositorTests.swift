@@ -884,6 +884,19 @@ struct CompositorTests {
         try expectGreen(out, 1260, 520)
     }
 
+    @Test("setLayerPlacement sets both slots and both visible rects in one step")
+    func setLayerPlacementSetsAllFour() throws {
+        let compositor = try CompositorManager()
+        let museRect = CGRect(x: 0.2, y: 0.05, width: 0.6, height: 0.9)
+        compositor.setLayerPlacement(
+            avatarSlot: Self.gameplayLeft, avatarVisibleRect: Self.body,
+            museSlot: Self.gameplayRight, museVisibleRect: museRect)
+        #expect(compositor.avatarSlot == Self.gameplayLeft)
+        #expect(compositor.avatarVisibleRect == Self.body)
+        #expect(compositor.museSlot == Self.gameplayRight)
+        #expect(compositor.museVisibleRect == museRect)
+    }
+
     @Test("pipPosition moves only the camera")
     func pipPositionMovesOnlyTheCamera() throws {
         let compositor = try CompositorManager()

@@ -203,6 +203,16 @@ public final class RecordingSession: Sendable {
         set { compositor.museVisibleRect = newValue }
     }
 
+    /// Swaps both slots and both visible rects in one step, so no frame pairs a new slot with an old
+    /// rect (`CompositorManager.setLayerPlacement`).
+    public func setLayerPlacement(
+        avatarSlot: AvatarSlot, avatarVisibleRect: CGRect, museSlot: AvatarSlot, museVisibleRect: CGRect
+    ) {
+        compositor.setLayerPlacement(
+            avatarSlot: avatarSlot, avatarVisibleRect: avatarVisibleRect,
+            museSlot: museSlot, museVisibleRect: museVisibleRect)
+    }
+
     public var watermarkEnabled: Bool {
         get { compositor.watermarkEnabled }
         set { compositor.watermarkEnabled = newValue }

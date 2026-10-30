@@ -240,6 +240,21 @@ struct ComposedPreviewTests {
         #expect(first.muse.g > 200 && first.muse.b < 60)
     }
 
+    @Test("The session forwards a one-step placement to the compositor")
+    func sessionForwardsTheOneStepPlacement() throws {
+        let session = try Self.avatarSession()
+        let artRight = AvatarSlot(slot: CGRect(x: 0.78, y: 0.42, width: 0.20, height: 0.46), anchor: .bottomRight)
+        let conversation = AvatarSlot(slot: CGRect(x: 0.22, y: 0.08, width: 0.56, height: 0.92), anchor: .bottomCenter)
+        let body = CGRect(x: 0.3425, y: 0.1, width: 0.315, height: 0.8)
+        let museRect = CGRect(x: 0.2, y: 0.05, width: 0.6, height: 0.9)
+        session.setLayerPlacement(
+            avatarSlot: artRight, avatarVisibleRect: body, museSlot: conversation, museVisibleRect: museRect)
+        #expect(session.avatarSlot == artRight)
+        #expect(session.avatarVisibleRect == body)
+        #expect(session.museSlot == conversation)
+        #expect(session.museVisibleRect == museRect)
+    }
+
     private static func avatarSession() throws -> RecordingSession {
         let session = try RecordingSession()
         session.enableDesktop = false
