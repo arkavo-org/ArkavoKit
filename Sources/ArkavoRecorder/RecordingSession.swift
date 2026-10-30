@@ -63,6 +63,29 @@ public enum RecordingInputMode: String, Sendable, CaseIterable, Identifiable {
     }
 }
 
+/// Runs async work one item after another, in the order it was enqueued, and can wait until
+/// everything enqueued so far has run.
+private final class OrderedDelivery: @unchecked Sendable {
+    private let lock = NSLock()
+    private var last: Task<Void, Never>?
+
+    func enqueue(_ work: sending @escaping () async -> Void) {
+        lock.lock()
+        let previous = last
+        last = Task {
+            await previous?.value
+            await work()
+        }
+        lock.unlock()
+    }
+
+    /// Returns once every item enqueued before the call has run.
+    func waitUntilDelivered() async {
+        let last = lock.withLock { self.last }
+        await last?.value
+    }
+}
+
 /// Coordinates screen, camera, and audio capture with composition and encoding
 @MainActor
 public final class RecordingSession: Sendable {
@@ -78,6 +101,9 @@ public final class RecordingSession: Sendable {
     public private(set) var remoteCameraServer: RemoteCameraServer?
     nonisolated(unsafe) private let audioRouter: AudioRouter
     nonisolated(unsafe) private let audioMixer: AudioMixer
+    /// Hands the mix to the encoder in mix order, so stopping can wait until all of it,
+    /// the drained tail included, has reached the encoder.
+    nonisolated private let mixedAudioDelivery = OrderedDelivery()
     nonisolated(unsafe) private let compositor: CompositorManager
     nonisolated(unsafe) private let encoder: VideoEncoder
 
@@ -315,7 +341,7 @@ public final class RecordingSession: Sendable {
 
         // Wire mixer output to encoder
         audioMixer.onMixedSample = { @Sendable [weak self] mixedSample in
-            Task {
+            self?.mixedAudioDelivery.enqueue { [weak self] in
                 await self?.processAudioSampleSync(mixedSample, sourceID: AudioMixer.outputSourceID)
             }
         }
@@ -502,7 +528,14 @@ public final class RecordingSession: Sendable {
 
         // Stop all audio sources
         try? await audioRouter.stopAll()
-        if !_streamingActive.withLock({ $0 }) { resetAudioMixer() }
+        if !_streamingActive.withLock({ $0 }) {
+            // Nothing arrives now. Emit what the mixer still holds (a sound shorter than its
+            // prefill, a source's buffered tail) and let it reach the encoder before the file
+            // closes. A stream that continues keeps the mixer running instead.
+            audioMixer.drain()
+            await mixedAudioDelivery.waitUntilDelivered()
+            resetAudioMixer()
+        }
 
         // The recording is over even when finishing the file fails
         defer {

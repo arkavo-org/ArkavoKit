@@ -8,6 +8,12 @@ import CoreMedia
 struct AudioMixerTests {
     /// 48 kHz stereo Int16 interleaved buffer filled with `value`, `frames` long, PTS `pts`.
     static func buffer(frames: Int, value: Int16, pts: CMTime) -> CMSampleBuffer {
+        buffer(frames: frames, pts: pts) { _ in value }
+    }
+
+    /// 48 kHz stereo Int16 interleaved buffer, `frames` long, PTS `pts`; both channels of frame
+    /// `i` hold `sample(i)`.
+    static func buffer(frames: Int, pts: CMTime, sample: (Int) -> Int16) -> CMSampleBuffer {
         var asbd = AudioStreamBasicDescription(mSampleRate: 48000, mFormatID: kAudioFormatLinearPCM,
             mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
             mBytesPerPacket: 4, mFramesPerPacket: 1, mBytesPerFrame: 4, mChannelsPerFrame: 2,
@@ -15,7 +21,7 @@ struct AudioMixerTests {
         var desc: CMAudioFormatDescription?
         CMAudioFormatDescriptionCreate(allocator: nil, asbd: &asbd, layoutSize: 0, layout: nil,
                                        magicCookieSize: 0, magicCookie: nil, extensions: nil, formatDescriptionOut: &desc)
-        var samples = [Int16](repeating: value, count: frames * 2)
+        var samples = (0..<frames).flatMap { frame in [sample(frame), sample(frame)] }
         let length = samples.count * 2
         var block: CMBlockBuffer?
         CMBlockBufferCreateWithMemoryBlock(allocator: nil, memoryBlock: nil, blockLength: length, blockAllocator: nil,
@@ -197,6 +203,78 @@ struct AudioMixerTests {
         mixer.addSample(Self.buffer(frames: 960, value: 100, pts: .zero), from: "microphone")
         #expect(out.count == 2)
         #expect(Self.samples(out[1]).first == 100)   // not 600: the voice's old queue is gone
+    }
+
+    @Test("Draining at the end emits a sound still short of the prefill right after the last clock buffer")
+    func drainEmitsAnUnprimedRemainder() {
+        let mixer = AudioMixer(voiceSourceID: "muse-voice")
+        mixer.setClockSource("microphone")
+        var out: [CMSampleBuffer] = []
+        mixer.onMixedSample = { out.append($0) }
+        mixer.addSample(Self.buffer(frames: 1024, value: 0, pts: .zero), from: "microphone")
+        mixer.addSample(Self.buffer(frames: 960, value: 1000, pts: .zero), from: "muse-voice")   // 20 ms, below the prefill
+        mixer.addSample(Self.buffer(frames: 1024, value: 0, pts: CMTime(value: 1024, timescale: 48000)), from: "microphone")
+        #expect(out.count == 2)
+        #expect(Self.samples(out[1]).allSatisfy { $0 == 0 })   // still building its lead
+
+        mixer.drain()
+        #expect(out.count == 3)
+        guard out.count == 3 else { return }
+        #expect(CMSampleBufferGetPresentationTimeStamp(out[2]) == CMTime(value: 2048, timescale: 48000))
+        #expect(CMSampleBufferGetNumSamples(out[2]) == 960)
+        #expect(Self.samples(out[2]).allSatisfy { $0 == 1000 })
+        mixer.drain()
+        #expect(out.count == 3)   // the drain emptied the queue
+    }
+
+    @Test("Draining at the end emits a continuous source's buffered tail, continuing the clock's timeline")
+    func drainEmitsAPrimedTail() {
+        let mixer = AudioMixer()
+        mixer.setClockSource("microphone")
+        var out: [CMSampleBuffer] = []
+        mixer.onMixedSample = { out.append($0) }
+        // Desktop audio in 960-frame chunks, paced in real time against the 1024-frame clock,
+        // which stops while the source still holds its lead.
+        let chunks = 20
+        var delivered = 0
+        var tick = 1024
+        while tick <= chunks * 960 {
+            while delivered < chunks, delivered * 960 <= tick {
+                mixer.addSample(Self.buffer(frames: 960, value: 500, pts: .zero), from: "screen")
+                delivered += 1
+            }
+            mixer.addSample(Self.buffer(frames: 1024, value: 0, pts: CMTime(value: CMTimeValue(tick - 1024), timescale: 48000)),
+                            from: "microphone")
+            tick += 1024
+        }
+        let clockBuffers = out.count
+        #expect(out.contains { Self.samples($0).contains(500) })   // it had built its lead and was playing
+
+        mixer.drain()
+        let drained = out[clockBuffers...]
+        #expect(drained.count >= 2)
+        // The drain starts where the last clock buffer ended, with no gap or overlap after that.
+        var expected = CMTime(value: CMTimeValue(clockBuffers * 1024), timescale: 48000)
+        for buffer in drained {
+            #expect(CMSampleBufferGetPresentationTimeStamp(buffer) == expected)
+            expected = expected + CMTime(value: CMTimeValue(CMSampleBufferGetNumSamples(buffer)), timescale: 48000)
+        }
+        // Every queued sample came out once, as one unbroken sound.
+        #expect(Self.soundRuns(out.flatMap { Self.samples($0) }) == [chunks * 960 * 2])
+    }
+
+    @Test("Draining before the clock ever delivered emits nothing and drops the queues")
+    func drainWithoutAClockEmitsNothing() {
+        let mixer = AudioMixer(voiceSourceID: "muse-voice", prefillSeconds: 0)
+        mixer.registerSource("microphone")
+        var out: [CMSampleBuffer] = []
+        mixer.onMixedSample = { out.append($0) }
+        mixer.addSample(Self.buffer(frames: 960, value: 1000, pts: .zero), from: "muse-voice")   // queued: the mic is registered
+        mixer.drain()
+        #expect(out.isEmpty)   // no clock buffer, so no timeline to continue
+        mixer.addSample(Self.buffer(frames: 960, value: 0, pts: .zero), from: "microphone")
+        #expect(out.count == 1)
+        #expect(Self.samples(out[0]).allSatisfy { $0 == 0 })   // the dropped voice doesn't play later
     }
 
     @Test("reset() clears queued audio and the clock")

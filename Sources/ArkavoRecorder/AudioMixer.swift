@@ -33,6 +33,9 @@ public final class AudioMixer: @unchecked Sendable {
     private var primed: Set<String> = []
     /// Clock frames drained since an unprimed source's oldest queued sample arrived.
     private var framesWaited: [String: Int] = [:]
+    /// Where the mix's timeline ends: the last clock buffer's PTS plus its duration, its format
+    /// and its length in samples. `drain()` continues from here.
+    private var lastClock: (end: CMTime, format: CMFormatDescription, samples: Int)?
 
     /// The source whose activity ducks the others (the Muse voice). nil = no ducking.
     public let voiceSourceID: String?
@@ -144,6 +147,8 @@ public final class AudioMixer: @unchecked Sendable {
         // Drain every other FIFO by the clock's frame count, once it has built its lead.
         let frameSamples = incoming.count
         let clockFrames = frameSamples / Int(channels)
+        let clockPTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        lastClock = (CMTimeAdd(clockPTS, frameDuration(clockFrames)), formatDesc, frameSamples)
         let prefillFrames = Int((sampleRate * prefillSeconds).rounded())
         let prefillSamples = prefillFrames * Int(channels)
         var contributions: [(id: String, samples: [Int16])] = []
@@ -179,20 +184,72 @@ public final class AudioMixer: @unchecked Sendable {
         let gains = sourceGains
         lock.unlock()
 
-        var mixed = [Float](repeating: 0, count: frameSamples)
-        func add(_ id: String, _ src: [Int16]) {
-            let duck: Float = (ducking && id != voiceSourceID) ? voiceDuckAmount : 1.0
-            let g = (gains[id] ?? 1.0) * duck
-            for (i, v) in src.enumerated() { mixed[i] += Float(v) * g }
-        }
-        add(sourceID, incoming)
-        for c in contributions { add(c.id, c.samples) }
-
-        let out = mixed.map { Int16(max(-32768, min(32767, $0))) }
-        if let sb = Self.makeBuffer(out, frames: frameSamples / Int(channels), format: formatDesc,
-                                    pts: CMSampleBufferGetPresentationTimeStamp(sampleBuffer)) {
+        let out = mix([(id: sourceID, samples: incoming)] + contributions, length: frameSamples,
+                      gains: gains, ducking: ducking)
+        if let sb = Self.makeBuffer(out, frames: clockFrames, format: formatDesc, pts: clockPTS) {
             onMixedSample?(sb)
         }
+    }
+
+    /// Ends the mix: emits every non-clock source's queued audio, whether or not it has built its
+    /// lead, through `onMixedSample`, then drops the queues. The buffers are the clock's length
+    /// (the last one shorter) and continue its timeline from the end of its last buffer, so they
+    /// never overlap it. Call once the sources have stopped and nothing else arrives:
+    /// RecordingSession does before it finishes a recording. Emits nothing if the clock never
+    /// delivered, as there is no timeline to continue.
+    public func drain() {
+        lock.lock()
+        let queued = fifos.filter { $0.key != clockSourceID && !$0.value.isEmpty }
+        fifos.removeAll()
+        primed.removeAll()
+        framesWaited.removeAll()
+        guard let clock = lastClock, clock.samples > 0, !queued.isEmpty else {
+            lock.unlock()
+            return
+        }
+        let gains = sourceGains
+        let voiceRecent = CACurrentMediaTime() - lastVoiceActivity <= voiceDuckHangover
+        let longest = queued.values.map(\.count).max() ?? 0
+        var pts = clock.end
+        var tail: [(samples: [Int16], pts: CMTime)] = []
+        for offset in stride(from: 0, to: longest, by: clock.samples) {
+            let contributions = queued.compactMap { entry -> (id: String, samples: [Int16])? in
+                let (id, fifo) = entry
+                guard fifo.count > offset else { return nil }
+                return (id, Array(fifo[offset..<min(offset + clock.samples, fifo.count)]))
+            }
+            let length = contributions.map(\.samples.count).max() ?? 0
+            let voicePlays = contributions.contains { $0.id == voiceSourceID }
+            let ducking = voiceSourceID != nil && (voicePlays || voiceRecent)
+            tail.append((mix(contributions, length: length, gains: gains, ducking: ducking), pts))
+            pts = CMTimeAdd(pts, frameDuration(length / Int(channels)))
+        }
+        lastClock?.end = pts
+        lock.unlock()
+
+        for chunk in tail {
+            if let sb = Self.makeBuffer(chunk.samples, frames: chunk.samples.count / Int(channels),
+                                        format: clock.format, pts: chunk.pts) {
+                onMixedSample?(sb)
+            }
+        }
+    }
+
+    /// Sums `sources` sample by sample into `length` interleaved samples, applying each source's
+    /// gain, and the voice duck to every source but the voice while `ducking`.
+    private func mix(_ sources: [(id: String, samples: [Int16])], length: Int,
+                     gains: [String: Float], ducking: Bool) -> [Int16] {
+        var mixed = [Float](repeating: 0, count: length)
+        for source in sources {
+            let duck: Float = (ducking && source.id != voiceSourceID) ? voiceDuckAmount : 1.0
+            let g = (gains[source.id] ?? 1.0) * duck
+            for (i, v) in source.samples.enumerated() { mixed[i] += Float(v) * g }
+        }
+        return mixed.map { Int16(max(-32768, min(32767, $0))) }
+    }
+
+    private func frameDuration(_ frames: Int) -> CMTime {
+        CMTime(value: CMTimeValue(frames), timescale: CMTimeScale(sampleRate))
     }
 
     /// Drops a source's queued audio (e.g. the voice was cut).
@@ -205,6 +262,7 @@ public final class AudioMixer: @unchecked Sendable {
         fifos.removeAll()
         primed.removeAll()
         framesWaited.removeAll()
+        lastClock = nil
         clockSourceID = nil
         lastVoiceActivity = -.infinity
         lock.unlock()
