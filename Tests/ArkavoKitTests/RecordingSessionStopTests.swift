@@ -7,8 +7,11 @@ import os
 /// A stop that fails still ends the recording: the session must not keep reporting
 /// that it is recording and routing frames to a finished encoder.
 ///
-/// Serialized: each session composes 1080p frames at 30 fps, and several at once can starve the
-/// tests' own tasks.
+/// Serialized: each test opens real hardware encoder sessions, an asset writer for the file and
+/// a compression session for the stream. Run side by side, they exceed what the media engine
+/// takes: encoding fails with `kVTSessionMalfunctionErr` (-17691), the writer with -11800, and the
+/// stream-frame waits starve. That is a limit of the hardware, not frame pile-up, which the
+/// 30 fps driver no longer allows (one frame in flight per session).
 @MainActor
 @Suite(.serialized)
 struct RecordingSessionStopTests {
