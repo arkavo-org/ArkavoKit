@@ -212,9 +212,6 @@ public final class CompositorManager: Sendable {
         let placement = layerPlacement.withLock { $0 }
 
         if let avatarBuffer = avatarTexture {
-            #if DEBUG
-            debugSampleAvatarBuffer(avatarBuffer)
-            #endif
             if let avatar = slotLayer(
                 avatarBuffer, slot: placement.avatarSlot, visibleRect: placement.avatarVisibleRect,
                 outputSize: outputSize) {
@@ -704,53 +701,6 @@ public final class CompositorManager: Sendable {
             )
         }
     }
-
-    // Debug logging throttle
-    private nonisolated(unsafe) static var lastAvatarDebugTime: Date?
-
-    #if DEBUG
-    private func debugSampleAvatarBuffer(_ buffer: CVPixelBuffer) {
-        // Throttle to once every 2 seconds
-        let now = Date()
-        if let last = Self.lastAvatarDebugTime, now.timeIntervalSince(last) < 2.0 {
-            return
-        }
-        Self.lastAvatarDebugTime = now
-
-        CVPixelBufferLockBaseAddress(buffer, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
-
-        guard let baseAddress = CVPixelBufferGetBaseAddress(buffer) else {
-            print("🎭 [Compositor] Avatar buffer has no base address")
-            return
-        }
-
-        let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
-        let width = CVPixelBufferGetWidth(buffer)
-        let height = CVPixelBufferGetHeight(buffer)
-        let ptr = baseAddress.assumingMemoryBound(to: UInt8.self)
-
-        // Sample center pixel
-        let cx = width / 2
-        let cy = height / 2
-        let centerOffset = cy * bytesPerRow + cx * 4
-        let centerB = ptr[centerOffset + 0]
-        let centerG = ptr[centerOffset + 1]
-        let centerR = ptr[centerOffset + 2]
-        let centerA = ptr[centerOffset + 3]
-
-        // Sample corner pixel (where avatar might not be)
-        let cornerOffset = 10 * bytesPerRow + 10 * 4
-        let cornerB = ptr[cornerOffset + 0]
-        let cornerG = ptr[cornerOffset + 1]
-        let cornerR = ptr[cornerOffset + 2]
-        let cornerA = ptr[cornerOffset + 3]
-
-        print("🎭 [Compositor] Avatar \(width)x\(height)")
-        print("   Center: r=\(centerR) g=\(centerG) b=\(centerB) a=\(centerA)")
-        print("   Corner: r=\(cornerR) g=\(cornerG) b=\(cornerB) a=\(cornerA)")
-    }
-    #endif
 
     private func multiCameraPosition(
         screenSize: CGSize,
