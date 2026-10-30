@@ -177,6 +177,27 @@ struct RecordingSessionStopTests {
         #expect(!(await live.screenIsCapturing()))
     }
 
+    @Test("Stopping a paused recording lets the stream's frames through again")
+    func stoppingAPausedRecordingResumesTheStream() async throws {
+        let url = Self.outputURL("paused-stop")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let streamFrames = OSAllocatedUnfairLock(initialState: 0)
+        let session = try Self.avatarSession()
+        try await session.startRecording(outputURL: url, title: "paused stop")
+        try await session.startStreamingForTesting { _ in streamFrames.withLock { $0 += 1 } }
+        try await Self.waitUntil { streamFrames.withLock { $0 } >= 10 }
+        session.pauseRecording()
+        try await Task.sleep(for: .milliseconds(300))   // the pause reaches the encoder
+
+        _ = try await session.stopRecording()
+        let atStop = streamFrames.withLock { $0 }
+        try await Self.waitUntil { streamFrames.withLock { $0 } >= atStop + 10 }
+        let afterStop = streamFrames.withLock { $0 } - atStop
+        await session.stopStreaming()
+
+        #expect(afterStop >= 10)
+    }
+
     private static func outputURL(_ name: String) -> URL {
         FileManager.default.temporaryDirectory.appendingPathComponent("\(name)-\(UUID().uuidString).mov")
     }

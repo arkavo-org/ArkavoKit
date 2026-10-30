@@ -348,6 +348,9 @@ public actor VideoEncoder {
         isRecording = false
         isFinishing = true
         defer { isFinishing = false }
+        // A pause belongs to the recording; a stream that continues takes media again.
+        isPaused = false
+        resumePending = false
         if let finishingHookForTesting { await finishingHookForTesting() }
 
         print("📊 Media appended: \(appendedMedia), Asset writer status: \(assetWriter.status.rawValue)")
