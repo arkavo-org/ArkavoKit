@@ -177,6 +177,65 @@ struct RecordingSessionStopTests {
         #expect(!(await live.screenIsCapturing()))
     }
 
+    @Test("A stream that starts while a recording's file finishes gets the screen capture and audio back")
+    func streamStartingWhileTheFileFinishesGetsItsSources() async throws {
+        let url = Self.outputURL("stream-starts-while-finishing")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let encoder = VideoEncoder()
+        let live = try SharedSources(encoder: encoder)
+        let session = live.session
+        session.enableAvatar = false
+        session.enableDesktop = true
+        try session.startScreenPreview()
+        let preview = await live.screenInput()
+        // The recording's start waits for the first frame of its own screen capture.
+        let start = Task { try await session.startRecording(outputURL: url, title: "finishing") }
+        let deadline = ContinuousClock.now + .seconds(5)
+        while await live.screenInput().map({ $0 === preview }) ?? true, .now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(await live.screenIsCapturing())   // the first frame
+        try await start.value
+        // The recording's stop has already stopped the sources when the stream starts.
+        await encoder.setFinishingHookForTesting { try? await session.startStreamingForTesting { _ in } }
+
+        _ = try? await session.stopRecording()
+        await encoder.setFinishingHookForTesting(nil)
+
+        try await Self.waitUntil { live.audio.isActive }
+        #expect(live.audio.isActive)
+        #expect(await live.screenIsCapturing())
+        await session.stopStreaming()
+        #expect(!live.audio.isActive)
+        #expect(!(await live.screenIsCapturing()))
+    }
+
+    @Test("A stream that starts while a stopped recording releases the sources gets them back")
+    func streamStartingWhileTheSourcesAreReleasedGetsThemBack() async throws {
+        let url = Self.outputURL("stream-starts-while-releasing")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let encoder = VideoEncoder()
+        let live = try SharedSources(encoder: encoder)
+        let session = live.session
+        // Stopping this source starts a new stream, once.
+        let startsAStream = StreamStartingAudioSource(sourceID: "stream-starter") {
+            try? await session.startStreamingForTesting { _ in }
+        }
+        session.addMuseAudioSource(startsAStream)
+        try await live.startRecordingAndStream(to: url)
+        // The stream ends while the file finishes, so the stop releases the sources after it.
+        await encoder.setFinishingHookForTesting { await session.stopStreaming() }
+
+        _ = try await session.stopRecording()
+        await encoder.setFinishingHookForTesting(nil)
+
+        #expect(startsAStream.startedAStream)
+        try await Self.waitUntil { live.audio.isActive }
+        #expect(live.audio.isActive)
+        await session.stopStreaming()
+        #expect(!live.audio.isActive)
+    }
+
     @Test("Stopping a paused recording lets the stream's frames through again")
     func stoppingAPausedRecordingResumesTheStream() async throws {
         let url = Self.outputURL("paused-stop")
@@ -632,6 +691,37 @@ private final class SlowStartingAudioSource: AudioSource, @unchecked Sendable {
 
     func stop() async throws {
         active.withLock { $0 = false }
+    }
+}
+
+/// An audio source whose first stop runs `onFirstStop` before it returns.
+private final class StreamStartingAudioSource: AudioSource, @unchecked Sendable {
+    let sourceID: String
+    let sourceName = "Stream starter"
+    let format = AudioFormat(sampleRate: 48000, channels: 2, bitDepth: 16, formatID: kAudioFormatLinearPCM)
+    var onSample: ((CMSampleBuffer) -> Void)?
+    private let onFirstStop: @Sendable () async -> Void
+    private let state = OSAllocatedUnfairLock(initialState: (active: false, stops: 0))
+
+    init(sourceID: String, onFirstStop: @escaping @Sendable () async -> Void) {
+        self.sourceID = sourceID
+        self.onFirstStop = onFirstStop
+    }
+
+    var isActive: Bool { state.withLock { $0.active } }
+    var startedAStream: Bool { state.withLock { $0.stops > 0 } }
+
+    func start() async throws {
+        state.withLock { $0.active = true }
+    }
+
+    func stop() async throws {
+        let first = state.withLock { state in
+            state.active = false
+            state.stops += 1
+            return state.stops == 1
+        }
+        if first { await onFirstStop() }
     }
 }
 

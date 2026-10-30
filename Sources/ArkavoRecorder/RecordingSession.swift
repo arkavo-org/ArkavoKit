@@ -609,11 +609,16 @@ public final class RecordingSession: Sendable {
     /// only the file finishes: they keep feeding the stream as before, until `stopStreaming()`
     /// stops them, or until the file is finished if the stream ends first. Frames and audio that
     /// arrive while the file is being finished go to the stream only; the encoder takes nothing
-    /// more into the file once finishing has begun.
+    /// more into the file once finishing has begun. A stream that starts while this stops the
+    /// sources, or while the file finishes, gets them back once the recording is over.
     public func stopRecording() async throws -> URL {
         let streamKeepsSources = _streamingActive.withLock { $0 }
+        // A stream that starts once this has stopped the sources finds the recording still
+        // running, so it neither starts them nor its frames: this does once the recording is over.
+        var stoppedSources = false
         if !streamKeepsSources {
             await stopSources()
+            stoppedSources = true
         }
         if !_streamingActive.withLock({ $0 }) {
             // Nothing arrives now. Emit what the mixer still holds (a sound shorter than its
@@ -631,6 +636,11 @@ public final class RecordingSession: Sendable {
             recordingStartTime = nil
             pauseStartTime = nil
             pausedDuration = .zero
+            // No await since the check: a stream that starts after it sees no recording and
+            // starts its sources and frames itself.
+            if stoppedSources && _streamingActive.withLock({ $0 }) {
+                restartSourcesForStream()
+            }
             inputsDidChange()
         }
 
@@ -645,12 +655,27 @@ public final class RecordingSession: Sendable {
         if streamKeepsSources && !_streamingActive.withLock({ $0 }) {
             await stopSources()
             resetAudioMixer()
+            stoppedSources = true
         }
         let result = try finished.get()
 
         print("🛑 [RecordingSession] Recording stopped")
 
         return result
+    }
+
+    /// Starts what a live stream needs after `stopSources()`: the screen capture in desktop
+    /// modes (a stream that starts by itself uses the running screen preview), then the frame
+    /// driver and the audio, as starting the stream does.
+    private func restartSourcesForStream() {
+        if inputMode.needsDesktop {
+            do {
+                try screenCapture.startCapture(displayID: selectedDisplayID)
+            } catch {
+                screenCaptureFailureHandler?(error)
+            }
+        }
+        startStreamingFrameGeneration()
     }
 
     /// Stops the frame driver and every capture: the screen, the cameras and the audio.
