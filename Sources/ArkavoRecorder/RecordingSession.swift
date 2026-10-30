@@ -612,7 +612,8 @@ public final class RecordingSession: Sendable {
 
     private nonisolated func processFrameSync(screen screenBuffer: CMSampleBuffer, captureID: UUID, monitorHandler: MonitorHandler?) async {
         guard let delivery = beginFrameDelivery(handler: monitorHandler) else { return }
-        defer { finishFrameDelivery(delivery) }
+        var delivered = false
+        defer { finishFrameDelivery(delivery, delivered: delivered) }
 
         let mode = await MainActor.run { self.inputMode }
 
@@ -655,6 +656,7 @@ public final class RecordingSession: Sendable {
 
         guard screenCapture.isCurrentCapture(captureID), isCurrent(delivery) else { return }
         delivery.handler?(composited, timestamp)
+        delivered = true
 
         if delivery.previewGeneration == nil {
             await encoder.encodeVideoFrame(composited, timestamp: timestamp)
@@ -665,7 +667,8 @@ public final class RecordingSession: Sendable {
     private nonisolated func processCameraOrAvatarFrame() async {
         let monitorHandler = monitorFrameHandler
         guard let delivery = beginFrameDelivery(handler: monitorHandler) else { return }
-        defer { finishFrameDelivery(delivery) }
+        var delivered = false
+        defer { finishFrameDelivery(delivery, delivered: delivered) }
 
         let mode = await MainActor.run { self.inputMode }
         let canvasSize = standardCanvasSize
@@ -712,6 +715,7 @@ public final class RecordingSession: Sendable {
 
         guard isCurrent(delivery) else { return }
         delivery.handler?(output, timestamp)
+        delivered = true
 
         if delivery.previewGeneration == nil {
             await encoder.encodeVideoFrame(output, timestamp: timestamp)
@@ -733,11 +737,21 @@ public final class RecordingSession: Sendable {
         }
     }
 
-    private nonisolated func finishFrameDelivery(_ delivery: FrameDelivery) {
-        guard delivery.previewGeneration != nil else { return }
-        composedPreview.withLock {
-            $0.inFlight = false
-            $0.lastFrameTime = .now
+    /// Ends an idle preview frame. Only a frame handed to the handler counts toward the 1 s
+    /// gate. A frame a source change superseded while it composed starts its replacement at
+    /// once: the change's own immediate frame was refused while this one was in flight.
+    private nonisolated func finishFrameDelivery(_ delivery: FrameDelivery, delivered: Bool) {
+        guard let generation = delivery.previewGeneration else { return }
+        let superseded = composedPreview.withLock { state in
+            state.inFlight = false
+            if delivered { state.lastFrameTime = .now }
+            return !delivered && state.enabled && state.generation != generation
+        }
+        guard superseded else { return }
+        Task { @MainActor [weak self] in
+            guard let self, !self._isRecording, !self._streamingActive.withLock({ $0 }),
+                  !self.inputMode.needsDesktop, self.inputMode.needsVideo else { return }
+            await self.processCameraOrAvatarFrame()
         }
     }
 

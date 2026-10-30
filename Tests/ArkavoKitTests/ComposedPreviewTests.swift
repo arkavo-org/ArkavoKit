@@ -179,6 +179,35 @@ struct ComposedPreviewTests {
         #expect(replacement.withLock { $0 } == 0)
     }
 
+    @Test("A source change while a preview frame is composing delivers its replacement without waiting for the 1 s gate")
+    func sourceChangeDuringInFlightFrameDeliversPromptly() async throws {
+        let session = try Self.avatarSession()
+        let compositions = OSAllocatedUnfairLock(initialState: 0)
+        session.avatarTextureProvider = {
+            // The first frame is still composing when the sources change.
+            if compositions.withLock({ count in count += 1; return count }) == 1 {
+                Thread.sleep(forTimeInterval: 0.25)
+            }
+            return createTestPixelBuffer(width: 1920, height: 1080, red: 0, green: 255, blue: 0)
+        }
+        let frames = OSAllocatedUnfairLock(initialState: [Frame]())
+        session.monitorFrameHandler = { buffer, _ in
+            let frame = Frame(buffer)
+            frames.withLock { $0.append(frame) }
+        }
+        session.setComposedPreviewEnabled(true)
+        defer { session.setComposedPreviewEnabled(false) }
+        try await Task.sleep(for: .milliseconds(50))
+
+        let changed = ContinuousClock.now
+        session.inputsDidChange()
+        try await Self.waitForFrames(frames, count: 1)
+        let first = try #require(frames.withLock { $0.first })
+        // The frame composed before the change isn't delivered; its replacement follows at once.
+        #expect(compositions.withLock { $0 } >= 2)
+        #expect(changed.duration(to: first.time) < .milliseconds(900))
+    }
+
     private static func avatarSession() throws -> RecordingSession {
         let session = try RecordingSession()
         session.enableDesktop = false
