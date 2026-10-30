@@ -663,9 +663,8 @@ struct CompositorTests {
         }
 
         // Check bottom-right corner - avatar should be there
-        // In 4K, avatar at (3840-768-20, 20) with size 768x432
-        // After scaling to 1080p: position approximately (1526, 10) with size 384x216
-        // CIImage y=10 → pixel buffer y = 1080-10-216 = 854 to 1070
+        // The 4K screen is fitted into the 1080p output, and the avatar is placed in output space:
+        // a 384x216 box at CIImage (1920-384-20, 20), so pixel buffer (1516, 844)…(1900, 1060)
         // Check at pixel buffer y=900 which is inside avatar region
         if let cornerColor = getAverageColor(in: result, region: CGRect(x: 1600, y: 900, width: 50, height: 50)) {
             print("4K→1080p corner (pixel buffer y=900): r=\(cornerColor.r), g=\(cornerColor.g), b=\(cornerColor.b)")
@@ -774,5 +773,106 @@ struct CompositorTests {
         let out = try #require(compositor.composite(cameraLayers: [layer], canvasSize: CGSize(width: 1920, height: 1080), museTexture: muse))
         let bottomLeft = try #require(getAverageColor(in: out, region: CGRect(x: 60, y: 1000, width: 40, height: 40)))
         #expect(bottomLeft.b > 200 && bottomLeft.r < 60)
+    }
+
+    // MARK: - Screen fit (bars) and output-space overlays
+
+    @Test("A 16:10 screen is pillar-boxed, not squashed")
+    func sixteenByTenScreenGetsBars() throws {
+        // 1920×1200 fits as (96, 0, 1728, 1080): bars 0..96 and 1824..1920.
+        let out = try compositeRedScreen(width: 1920, height: 1200)
+        #expect(CVPixelBufferGetWidth(out) == 1920 && CVPixelBufferGetHeight(out) == 1080)
+        try expectBlack(out, 40, 520)
+        try expectBlack(out, 1860, 520)
+        try expectRed(out, 120, 520)
+        try expectRed(out, 940, 520)
+    }
+
+    @Test("A portrait screen is pillar-boxed")
+    func portraitScreenGetsBars() throws {
+        // 1080×1920 fits as (656.25, 0, 607.5, 1080).
+        let out = try compositeRedScreen(width: 1080, height: 1920)
+        try expectBlack(out, 300, 520)
+        try expectBlack(out, 1600, 520)
+        try expectRed(out, 940, 520)
+    }
+
+    @Test("An ultrawide screen is letterboxed")
+    func ultrawideScreenGetsBars() throws {
+        // 3440×1440 fits as (0, 138.14…, 1920, 803.72…): y 138.14…941.86.
+        let out = try compositeRedScreen(width: 3440, height: 1440)
+        try expectBlack(out, 940, 60)
+        try expectBlack(out, 940, 1000)
+        try expectRed(out, 940, 520)
+    }
+
+    @Test("A camera PiP over a portrait screen sits in the output's corner, over the bar")
+    func cameraOverPortraitScreen() throws {
+        // The 384×216 PiP box is in output space: (1516, 844)…(1900, 1060), over the right bar.
+        let camera = try #require(createTestPixelBuffer(width: 1920, height: 1080, red: 0, green: 255, blue: 0))
+        let cameraSample = try #require(createTestSampleBuffer(from: camera))
+        let layer = CompositorManager.CameraLayer(id: "cam", buffer: cameraSample, position: .bottomRight)
+        let out = try compositeRedScreen(width: 1080, height: 1920, cameraLayers: [layer])
+        let pip = try sample(out, 1680, 930)
+        #expect(pip.g > 200 && pip.r < 60 && pip.b < 60, "got r=\(pip.r) g=\(pip.g) b=\(pip.b)")
+    }
+
+    @Test("A scene overlay covers the bars")
+    func sceneOverlayCoversBars() throws {
+        // (300, 520) is in the portrait screen's left bar; the overlay spans the whole output.
+        let out = try compositeRedScreen(width: 1080, height: 1920) { compositor in
+            compositor.sceneOverlayText = "Be Right Back"
+            compositor.sceneOverlayGradientColors = (
+                CGColor(red: 1, green: 0, blue: 0, alpha: 1),
+                CGColor(red: 1, green: 0, blue: 0, alpha: 1))
+        }
+        let bar = try sample(out, 300, 520)
+        #expect(bar.r > 200, "got r=\(bar.r)")
+    }
+
+    // MARK: - Helpers
+
+    /// Composites a solid red screen of the given size into the default 1920×1080 output.
+    private func compositeRedScreen(
+        width: Int,
+        height: Int,
+        cameraLayers: [CompositorManager.CameraLayer] = [],
+        configure: (CompositorManager) -> Void = { _ in }
+    ) throws -> CVPixelBuffer {
+        let compositor = try CompositorManager()
+        compositor.outputSize = CGSize(width: 1920, height: 1080)
+        compositor.watermarkEnabled = false
+        compositor.pipPosition = .bottomRight
+        compositor.pipScale = 0.2
+        configure(compositor)
+        let screen = try #require(createTestPixelBuffer(width: width, height: height, red: 255, green: 0, blue: 0))
+        let screenSample = try #require(createTestSampleBuffer(from: screen))
+        return try #require(compositor.composite(screen: screenSample, cameraLayers: cameraLayers))
+    }
+
+    /// The average colour of the 40×40 region whose top-left corner is (x, y).
+    private func sample(_ buffer: CVPixelBuffer, _ x: CGFloat, _ y: CGFloat) throws -> (r: UInt8, g: UInt8, b: UInt8, a: UInt8) {
+        try #require(getAverageColor(in: buffer, region: CGRect(x: x, y: y, width: 40, height: 40)))
+    }
+
+    /// Black means r, g and b all below 20.
+    private func expectBlack(
+        _ buffer: CVPixelBuffer, _ x: CGFloat, _ y: CGFloat,
+        sourceLocation: SourceLocation = #_sourceLocation
+    ) throws {
+        let c = try sample(buffer, x, y)
+        #expect(c.r < 20 && c.g < 20 && c.b < 20,
+                "(\(Int(x)), \(Int(y))) should be black, got r=\(c.r) g=\(c.g) b=\(c.b)",
+                sourceLocation: sourceLocation)
+    }
+
+    private func expectRed(
+        _ buffer: CVPixelBuffer, _ x: CGFloat, _ y: CGFloat,
+        sourceLocation: SourceLocation = #_sourceLocation
+    ) throws {
+        let c = try sample(buffer, x, y)
+        #expect(c.r > 200 && c.g < 60 && c.b < 60,
+                "(\(Int(x)), \(Int(y))) should be red, got r=\(c.r) g=\(c.g) b=\(c.b)",
+                sourceLocation: sourceLocation)
     }
 }

@@ -29,7 +29,7 @@ public final class CompositorManager: Sendable {
 
     // PiP configuration
     public nonisolated(unsafe) var pipPosition: PiPPosition = .bottomRight
-    public nonisolated(unsafe) var pipScale: Float = 0.2 // 20% of screen size
+    public nonisolated(unsafe) var pipScale: Float = 0.2 // 20% of the output size
 
     // Watermark configuration
     public nonisolated(unsafe) var watermarkEnabled: Bool = true // Enabled by default per MVP spec
@@ -92,7 +92,7 @@ public final class CompositorManager: Sendable {
 
         return compositeWithBase(
             baseImage: screenImage,
-            screenSize: screenSize,
+            baseSize: screenSize,
             cameraLayers: cameraLayers,
             avatarTexture: avatarTexture,
             museTexture: museTexture
@@ -123,7 +123,7 @@ public final class CompositorManager: Sendable {
         // Remaining cameras become PiP overlays
         let overlayLayers = Array(cameraLayers.dropFirst())
 
-        return compositeWithBase(baseImage: scaledBaseImage, screenSize: canvasSize, cameraLayers: overlayLayers, museTexture: museTexture)
+        return compositeWithBase(baseImage: scaledBaseImage, baseSize: canvasSize, cameraLayers: overlayLayers, museTexture: museTexture)
     }
 
     /// Composites an avatar texture as the primary source with optional camera overlays
@@ -135,20 +135,30 @@ public final class CompositorManager: Sendable {
         let avatarImage = CIImage(cvPixelBuffer: avatarTexture)
         let screenSize = avatarImage.extent.size
 
-        return compositeWithBase(baseImage: avatarImage, screenSize: screenSize, cameraLayers: cameraLayers, museTexture: museTexture)
+        return compositeWithBase(baseImage: avatarImage, baseSize: screenSize, cameraLayers: cameraLayers, museTexture: museTexture)
     }
 
     // MARK: - Private Composition Core
 
-    /// Core composition logic: takes a base image and overlays camera layers as PiP
+    /// Core composition logic: fits the base into the output, then overlays the avatar, Muse,
+    /// camera PiPs, the watermark and the scene overlay, all placed in output space.
+    ///
+    /// The base (`baseSize` is its size) is scaled uniformly and centred over black, so a base
+    /// whose shape differs from the output gets bars rather than being stretched. Every overlay
+    /// is sized and positioned against `outputSize`, independent of the base.
     private func compositeWithBase(
         baseImage: CIImage,
-        screenSize: CGSize,
+        baseSize: CGSize,
         cameraLayers: [CameraLayer],
         avatarTexture: CVPixelBuffer? = nil,
         museTexture: CVPixelBuffer? = nil
     ) -> CVPixelBuffer? {
-        var composited = baseImage
+        // Read once: the whole frame is composed against one output size.
+        let outputSize = self.outputSize
+        let outputRect = CGRect(origin: .zero, size: outputSize)
+
+        var composited = fittedBase(baseImage, baseSize: baseSize, outputSize: outputSize)
+            .composited(over: CIImage(color: .black).cropped(to: outputRect))
 
         // Add avatar as PiP overlay if provided
         if let avatarBuffer = avatarTexture {
@@ -157,7 +167,7 @@ public final class CompositorManager: Sendable {
             // Check if avatar image is valid
             guard avatarImage.extent.width > 0 && avatarImage.extent.height > 0 else {
                 print("⚠️ [Compositor] Avatar image has zero extent: \(avatarImage.extent)")
-                return compositeWithBase(baseImage: baseImage, screenSize: screenSize, cameraLayers: cameraLayers, avatarTexture: nil)
+                return compositeWithBase(baseImage: baseImage, baseSize: baseSize, cameraLayers: cameraLayers, avatarTexture: nil)
             }
 
             // Debug: Sample pixels from avatar buffer to verify content
@@ -167,7 +177,7 @@ public final class CompositorManager: Sendable {
 
             // Calculate PiP dimensions for avatar (treat as single overlay)
             let totalOverlays = cameraLayers.count + 1
-            let pipSize = pipSize(for: screenSize, cameraCount: totalOverlays)
+            let pipSize = pipSize(for: outputSize, cameraCount: totalOverlays)
 
             // Scale avatar to PiP size maintaining aspect ratio
             let avatarAspect = avatarImage.extent.width / avatarImage.extent.height
@@ -189,7 +199,7 @@ public final class CompositorManager: Sendable {
 
             // Position avatar at the configured PiP position (first position)
             let position = calculatePiPPosition(
-                screenSize: screenSize,
+                screenSize: outputSize,
                 pipSize: scaledAvatarSize,
                 position: pipPosition
             )
@@ -205,11 +215,11 @@ public final class CompositorManager: Sendable {
 
             guard museImage.extent.width > 0 && museImage.extent.height > 0 else {
                 // Skip invalid muse texture
-                return compositeWithBase(baseImage: baseImage, screenSize: screenSize, cameraLayers: cameraLayers, avatarTexture: avatarTexture, museTexture: nil)
+                return compositeWithBase(baseImage: baseImage, baseSize: baseSize, cameraLayers: cameraLayers, avatarTexture: avatarTexture, museTexture: nil)
             }
 
             let totalOverlays = cameraLayers.count + (avatarTexture != nil ? 2 : 1)
-            let musePipSize = pipSize(for: screenSize, cameraCount: totalOverlays)
+            let musePipSize = pipSize(for: outputSize, cameraCount: totalOverlays)
 
             let museAspect = museImage.extent.width / museImage.extent.height
             let pipAspect = musePipSize.width / musePipSize.height
@@ -230,7 +240,7 @@ public final class CompositorManager: Sendable {
             // Position muse opposite to the mocap avatar
             let musePosition: PiPPosition = (pipPosition == .bottomRight) ? .bottomLeft : .bottomRight
             let position = calculatePiPPosition(
-                screenSize: screenSize,
+                screenSize: outputSize,
                 pipSize: scaledMuseSize,
                 position: musePosition
             )
@@ -257,7 +267,7 @@ public final class CompositorManager: Sendable {
             }
 
             // Calculate PiP dimensions and position
-            let pipSize = pipSize(for: screenSize, cameraCount: cameraLayers.count)
+            let pipSize = pipSize(for: outputSize, cameraCount: cameraLayers.count)
 
             // Scale camera to PiP size maintaining aspect ratio
             let cameraAspect = cameraImage.extent.width / cameraImage.extent.height
@@ -279,14 +289,14 @@ public final class CompositorManager: Sendable {
             let position: CGPoint
             if cameraLayers.count > 1 {
                 position = multiCameraPosition(
-                    screenSize: screenSize,
+                    screenSize: outputSize,
                     pipSize: scaledCameraSize,
                     preferred: placement,
                     index: index
                 )
             } else {
                 position = calculatePiPPosition(
-                    screenSize: screenSize,
+                    screenSize: outputSize,
                     pipSize: scaledCameraSize,
                     position: placement
                 )
@@ -305,28 +315,30 @@ public final class CompositorManager: Sendable {
 
         // Add watermark if enabled
         if watermarkEnabled {
-            composited = addWatermark(to: composited, screenSize: screenSize)
+            composited = addWatermark(to: composited, screenSize: outputSize)
         }
 
         // Add scene overlay if active (Starting Soon, BRB, Ending)
         #if os(macOS)
         if let overlayText = sceneOverlayText, !overlayText.isEmpty {
-            composited = addSceneOverlay(to: composited, screenSize: screenSize, text: overlayText)
+            composited = addSceneOverlay(to: composited, screenSize: outputSize, text: overlayText)
         }
         #endif
 
-        // Scale to output resolution if different from source
-        let finalImage: CIImage
-        if screenSize != outputSize {
-            let scaleX = outputSize.width / screenSize.width
-            let scaleY = outputSize.height / screenSize.height
-            finalImage = composited.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
-        } else {
-            finalImage = composited
-        }
+        // Everything is already in output space; clip whatever overhangs the output.
+        return renderToPixelBuffer(image: composited.cropped(to: outputRect), size: outputSize)
+    }
 
-        // Render to pixel buffer at output resolution
-        return renderToPixelBuffer(image: finalImage, size: outputSize)
+    /// Scales the base uniformly to fit inside the output and centres it, leaving bars on the
+    /// unused axis. The base is never stretched.
+    private func fittedBase(_ base: CIImage, baseSize: CGSize, outputSize: CGSize) -> CIImage {
+        let fit = AvatarSlotLayout.coreImageRect(
+            AvatarSlotLayout.aspectFit(baseSize, in: outputSize), outputHeight: outputSize.height)
+        guard fit.width > 0, fit.height > 0 else { return base }
+        let scale = fit.width / baseSize.width
+        let scaled = base.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        return scaled.transformed(by: CGAffineTransform(
+            translationX: fit.minX - scaled.extent.minX, y: fit.minY - scaled.extent.minY))
     }
 
     /// Scales an image to fill the canvas size (center crop)
