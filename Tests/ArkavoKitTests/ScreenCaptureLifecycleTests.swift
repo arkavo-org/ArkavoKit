@@ -126,6 +126,88 @@ struct ScreenCaptureLifecycleTests {
         #expect(captureSession.inputs.isEmpty)
         #expect(captureSession.calls.allSatisfy { !$0.onMainThread })
     }
+
+    @Test("Stopping while a first-frame wait is still starting ends the wait")
+    func stopDuringStartEndsFirstFrameWait() async throws {
+        let captureSession = LifecycleRecordingCaptureSession()
+        captureSession.holdStart()
+        let manager = ScreenCaptureManager(captureSession: captureSession)
+        let wait = startFirstFrameWait(manager)
+
+        // The waiter is suspended across its start, blocked in startRunning on the session queue.
+        try await waitUntil { captureSession.startsEntered == 1 }
+        manager.stopCapture()
+        captureSession.releaseStart()
+
+        try await waitUntil { wait.withLock { $0 } != nil }
+        #expect(wait.withLock { $0 } == .cancelled)
+    }
+
+    @Test("Stopping while waiting for the first frame ends the wait")
+    func stopDuringFirstFrameWaitEndsIt() async throws {
+        let captureSession = LifecycleRecordingCaptureSession()
+        let manager = ScreenCaptureManager(captureSession: captureSession)
+        let wait = startFirstFrameWait(manager)
+        try await waitUntil { captureSession.calls.count == 1 }
+        try await Task.sleep(for: .milliseconds(50))   // its start has run; no frame will come
+        #expect(wait.withLock { $0 } == nil)
+
+        manager.stopCapture()
+        try await waitUntil { wait.withLock { $0 } != nil }
+        #expect(wait.withLock { $0 } == .cancelled)
+    }
+
+    @Test("A first-frame wait returns on its own capture's first frame and ends when a newer start replaces it")
+    func firstFrameWaitFollowsItsOwnCapture() async throws {
+        let captureSession = LifecycleRecordingCaptureSession()
+        let manager = ScreenCaptureManager(captureSession: captureSession)
+        let pixel = try #require(createTestPixelBuffer(width: 16, height: 16, red: 255, green: 0, blue: 0))
+        let sample = try #require(createTestSampleBuffer(from: pixel))
+
+        let first = startFirstFrameWait(manager)
+        try await waitUntil { captureSession.calls.count == 1 }
+        let output = try #require(captureSession.outputs.first)
+        let connection = try #require(output.connection(with: .video))
+        manager.captureOutput(output, didOutput: sample, from: connection)
+        try await waitUntil { first.withLock { $0 } != nil }
+        #expect(first.withLock { $0 } == .returned)
+
+        let second = startFirstFrameWait(manager)
+        try await waitUntil { captureSession.calls.count == 2 }
+        try await Task.sleep(for: .milliseconds(50))
+        try manager.startCapture(displayID: CGMainDisplayID())
+        try await waitUntil { second.withLock { $0 } != nil }
+        #expect(second.withLock { $0 } == .cancelled)
+        manager.stopCapture()
+    }
+}
+
+private enum FirstFrameWaitOutcome: Equatable { case returned, cancelled, failed }
+
+/// Starts `startCaptureAndWaitForFirstFrame` in a task; the lock holds how it ended, once it has.
+@MainActor
+private func startFirstFrameWait(_ manager: ScreenCaptureManager) -> OSAllocatedUnfairLock<FirstFrameWaitOutcome?> {
+    let outcome = OSAllocatedUnfairLock<FirstFrameWaitOutcome?>(initialState: nil)
+    Task { @MainActor in
+        do {
+            try await manager.startCaptureAndWaitForFirstFrame(displayID: CGMainDisplayID())
+            outcome.withLock { $0 = .returned }
+        } catch is CancellationError {
+            outcome.withLock { $0 = .cancelled }
+        } catch {
+            outcome.withLock { $0 = .failed }
+        }
+    }
+    return outcome
+}
+
+/// Polls `condition` for up to two seconds, so a wait that never ends fails instead of hanging.
+@MainActor
+private func waitUntil(_ condition: () -> Bool) async throws {
+    let deadline = ContinuousClock.now + .seconds(2)
+    while !condition() && .now < deadline {
+        try await Task.sleep(for: .milliseconds(10))
+    }
 }
 
 /// Exercise AVFoundation's real input configuration without capturing the user's screen.
@@ -143,7 +225,9 @@ private final class LifecycleRecordingCaptureSession: AVCaptureSession, @uncheck
     struct Call { let kind: Kind; let onMainThread: Bool }
 
     private let latency: TimeInterval
-    private let state = OSAllocatedUnfairLock(initialState: (calls: [Call](), running: false, holdsStart: false))
+    private let state = OSAllocatedUnfairLock(
+        initialState: (calls: [Call](), running: false, holdsStart: false, startsEntered: 0)
+    )
     private let startGate = DispatchSemaphore(value: 0)
 
     init(latency: TimeInterval = 0) {
@@ -153,6 +237,8 @@ private final class LifecycleRecordingCaptureSession: AVCaptureSession, @uncheck
 
     var calls: [Call] { state.withLock { $0.calls } }
     var isRunningStub: Bool { state.withLock { $0.running } }
+    /// `startRunning` calls that have begun, including one still blocked.
+    var startsEntered: Int { state.withLock { $0.startsEntered } }
 
     func holdStart() { state.withLock { $0.holdsStart = true } }
 
@@ -162,6 +248,7 @@ private final class LifecycleRecordingCaptureSession: AVCaptureSession, @uncheck
     }
 
     override func startRunning() {
+        state.withLock { $0.startsEntered += 1 }
         if state.withLock({ $0.holdsStart }) {
             _ = startGate.wait(timeout: .now() + 1)
         }

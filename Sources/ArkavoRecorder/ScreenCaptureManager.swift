@@ -35,8 +35,9 @@ public final class ScreenCaptureManager: NSObject, Sendable {
         activeCapture.withLock { $0?.id == id }
     }
 
-    /// Continuation for async first-frame signaling
-    private var firstFrameContinuation: CheckedContinuation<Void, Never>?
+    /// The `startCaptureAndWaitForFirstFrame` call waiting for its capture's first frame.
+    /// A frame of that capture resumes it; a stop or a newer start ends it with `CancellationError`.
+    private var firstFrameWaiter: (captureID: UUID, continuation: CheckedContinuation<Void, any Error>)?
     private var hasDeliveredFirstFrame: Bool = false
 
     // MARK: - Initialization
@@ -75,6 +76,10 @@ public final class ScreenCaptureManager: NSObject, Sendable {
 
     /// Starts screen capture and waits for the first frame to be delivered
     /// This ensures the screen capture is actually producing frames before returning
+    ///
+    /// Throws `RecorderError.cannotAddInput` if the session can't take the display's input, and
+    /// `CancellationError` if `stopCapture` or another start replaces this capture before its
+    /// first frame arrives.
     public func startCaptureAndWaitForFirstFrame(displayID: CGDirectDisplayID? = nil) async throws {
         #if os(macOS)
         let request = try beginCapture(displayID: displayID)
@@ -84,14 +89,18 @@ public final class ScreenCaptureManager: NSObject, Sendable {
             enqueueStart(request) { continuation.resume(with: $0) }
         }
 
+        // A stop or a newer start while this one was queued has replaced it: no frame will come.
+        guard isCurrentCapture(request.captureID) else { throw CancellationError() }
+
         // Wait for first frame
-        await withCheckedContinuation { continuation in
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
             if hasDeliveredFirstFrame {
                 // Already got a frame
                 continuation.resume()
             } else {
-                // Store continuation to be resumed when first frame arrives
-                firstFrameContinuation = continuation
+                // Resumed when this capture's first frame arrives, or ended when it's replaced
+                endFirstFrameWait()
+                firstFrameWaiter = (request.captureID, continuation)
             }
         }
 
@@ -112,7 +121,7 @@ public final class ScreenCaptureManager: NSObject, Sendable {
 
         // Reset state
         hasDeliveredFirstFrame = false
-        firstFrameContinuation = nil
+        endFirstFrameWait()
     }
 
     /// Returns once every session change requested before the call has run on the session queue.
@@ -145,9 +154,17 @@ public final class ScreenCaptureManager: NSObject, Sendable {
         let capture = ActiveCapture(input: ObjectIdentifier(input))
         activeCapture.withLock { $0 = capture }
 
-        // Reset first frame tracking
+        // Reset first frame tracking; a wait for the replaced capture's frame can't succeed now.
         hasDeliveredFirstFrame = false
+        endFirstFrameWait()
         return StartRequest(input: input, captureID: capture.id)
+    }
+
+    /// Ends a pending first-frame wait whose capture is no longer current.
+    private func endFirstFrameWait() {
+        guard let waiter = firstFrameWaiter else { return }
+        firstFrameWaiter = nil
+        waiter.continuation.resume(throwing: CancellationError())
     }
 
     /// Attaches the request's input and starts the session on the session queue. If the session
@@ -198,8 +215,9 @@ public final class ScreenCaptureManager: NSObject, Sendable {
     private func signalFirstFrame(captureID: UUID) {
         guard isCurrentCapture(captureID), !hasDeliveredFirstFrame else { return }
         hasDeliveredFirstFrame = true
-        firstFrameContinuation?.resume()
-        firstFrameContinuation = nil
+        guard let waiter = firstFrameWaiter, waiter.captureID == captureID else { return }
+        firstFrameWaiter = nil
+        waiter.continuation.resume()
     }
 }
 
