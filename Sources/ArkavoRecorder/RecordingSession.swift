@@ -87,6 +87,22 @@ private final class OrderedDelivery: @unchecked Sendable {
     }
 }
 
+/// The system audio inputs a session creates: the microphone, with its permission, and the
+/// screen's audio. Tests substitute stand-ins.
+struct AudioInputs {
+    var microphonePermission: () async -> Bool
+    var makeMicrophone: @MainActor () -> any AudioSource
+    var makeScreenAudio: @MainActor () -> any AudioSource
+
+    @MainActor static var system: AudioInputs {
+        AudioInputs(
+            microphonePermission: { await MicrophoneAudioSource.requestPermission() },
+            makeMicrophone: { MicrophoneAudioSource(sourceID: "microphone") },
+            makeScreenAudio: { ScreenAudioSource(sourceID: "screen") }
+        )
+    }
+}
+
 /// Coordinates screen, camera, and audio capture with composition and encoding
 @MainActor
 public final class RecordingSession: Sendable {
@@ -107,6 +123,7 @@ public final class RecordingSession: Sendable {
     nonisolated private let mixedAudioDelivery = OrderedDelivery()
     nonisolated(unsafe) private let compositor: CompositorManager
     nonisolated(unsafe) private let encoder: VideoEncoder
+    private let audioInputs: AudioInputs
 
     // Recording state tracked locally for synchronous access
     // This is updated when recording starts/stops
@@ -264,6 +281,15 @@ public final class RecordingSession: Sendable {
         }
     }
 
+    /// Adds a microphone that reports its level as `audioLevel`.
+    private func addMicrophone() {
+        let microphone = audioInputs.makeMicrophone()
+        (microphone as? MicrophoneAudioSource)?.onLevelUpdate = { @Sendable [weak self] level in
+            self?.audioLevel = level
+        }
+        audioRouter.addSource(microphone)
+    }
+
     /// Drops queued audio and the clock choice so nothing carries over between sessions.
     private func resetAudioMixer() {
         audioMixer.reset()
@@ -306,8 +332,13 @@ public final class RecordingSession: Sendable {
         try self.init(screenCapture: ScreenCaptureManager())
     }
 
-    init(screenCapture: ScreenCaptureManager, encoder: VideoEncoder = VideoEncoder()) throws {
+    init(
+        screenCapture: ScreenCaptureManager,
+        encoder: VideoEncoder = VideoEncoder(),
+        audioInputs: AudioInputs = .system
+    ) throws {
         self.screenCapture = screenCapture
+        self.audioInputs = audioInputs
         self.cameraCaptures = [:]
         self.audioRouter = AudioRouter()
         self.audioMixer = AudioMixer(voiceSourceID: "muse-voice")
@@ -409,21 +440,16 @@ public final class RecordingSession: Sendable {
         // STEP 2: Add audio sources to audio router (but don't start yet)
         await removeUnwantedAudioSources(microphone: mode.needsMicrophone)
         resetAudioMixer()
-        if mode.needsMicrophone {
-            print("🎙️ RecordingSession: Adding microphone to audio router")
-            let micSource = await audioRouter.addMicrophone()
-            micSource.onLevelUpdate = { @Sendable [weak self] level in
-                self?.audioLevel = level
-            }
-            print("🎙️ RecordingSession: Microphone source created: \(micSource.sourceID)")
+        // A stream that outlived the last recording still runs its microphone and screen audio;
+        // the recording takes those over rather than adding a second of each.
+        if mode.needsMicrophone && !audioRouter.allSourceIDs.contains("microphone") {
+            addMicrophone()
             syncAudioMixerRouting()
         }
 
         // Add desktop/screen audio if enabled
-        if enableScreenAudio {
-            print("🔊 RecordingSession: Adding screen audio to audio router")
-            let _ = await audioRouter.addScreenAudio()
-            print("🔊 RecordingSession: Screen audio source created")
+        if enableScreenAudio && !audioRouter.allSourceIDs.contains("screen") {
+            audioRouter.addSource(audioInputs.makeScreenAudio())
             syncAudioMixerRouting()
         }
 
@@ -607,7 +633,7 @@ public final class RecordingSession: Sendable {
         }
 
         if enableMicrophone {
-            guard await MicrophoneAudioSource.requestPermission() else {
+            guard await audioInputs.microphonePermission() else {
                 return false
             }
         }
@@ -948,13 +974,10 @@ public final class RecordingSession: Sendable {
         Task { @MainActor in
             await removeUnwantedAudioSources(microphone: mode.needsMicrophone)
             if mode.needsMicrophone && !audioRouter.allSourceIDs.contains("microphone") {
-                let micSource = audioRouter.addMicrophone()
-                micSource.onLevelUpdate = { @Sendable [weak self] level in
-                    self?.audioLevel = level
-                }
+                addMicrophone()
             }
             if enableScreenAudio && !audioRouter.allSourceIDs.contains("screen") {
-                let _ = audioRouter.addScreenAudio()
+                audioRouter.addSource(audioInputs.makeScreenAudio())
             }
             syncAudioMixerRouting()
             try? await audioRouter.startAll()

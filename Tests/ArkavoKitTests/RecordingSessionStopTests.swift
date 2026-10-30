@@ -198,6 +198,31 @@ struct RecordingSessionStopTests {
         #expect(afterStop >= 10)
     }
 
+    @Test("Recording again while a stream runs reuses the stream's microphone instead of adding a second one")
+    func recordingAgainWhileStreamingReusesTheMicrophone() async throws {
+        let first = Self.outputURL("record-again-1"), second = Self.outputURL("record-again-2")
+        defer {
+            try? FileManager.default.removeItem(at: first)
+            try? FileManager.default.removeItem(at: second)
+        }
+        let inputs = StandInAudioInputs()
+        let session = try Self.avatarSession(audioInputs: inputs.audioInputs)
+        session.enableMicrophone = true
+        let streamFrames = OSAllocatedUnfairLock(initialState: 0)
+        try await session.startRecording(outputURL: first, title: "first")
+        try await session.startStreamingForTesting { _ in streamFrames.withLock { $0 += 1 } }
+        try await Self.waitUntil { streamFrames.withLock { $0 } >= 5 }
+        _ = try? await session.stopRecording()
+
+        try await session.startRecording(outputURL: second, title: "second")
+
+        #expect(inputs.microphones.count == 1)
+        #expect(inputs.microphones.filter(\.isActive).count == 1)
+        _ = try? await session.stopRecording()
+        await session.stopStreaming()
+        #expect(inputs.microphones.allSatisfy { !$0.isActive })
+    }
+
     private static func outputURL(_ name: String) -> URL {
         FileManager.default.temporaryDirectory.appendingPathComponent("\(name)-\(UUID().uuidString).mov")
     }
@@ -205,9 +230,10 @@ struct RecordingSessionStopTests {
     /// Avatar mode, which needs no devices or permissions.
     private static func avatarSession(
         screenCapture: ScreenCaptureManager = ScreenCaptureManager(),
-        encoder: VideoEncoder = VideoEncoder()
+        encoder: VideoEncoder = VideoEncoder(),
+        audioInputs: AudioInputs = .system
     ) throws -> RecordingSession {
-        let session = try RecordingSession(screenCapture: screenCapture, encoder: encoder)
+        let session = try RecordingSession(screenCapture: screenCapture, encoder: encoder, audioInputs: audioInputs)
         session.enableDesktop = false
         session.enableCamera = false
         session.enableMicrophone = false
@@ -347,5 +373,30 @@ private struct SolidFrame: @unchecked Sendable {
 
     init(red: UInt8, green: UInt8, blue: UInt8) throws {
         buffer = try #require(createTestPixelBuffer(width: 1920, height: 1080, red: red, green: green, blue: blue))
+    }
+}
+
+
+/// Audio inputs that capture nothing: microphone permission is granted, and each microphone or
+/// screen audio the session makes is a `FakeAudioSource`, kept here.
+@MainActor
+private final class StandInAudioInputs {
+    private(set) var microphones: [FakeAudioSource] = []
+    private(set) var screenAudio: [FakeAudioSource] = []
+
+    var audioInputs: AudioInputs {
+        AudioInputs(
+            microphonePermission: { true },
+            makeMicrophone: { [self] in
+                let microphone = FakeAudioSource(sourceID: "microphone")
+                microphones.append(microphone)
+                return microphone
+            },
+            makeScreenAudio: { [self] in
+                let audio = FakeAudioSource(sourceID: "screen")
+                screenAudio.append(audio)
+                return audio
+            }
+        )
     }
 }
