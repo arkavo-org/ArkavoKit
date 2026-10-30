@@ -33,6 +33,44 @@ struct AudioRouterSourceLifecycleTests {
         try await router.startAll()
         #expect(source.starts == 1)
     }
+
+    @Test("A source that fails to start doesn't keep the one beside it from starting, and starting all still throws")
+    nonisolated func failingSourceLetsTheOtherStart() async throws {
+        // The router's order is unspecified. Each source fails in turn, in several routers kept
+        // alive (so none reuses another's storage), so the failing one comes first in some of them.
+        var routers: [AudioRouter] = []
+        for (failingID, healthyID) in [("screen", "microphone"), ("microphone", "screen")] {
+            for _ in 0..<5 {
+                let router = AudioRouter()
+                routers.append(router)
+                let healthy = FakeAudioSource(sourceID: healthyID)
+                router.addSource(FailingAudioSource(sourceID: failingID))
+                router.addSource(healthy)
+
+                await #expect(throws: RecorderError.screenCaptureUnavailable) { try await router.startAll() }
+                #expect(healthy.isActive, "\(failingID) failing kept \(healthyID) from starting")
+            }
+        }
+    }
+}
+
+/// Can't start, as screen audio without screen recording permission can't.
+private final class FailingAudioSource: AudioSource {
+    let sourceID: String
+    let sourceName = "Failing"
+    let format = AudioFormat(sampleRate: 48000, channels: 2, bitDepth: 16, formatID: kAudioFormatLinearPCM)
+    let isActive = false
+    var onSample: ((CMSampleBuffer) -> Void)?
+
+    init(sourceID: String) {
+        self.sourceID = sourceID
+    }
+
+    func start() async throws {
+        throw RecorderError.screenCaptureUnavailable
+    }
+
+    func stop() async throws {}
 }
 
 /// Counts its starts. Starting one that is running would open a second capture.

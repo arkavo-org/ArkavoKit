@@ -71,19 +71,22 @@ public class AudioRouter {
     }
 
     /// Start all audio sources that aren't running. Starting a running source again could open a
-    /// second capture of it.
+    /// second capture of it. A source that fails to start doesn't keep the others from starting:
+    /// each is tried, and the first error is thrown once all have been.
     public func startAll() async throws {
         print("🎛️ AudioRouter: Starting all sources...")
 
+        var firstError: (any Error)?
         for (sourceID, source) in sources where !source.isActive {
             do {
                 try await source.start()
                 print("  ✓ Started [\(sourceID)]")
             } catch {
                 print("  ✗ Failed to start [\(sourceID)]: \(error)")
-                throw error
+                if firstError == nil { firstError = error }
             }
         }
+        if let firstError { throw firstError }
 
         print("🎛️ AudioRouter: All sources started")
     }
