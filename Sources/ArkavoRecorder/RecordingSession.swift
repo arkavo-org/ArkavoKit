@@ -431,6 +431,11 @@ public final class RecordingSession: Sendable {
             if streamLeftSources && !_streamingActive.withLock({ $0 }) {
                 await stopSources()
                 resetAudioMixer()
+                // A stream that started during that await started its frames, but the screen and
+                // cameras had already stopped, and the audio it started may have been stopped too.
+                if _streamingActive.withLock({ $0 }) {
+                    restartSourcesForStream()
+                }
             }
             throw error
         }

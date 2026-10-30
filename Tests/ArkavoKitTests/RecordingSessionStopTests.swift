@@ -361,6 +361,51 @@ struct RecordingSessionStopTests {
         #expect(!(await live.screenIsCapturing()))
     }
 
+    @Test("A stream that starts while a failed recording start releases the sources gets the screen and cameras back")
+    func streamStartingWhileAFailedStartReleasesTheSourcesGetsThemBack() async throws {
+        let url = Self.outputURL("stream-starts-after-failed-start")
+        defer { try? FileManager.default.removeItem(at: url) }
+        // The microphone permission request is held until released, then refused.
+        let released = OSAllocatedUnfairLock(initialState: false)
+        let asked = OSAllocatedUnfairLock(initialState: false)
+        var inputs = StandInAudioInputs().audioInputs
+        inputs.microphonePermission = {
+            asked.withLock { $0 = true }
+            while !released.withLock({ $0 }) { try? await Task.sleep(for: .milliseconds(10)) }
+            return false
+        }
+        let live = try SharedSources(audioInputs: inputs)
+        let session = live.session
+        session.enableAvatar = false
+        session.enableDesktop = true
+        session.enableMicrophone = true
+        let cameraStarts = CameraStartAttempts(session)
+        // Stopping this source starts a new stream, once: while the failed start releases the sources.
+        let startsAStream = StreamStartingAudioSource(sourceID: "stream-starter") {
+            try? await session.startStreamingForTesting { _ in }
+        }
+        session.addMuseAudioSource(startsAStream)
+        try session.startScreenPreview()
+        try await session.startStreamingForTesting { _ in }
+        try await Self.waitUntil { live.audio.isActive }
+
+        let start = Task { try await session.startRecording(outputURL: url, title: "refused") }
+        try await Self.waitUntil { asked.withLock { $0 } }
+        await session.stopStreaming()   // leaves the sources to the starting recording
+        cameraStarts.enableCamera()
+        released.withLock { $0 = true }
+        await #expect(throws: RecorderError.permissionDenied) { try await start.value }
+
+        #expect(startsAStream.startedAStream)
+        #expect(await live.screenIsCapturing())
+        #expect(cameraStarts.attempted == [CameraStartAttempts.cameraID])
+        try await Self.waitUntil { live.audio.isActive }
+        #expect(live.audio.isActive)
+        await session.stopStreaming()
+        #expect(!live.audio.isActive)
+        #expect(!(await live.screenIsCapturing()))
+    }
+
     @Test("Pausing a recording keeps a live stream going, and the file takes nothing while paused")
     func pausingARecordingKeepsTheStreamGoing() async throws {
         let url = Self.outputURL("paused-stream")
