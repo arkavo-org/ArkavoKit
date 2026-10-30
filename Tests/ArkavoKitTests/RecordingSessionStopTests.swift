@@ -210,6 +210,24 @@ struct RecordingSessionStopTests {
         #expect(!(await live.screenIsCapturing()))
     }
 
+    @Test("A stream that starts while a recording's file finishes gets its cameras started again")
+    func streamStartingWhileTheFileFinishesRestartsItsCameras() async throws {
+        let url = Self.outputURL("cameras-after-finish")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let encoder = VideoEncoder()
+        let session = try Self.avatarSession(encoder: encoder)
+        let cameraStarts = CameraStartAttempts(session)
+        try await session.startRecording(outputURL: url, title: "cameras")
+        cameraStarts.enableCamera()
+        await encoder.setFinishingHookForTesting { try? await session.startStreamingForTesting { _ in } }
+
+        _ = try? await session.stopRecording()
+        await encoder.setFinishingHookForTesting(nil)
+
+        #expect(cameraStarts.attempted == [CameraStartAttempts.cameraID])
+        await session.stopStreaming()
+    }
+
     @Test("A stream that starts while a stopped recording releases the sources gets them back")
     func streamStartingWhileTheSourcesAreReleasedGetsThemBack() async throws {
         let url = Self.outputURL("stream-starts-while-releasing")
@@ -691,6 +709,31 @@ private final class SlowStartingAudioSource: AudioSource, @unchecked Sendable {
 
     func stop() async throws {
         active.withLock { $0 = false }
+    }
+}
+
+/// The session's camera starts, seen with no camera hardware or permission: the camera can't
+/// exist, so each start of it is reported to `cameraStartFailureHandler` at once.
+@MainActor
+private final class CameraStartAttempts {
+    static let cameraID = "nonexistent-camera-id"
+    private let session: RecordingSession
+    private let reported = OSAllocatedUnfairLock(initialState: [String]())
+
+    init(_ session: RecordingSession) {
+        self.session = session
+        let reported = reported
+        session.cameraStartFailureHandler = { failure in reported.withLock { $0.append(failure.sourceID) } }
+    }
+
+    /// The cameras whose start was attempted.
+    var attempted: [String] { reported.withLock { $0 } }
+
+    /// Turns the camera on. Call it once a recording's start has asked its permissions, so the
+    /// start asks for no camera permission.
+    func enableCamera() {
+        session.cameraSourceIdentifiers = [Self.cameraID]
+        session.enableCamera = true
     }
 }
 

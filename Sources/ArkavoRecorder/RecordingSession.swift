@@ -665,8 +665,8 @@ public final class RecordingSession: Sendable {
     }
 
     /// Starts what a live stream needs after `stopSources()`: the screen capture in desktop
-    /// modes (a stream that starts by itself uses the running screen preview), then the frame
-    /// driver and the audio, as starting the stream does.
+    /// modes and the cameras (a stream that starts by itself uses the running previews), then
+    /// the frame driver and the audio, as starting the stream does.
     private func restartSourcesForStream() {
         if inputMode.needsDesktop {
             do {
@@ -674,6 +674,11 @@ public final class RecordingSession: Sendable {
             } catch {
                 screenCaptureFailureHandler?(error)
             }
+        }
+        // stopSources() removed the cameras too; without them a camera stream composes none.
+        // Each camera that fails is reported to cameraStartFailureHandler, as in a preview.
+        if enableCamera {
+            try? startCameraCapturesIfNeeded()
         }
         startStreamingFrameGeneration()
     }
