@@ -944,6 +944,49 @@ struct CompositorTests {
         #expect(pip.g > 200 && pip.r < 60 && pip.b < 60, "got r=\(pip.r) g=\(pip.g) b=\(pip.b)")
     }
 
+    @Test("A screen within a pixel of 16:9 fills the output with no sub-pixel bar")
+    func nearSixteenByNineScreenFillsTheOutput() throws {
+        // 1366×768 fits as 1920×1079.47: a 0.26 px bar top and bottom would darken the edge rows.
+        let out = try compositeRedScreen(width: 1366, height: 768)
+        for y in [0, 1079] as [CGFloat] {
+            let row = try #require(getAverageColor(in: out, region: CGRect(x: 100, y: y, width: 1720, height: 1)))
+            #expect(row.r > 250 && row.g < 5 && row.b < 5, "row \(Int(y)): r=\(row.r) g=\(row.g) b=\(row.b)")
+        }
+    }
+
+    @Test("A 4:3 camera base fills the output: cropped, with no bars")
+    func fourByThreeCameraFillsTheOutput() throws {
+        // A 1440×1080 camera fills as 1920×1440, cropping 180 px top and bottom. Its red top band
+        // (108 px, 144 px once scaled) is cropped away, so it is neither barred nor squeezed in.
+        let compositor = try CompositorManager()
+        compositor.outputSize = CGSize(width: 1920, height: 1080)
+        compositor.watermarkEnabled = false
+        let camera = try #require(createMaskedPixelBuffer(
+            width: 1440, height: 1080, opaque: AvatarSlotLayout.fullTexture, color: (0, 0, 255),
+            marker: CGRect(x: 0, y: 0, width: 1, height: 0.1)))
+        let layer = CompositorManager.CameraLayer(
+            id: "cam", buffer: try #require(createTestSampleBuffer(from: camera)), position: nil)
+        let out = try #require(compositor.composite(cameraLayers: [layer], canvasSize: CGSize(width: 1920, height: 1080)))
+        try expectBlue(out, 0, 520)
+        try expectBlue(out, 1880, 520)
+        try expectBlue(out, 940, 0)
+        try expectBlue(out, 940, 1040)
+    }
+
+    @Test("An avatar-only frame is opaque: the texture's transparent pixels come out black")
+    func avatarOnlyFrameIsOpaque() throws {
+        let compositor = try CompositorManager()
+        compositor.outputSize = CGSize(width: 1920, height: 1080)
+        compositor.watermarkEnabled = false
+        let avatar = try #require(createTestPixelBuffer(width: 1920, height: 1080, red: 0, green: 0, blue: 0, alpha: 0))
+        let out = try #require(compositor.composite(avatarTexture: avatar))
+        for (x, y) in [(940, 520), (0, 0), (1880, 1040)] as [(CGFloat, CGFloat)] {
+            let c = try sample(out, x, y)
+            #expect(c.a == 255 && c.r < 20 && c.g < 20 && c.b < 20,
+                    "(\(Int(x)), \(Int(y))): r=\(c.r) g=\(c.g) b=\(c.b) a=\(c.a)")
+        }
+    }
+
     @Test("A scene overlay covers the bars")
     func sceneOverlayCoversBars() throws {
         // (300, 520) is in the portrait screen's left bar; the overlay spans the whole output.

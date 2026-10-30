@@ -172,6 +172,11 @@ struct AvatarSlotLayoutTests {
         #expect(isClose(
             AvatarSlotLayout.aspectFit(CGSize(width: 1280, height: 720), in: output),
             CGRect(x: 0, y: 0, width: 1920, height: 1080)))
+        // Within a pixel of the output on an axis: that axis fills, with no sub-pixel bar.
+        // 1366×768 would otherwise fit as (0, 0.26, 1920, 1079.47).
+        #expect(isClose(
+            AvatarSlotLayout.aspectFit(CGSize(width: 1366, height: 768), in: output),
+            CGRect(x: 0, y: 0, width: 1920, height: 1080), tolerance: 1e-9))
         #expect(AvatarSlotLayout.aspectFit(.zero, in: output) == .zero)
         #expect(AvatarSlotLayout.aspectFit(CGSize(width: 1920, height: 1080), in: .zero) == .zero)
     }

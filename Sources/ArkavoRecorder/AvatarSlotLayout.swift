@@ -95,14 +95,18 @@ public enum AvatarSlotLayout {
 
     /// Fits a source of the given size inside the output, uniformly and centred.
     ///
-    /// Returns a top-left rect in output pixels; the source is never stretched, so the
-    /// unused axis is left as bars. Returns `.zero` when either size is degenerate.
+    /// Returns a top-left rect in output pixels; the source is not stretched, so the unused
+    /// axis is left as bars. One exception: a fit within a pixel of the output on an axis fills
+    /// that axis, because a bar under a pixel would only darken the edge rows (1366×768 fits as
+    /// 1920×1079.47). Returns `.zero` when either size is degenerate.
     static func aspectFit(_ source: CGSize, in output: CGSize) -> CGRect {
         guard source.width > 0, source.height > 0, output.width > 0, output.height > 0
         else { return .zero }
         let scale = min(output.width / source.width, output.height / source.height)
-        let w = source.width * scale
-        let h = source.height * scale
+        var w = source.width * scale
+        var h = source.height * scale
+        if output.width - w < 1 { w = output.width }
+        if output.height - h < 1 { h = output.height }
         return CGRect(x: (output.width - w) / 2, y: (output.height - h) / 2, width: w, height: h)
     }
 

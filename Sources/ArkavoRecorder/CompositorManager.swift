@@ -144,6 +144,10 @@ public final class CompositorManager: Sendable {
 
     /// Composites camera frames without a screen base layer (camera-only mode)
     /// First camera becomes the primary full-canvas source, additional cameras become PiP overlays
+    ///
+    /// - Parameter canvasSize: The canvas the first camera fills and crops to. Give it the
+    ///   output's shape (`outputSize` itself, as production does): the filled canvas is then
+    ///   fitted into the output like any base, so a canvas of another shape gets bars.
     public func composite(
         cameraLayers: [CameraLayer],
         canvasSize: CGSize,
@@ -331,13 +335,14 @@ public final class CompositorManager: Sendable {
     }
 
     /// Scales the base uniformly to fit inside the output and centres it, leaving bars on the
-    /// unused axis. The base is never stretched.
+    /// unused axis. The base is not stretched, except that an axis within a pixel of the output
+    /// fills it (`AvatarSlotLayout.aspectFit`), so no sub-pixel bar darkens the edge.
     private func fittedBase(_ base: CIImage, baseSize: CGSize, outputSize: CGSize) -> CIImage {
         let fit = AvatarSlotLayout.coreImageRect(
             AvatarSlotLayout.aspectFit(baseSize, in: outputSize), outputHeight: outputSize.height)
         guard fit.width > 0, fit.height > 0 else { return base }
-        let scale = fit.width / baseSize.width
-        let scaled = base.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let scaled = base.transformed(by: CGAffineTransform(
+            scaleX: fit.width / baseSize.width, y: fit.height / baseSize.height))
         return scaled.transformed(by: CGAffineTransform(
             translationX: fit.minX - scaled.extent.minX, y: fit.minY - scaled.extent.minY))
     }
