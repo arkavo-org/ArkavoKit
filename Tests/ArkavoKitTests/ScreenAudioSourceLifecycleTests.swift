@@ -112,8 +112,8 @@ struct ScreenAudioSourceLifecycleTests {
         try await source.stop()
     }
 
-    @Test("A capture that stops by itself while the source is starting leaves the source stopped")
-    func captureStoppingByItselfDuringTheStartLeavesTheSourceStopped() async throws {
+    @Test("A capture that stops by itself while the source is starting fails the start and leaves the source stopped")
+    func captureStoppingByItselfDuringTheStartFailsIt() async throws {
         let captures = StandInCaptures(held: true)
         let source = ScreenAudioSource(sourceID: "screen", openCapture: captures.open)
         let start = Task { try await source.start() }
@@ -121,12 +121,46 @@ struct ScreenAudioSourceLifecycleTests {
 
         captures.opened[0].stopByItself()
         captures.release()
-        try await start.value
+        await #expect(throws: RecorderError.screenCaptureUnavailable) { try await start.value }
 
         #expect(!source.isActive)
         try await source.start()
         #expect(captures.opened.count == 2)
         #expect(source.isActive)
+    }
+
+    @Test("A start that joined an opening whose capture stops by itself fails with it")
+    func joinedStartFailsWhenTheCaptureStopsByItself() async throws {
+        let captures = StandInCaptures(held: true)
+        let source = ScreenAudioSource(sourceID: "screen", openCapture: captures.open)
+        let first = Task { try await source.start() }
+        try await Self.waitUntil { captures.opened.count == 1 }
+        let second = Task { try await source.start() }
+        try await Task.sleep(for: .milliseconds(200))   // time for the second start to join
+
+        captures.opened[0].stopByItself()
+        captures.release()
+        await #expect(throws: RecorderError.screenCaptureUnavailable) { try await first.value }
+        await #expect(throws: RecorderError.screenCaptureUnavailable) { try await second.value }
+
+        #expect(captures.opened.count == 1)
+        #expect(!source.isActive)
+    }
+
+    @Test("A stop during the start wins over the capture stopping by itself: the start returns")
+    func stopDuringTheStartWinsOverTheCaptureStoppingByItself() async throws {
+        let captures = StandInCaptures(held: true)
+        let source = ScreenAudioSource(sourceID: "screen", openCapture: captures.open)
+        let start = Task { try await source.start() }
+        try await Self.waitUntil { captures.opened.count == 1 }
+
+        try await source.stop()
+        captures.opened[0].stopByItself()
+        captures.release()
+        try await start.value
+
+        #expect(!source.isActive)
+        #expect(captures.opened.allSatisfy { $0.isStopped })
     }
 
     /// Polls `condition` for up to five seconds.
