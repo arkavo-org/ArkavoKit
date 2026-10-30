@@ -539,6 +539,35 @@ struct RecordingSessionStopTests {
         await session.stopStreaming()
     }
 
+    @Test("The 30 fps driver composes one frame at a time, so a slow composite skips ticks instead of queueing them")
+    func slowCompositeSkipsTicks() async throws {
+        let url = Self.outputURL("slow-composite")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let session = try Self.avatarSession()
+        let green = try SolidFrame(red: 0, green: 255, blue: 0)
+        // Each composite takes 100 ms, three ticks' worth.
+        let composites = OSAllocatedUnfairLock(initialState: (running: 0, peak: 0, started: 0))
+        session.avatarTextureProvider = {
+            composites.withLock { state in
+                state.running += 1
+                state.peak = max(state.peak, state.running)
+                state.started += 1
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+            composites.withLock { $0.running -= 1 }
+            return green.buffer
+        }
+        try await session.startRecording(outputURL: url, title: "slow composite")
+        let before = composites.withLock { $0.started }
+        try await Task.sleep(for: .seconds(1))
+        let during = composites.withLock { $0.started } - before
+        _ = try await session.stopRecording()
+
+        // Unbounded, every tick starts a composite: about 30 in the second, three or four at once.
+        #expect(composites.withLock { $0.peak } == 1)
+        #expect(during <= 12, "\(during) composites started in one second")
+    }
+
     /// An avatar session with the microphone on, whose permission request is held until answered.
     private static func sessionWithHeldPermission() throws -> (RecordingSession, HeldPermission) {
         let permission = HeldPermission()

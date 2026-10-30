@@ -333,6 +333,8 @@ public final class RecordingSession: Sendable {
 
     /// Timer for driving frame capture in non-desktop modes
     nonisolated(unsafe) private var cameraFrameTimer: Timer?
+    /// Whether a frame the 30 fps timer started is still composing or encoding.
+    private let drivenFrameInFlight = OSAllocatedUnfairLock(initialState: false)
 
     /// Debug logging throttle
     nonisolated(unsafe) private var lastDebugLogTime: Date?
@@ -949,13 +951,24 @@ public final class RecordingSession: Sendable {
 
     // MARK: - Camera/Avatar Frame Driver
 
-    /// Starts a timer to drive frame capture at 30fps for non-desktop modes
+    /// Starts a timer to drive frame capture at 30fps for non-desktop modes.
+    ///
+    /// One frame at a time: a tick that comes while the previous frame is still composing or
+    /// encoding is skipped, so a slow composite lowers the frame rate instead of queueing frames.
     private func startCameraFrameDriver() {
         stopCameraFrameDriver()
 
+        let inFlight = drivenFrameInFlight
         cameraFrameTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+            let admitted = inFlight.withLock { busy in
+                guard !busy else { return false }
+                busy = true
+                return true
+            }
+            guard admitted else { return }
             Task { @MainActor [weak self] in
                 await self?.processCameraOrAvatarFrame()
+                inFlight.withLock { $0 = false }
             }
         }
     }
