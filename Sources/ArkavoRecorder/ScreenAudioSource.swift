@@ -50,6 +50,9 @@ public final class ScreenAudioSource: NSObject, AudioSource, @unchecked Sendable
         var joiners: [CheckedContinuation<Bool, any Error>] = []
         /// A stop came after the last start: the capture is stopped as soon as it opens.
         var stopRequested = false
+        /// Stops made while it opens. Each returns once the opening has ended: after the capture
+        /// is stopped when it is, at once when a later start kept it or the open failed.
+        var stopWaiters: [CheckedContinuation<Void, Never>] = []
         /// The capture stopped by itself before it finished opening.
         var stoppedByItself = false
     }
@@ -93,7 +96,7 @@ public final class ScreenAudioSource: NSObject, AudioSource, @unchecked Sendable
 
     /// Opens a capture. Returns at once while one is running. A start made while one is opening
     /// waits for it and returns or throws as it does, so overlapping starts open one capture.
-    /// It also cancels a stop made during that opening: the latest call wins.
+    /// It also cancels a stop made during that opening: the latest call wins, and that stop returns.
     ///
     /// Throws `RecorderError.screenCaptureUnavailable` when the capture stops by itself before it
     /// finishes opening. A stop made after the last start wins over that: the start returns, as
@@ -126,64 +129,83 @@ public final class ScreenAudioSource: NSObject, AudioSource, @unchecked Sendable
                 { [weak self] _ in self?.captureStoppedByItself(token) }
             )
         } catch {
-            for joiner in finishOpening(token, keeping: nil).joiners { joiner.resume(throwing: error) }
+            let (_, joiners, stops) = finishOpening(token, keeping: nil)
+            for joiner in joiners { joiner.resume(throwing: error) }
+            for stop in stops { stop.resume() }   // there is no capture to stop
             throw error
         }
 
         // Kept unless a stop came while it opened, or it has already stopped by itself.
-        let (end, joiners) = finishOpening(token, keeping: capture)
+        let (end, joiners, stops) = finishOpening(token, keeping: capture)
         switch end {
         case .kept:
             for joiner in joiners { joiner.resume(returning: false) }
+            for stop in stops { stop.resume() }   // a later start cancelled these stops
             print("🔊 ScreenAudioSource [\(sourceID)] started")
         case .stopped:
             for joiner in joiners { joiner.resume(returning: false) }
             try? await capture.stop()
+            for stop in stops { stop.resume() }
             print("🔊 ScreenAudioSource [\(sourceID)] stopped as it started")
         case .stoppedByItself:
             for joiner in joiners { joiner.resume(throwing: RecorderError.screenCaptureUnavailable) }
             try? await capture.stop()
+            for stop in stops { stop.resume() }
             throw RecorderError.screenCaptureUnavailable
         }
     }
 
     /// Ends the opening of the capture with `token`: the source runs `capture` unless a stop
     /// came meanwhile or it stopped by itself, and is idle otherwise; a stop wins over stopping by
-    /// itself. Returns how it ended, and the starts that joined the opening. For an open that
-    /// failed (`capture` nil) only the joiners count: they get the open's error.
+    /// itself. Returns how it ended, the starts that joined the opening and the stops waiting for
+    /// it; the caller resumes them all, outside the lock. For an open that failed (`capture` nil)
+    /// only the joiners and the stops count: the joiners get the open's error.
     private func finishOpening(
         _ token: UUID, keeping capture: (any ScreenAudioCapture)?
-    ) -> (end: OpeningEnd, joiners: [CheckedContinuation<Bool, any Error>]) {
+    ) -> (
+        end: OpeningEnd,
+        joiners: [CheckedContinuation<Bool, any Error>],
+        stopWaiters: [CheckedContinuation<Void, Never>]
+    ) {
         state.withLockUnchecked { state in
-            guard case .opening(let opening) = state, opening.token == token else { return (.stopped, []) }
+            guard case .opening(let opening) = state, opening.token == token else { return (.stopped, [], []) }
             if let capture, !opening.stopRequested, !opening.stoppedByItself {
                 state = .running(capture: capture, token: token)
-                return (.kept, opening.joiners)
+                return (.kept, opening.joiners, opening.stopWaiters)
             }
             state = .idle
             let end: OpeningEnd = opening.stoppedByItself && !opening.stopRequested ? .stoppedByItself : .stopped
-            return (end, opening.joiners)
+            return (end, opening.joiners, opening.stopWaiters)
         }
     }
 
     /// Forgets the capture before stopping it: one that already stopped by itself throws here,
     /// and the source must read as stopped either way, so the next start opens a fresh one.
-    /// A capture still opening is stopped by its start as soon as it opens; this returns at once.
+    ///
+    /// A capture still opening is stopped by its start as soon as it opens, and this returns once
+    /// it has been, so a caller that awaits this gets no more audio from it. It also returns when
+    /// the open fails, and when a start made after it keeps the capture (the latest call wins).
     public func stop() async throws {
-        let capture = state.withLockUnchecked { state -> (any ScreenAudioCapture)? in
-            switch state {
-            case .idle:
-                return nil
-            case .opening(var opening):
-                opening.stopRequested = true
-                state = .opening(opening)
-                return nil
-            case .running(let capture, _):
-                state = .idle
-                return capture
+        var running: (any ScreenAudioCapture)?
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let waits = state.withLockUnchecked { state -> Bool in
+                switch state {
+                case .idle:
+                    return false
+                case .opening(var opening):
+                    opening.stopRequested = true
+                    opening.stopWaiters.append(continuation)
+                    state = .opening(opening)
+                    return true
+                case .running(let capture, _):
+                    state = .idle
+                    running = capture
+                    return false
+                }
             }
+            if !waits { continuation.resume() }
         }
-        guard let capture else { return }
+        guard let capture = running else { return }
 
         try await capture.stop()
 

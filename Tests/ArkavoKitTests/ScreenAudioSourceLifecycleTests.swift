@@ -77,39 +77,63 @@ struct ScreenAudioSourceLifecycleTests {
         #expect(captures.opened.allSatisfy { $0.isStopped }, "a capture is still open")
     }
 
-    @Test("A stop while the source is starting leaves no desktop audio capture open")
-    func stopDuringAStartLeavesNoCaptureOpen() async throws {
+    @Test("A stop while the source is starting returns only once the capture it opens is stopped")
+    func stopDuringAStartReturnsOnceTheCaptureIsStopped() async throws {
         let captures = StandInCaptures(held: true)
         let source = ScreenAudioSource(sourceID: "screen", openCapture: captures.open)
         let start = Task { try await source.start() }
         try await Self.waitUntil { captures.opened.count == 1 }
 
-        try await source.stop()
+        let stop = StopCall(source, capture: captures.opened[0])
+        try await Task.sleep(for: .milliseconds(200))   // time for a stop that doesn't wait to return
+        #expect(!stop.hasReturned, "the stop returned while the capture was still opening")
         captures.release()
         try await start.value
+        try await stop.waitForReturn()
 
+        #expect(stop.captureWasStoppedOnReturn == true, "the stop returned before the capture was stopped")
         #expect(!source.isActive)
         #expect(captures.opened.allSatisfy { $0.isStopped }, "the capture opened after the stop is still open")
     }
 
-    @Test("A start after a stop, both while the source is starting, keeps the capture it opens")
+    @Test("A start after a stop, both while the source is starting, keeps the capture it opens, and the stop returns")
     func startAfterAStopDuringAStartKeepsTheCapture() async throws {
         let captures = StandInCaptures(held: true)
         let source = ScreenAudioSource(sourceID: "screen", openCapture: captures.open)
         let first = Task { try await source.start() }
         try await Self.waitUntil { captures.opened.count == 1 }
-        try await source.stop()
+        let stop = StopCall(source)
+        try await Task.sleep(for: .milliseconds(200))   // time for the stop to begin
         let second = Task { try await source.start() }
         try await Task.sleep(for: .milliseconds(200))   // time for a second open to begin
 
         captures.release()
         try await first.value
         try await second.value
+        try await stop.waitForReturn()
 
+        #expect(stop.hasReturned, "the stop the second start cancelled never returned")
         #expect(captures.opened.count == 1)
         #expect(source.isActive)
         #expect(captures.opened.allSatisfy { !$0.isStopped })
         try await source.stop()
+    }
+
+    @Test("A stop while the source is starting returns when the capture fails to open")
+    func stopDuringAStartWhoseOpenFailsReturns() async throws {
+        let captures = StandInCaptures(held: true, failing: true)
+        let source = ScreenAudioSource(sourceID: "screen", openCapture: captures.open)
+        let start = Task { try await source.start() }
+        try await Self.waitUntil { captures.opened.count == 1 }
+        let stop = StopCall(source)
+        try await Task.sleep(for: .milliseconds(200))   // time for the stop to begin
+
+        captures.release()
+        await #expect(throws: RecorderError.screenCaptureUnavailable) { try await start.value }
+        try await stop.waitForReturn()
+
+        #expect(stop.hasReturned, "the stop never returned")
+        #expect(!source.isActive)
     }
 
     @Test("A capture that stops by itself while the source is starting fails the start and leaves the source stopped")
@@ -154,11 +178,14 @@ struct ScreenAudioSourceLifecycleTests {
         let start = Task { try await source.start() }
         try await Self.waitUntil { captures.opened.count == 1 }
 
-        try await source.stop()
+        let stop = StopCall(source, capture: captures.opened[0])
+        try await Task.sleep(for: .milliseconds(200))   // time for the stop to begin
         captures.opened[0].stopByItself()
         captures.release()
         try await start.value
+        try await stop.waitForReturn()
 
+        #expect(stop.captureWasStoppedOnReturn == true)
         #expect(!source.isActive)
         #expect(captures.opened.allSatisfy { $0.isStopped })
     }
@@ -172,15 +199,17 @@ struct ScreenAudioSourceLifecycleTests {
     }
 }
 
-/// Stand-ins for ScreenCaptureKit captures, kept in the order they were opened. Held ones don't
-/// finish opening until `release()`.
+/// Stand-ins for ScreenCaptureKit captures, kept in the order their opens began. Held ones don't
+/// finish opening until `release()`; failing ones then throw instead of opening.
 @MainActor
 private final class StandInCaptures {
     private(set) var opened: [StandInCapture] = []
     private let held: OSAllocatedUnfairLock<Bool>
+    private let failing: Bool
 
-    init(held: Bool = false) {
+    init(held: Bool = false, failing: Bool = false) {
         self.held = OSAllocatedUnfairLock(initialState: held)
+        self.failing = failing
     }
 
     func release() {
@@ -188,11 +217,41 @@ private final class StandInCaptures {
     }
 
     var open: OpenScreenAudioCapture {
-        { [self, held] _, onStop in
+        { [self, held, failing] _, onStop in
             let capture = StandInCapture(onStop: onStop)
             await MainActor.run { opened.append(capture) }
             while held.withLock({ $0 }) { try? await Task.sleep(for: .milliseconds(10)) }
+            if failing { throw RecorderError.screenCaptureUnavailable }
             return capture
+        }
+    }
+}
+
+/// A `stop()` made in a task, so a test can make it while the source is starting and wait for it
+/// with a timeout: a stop that never returns fails the test instead of hanging it.
+@MainActor
+private final class StopCall {
+    /// Nil until the stop returns; then whether `capture` had been stopped by then.
+    private let returned = OSAllocatedUnfairLock<Bool?>(initialState: nil)
+
+    init(_ source: ScreenAudioSource, capture: StandInCapture? = nil) {
+        let returned = returned
+        Task {
+            try? await source.stop()
+            returned.withLock { $0 = capture?.isStopped ?? true }
+        }
+    }
+
+    var hasReturned: Bool { returned.withLock { $0 != nil } }
+
+    /// Whether the capture had been stopped when the stop returned; nil before it returns.
+    var captureWasStoppedOnReturn: Bool? { returned.withLock { $0 } }
+
+    /// Polls for up to five seconds for the stop to return.
+    func waitForReturn() async throws {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !hasReturned && .now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
         }
     }
 }
