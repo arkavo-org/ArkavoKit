@@ -284,6 +284,64 @@ struct RecordingSessionStopTests {
         #expect(!(await live.screenIsCapturing()))
     }
 
+    @Test("Pausing a recording keeps a live stream going, and the file takes nothing while paused")
+    func pausingARecordingKeepsTheStreamGoing() async throws {
+        let url = Self.outputURL("paused-stream")
+        defer { try? FileManager.default.removeItem(at: url) }
+        // Once the encoder is paused, the avatar turns red.
+        let paused = OSAllocatedUnfairLock(initialState: false)
+        let encoder = VideoEncoder()
+        let session = try Self.avatarSession(encoder: encoder)
+        let green = try SolidFrame(red: 0, green: 255, blue: 0)
+        let red = try SolidFrame(red: 255, green: 0, blue: 0)
+        session.avatarTextureProvider = { paused.withLock { $0 } ? red.buffer : green.buffer }
+        let streamFrames = OSAllocatedUnfairLock(initialState: 0)
+        try await session.startRecording(outputURL: url, title: "paused stream")
+        try await session.startStreamingForTesting { _ in streamFrames.withLock { $0 += 1 } }
+        try await Self.waitUntil { streamFrames.withLock { $0 } >= 10 }
+
+        session.pauseRecording()
+        await encoder.pause()   // the session's pause reaches the encoder in a task; this one is done on return
+        paused.withLock { $0 = true }
+        let atPause = streamFrames.withLock { $0 }
+        try await Task.sleep(for: .seconds(1))
+        let whilePaused = streamFrames.withLock { $0 } - atPause
+        _ = try await session.stopRecording()
+        await session.stopStreaming()
+
+        // About 30 at 30 fps; a held-back stream still shows a few from the encoder's lag.
+        #expect(whilePaused >= 15)
+        let colors = try await Self.centerColors(in: url)
+        #expect(!colors.isEmpty)
+        #expect(colors.allSatisfy { $0.g > 150 && $0.r < 100 }, "a frame composed while paused reached the file")
+    }
+
+    @Test("A stream's timestamps keep moving forward through a recording's pause, resume and stop")
+    func streamTimestampsKeepMovingForwardThroughAPause() async throws {
+        let url = Self.outputURL("stream-timeline")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let session = try Self.avatarSession()
+        let times = OSAllocatedUnfairLock(initialState: [CMTime]())
+        try await session.startRecording(outputURL: url, title: "stream timeline")
+        try await session.startStreamingForTesting { frame in
+            let pts = frame.pts
+            times.withLock { $0.append(pts) }
+        }
+        try await Self.waitUntil { times.withLock { $0.count } >= 5 }
+        session.pauseRecording()
+        try await Task.sleep(for: .milliseconds(500))
+        session.resumeRecording()
+        try await Task.sleep(for: .milliseconds(500))
+        _ = try await session.stopRecording()
+        let atStop = times.withLock { $0.count }
+        try await Self.waitUntil { times.withLock { $0.count } >= atStop + 5 }
+        await session.stopStreaming()
+
+        let pts = times.withLock { $0 }
+        #expect(pts.count >= 15)
+        #expect(zip(pts, pts.dropFirst()).allSatisfy { CMTimeCompare($0, $1) < 0 }, "the stream's timestamps went back")
+    }
+
     private static func outputURL(_ name: String) -> URL {
         FileManager.default.temporaryDirectory.appendingPathComponent("\(name)-\(UUID().uuidString).mov")
     }

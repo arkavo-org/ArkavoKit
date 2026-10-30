@@ -113,7 +113,10 @@ public actor VideoEncoder {
     private var videoFormatDescription: CMFormatDescription?
     private var audioFormatDescription: CMFormatDescription?
     private var streamStartTime: CMTime?
-    private var lastStreamVideoTimestamp: CMTime = .zero
+    /// The stream's first video frame, on the capture clock; the stream's timeline starts there
+    private var streamVideoBase: CMTime?
+    /// The last video frame sent to the stream, on the stream's timeline
+    private var lastStreamVideoTime: CMTime?
     private var lastStreamAudioTimestamp: CMTime = .zero
 
     // Encoding settings - adaptive based on system capabilities
@@ -505,10 +508,12 @@ public actor VideoEncoder {
 
     // MARK: - Frame Encoding
 
-    /// Encodes a video frame
+    /// Encodes a video frame: into the file while recording, unless paused, and into the stream
+    /// while streaming. A pause holds back the file only; a live stream goes on through it.
     public func encodeVideoFrame(_ pixelBuffer: CVPixelBuffer, timestamp: CMTime) {
-        // Allow frames through if recording OR streaming (NTDF or regular)
-        guard (isRecording || isStreaming || isNTDFStreaming), !isPaused else { return }
+        let toFile = isRecording && !isPaused
+        let toStream = isStreaming || isNTDFStreaming
+        guard toFile || toStream else { return }
 
         // Validate timestamp
         guard timestamp.isValid, timestamp.seconds >= 0 else {
@@ -516,128 +521,113 @@ public actor VideoEncoder {
             return
         }
 
-        // Calculate adjusted timestamp for both recording and streaming
+        if toFile { appendVideoToFile(pixelBuffer, timestamp: timestamp) }
+        if toStream { streamVideo(pixelBuffer, timestamp: timestamp) }
+    }
+
+    /// Appends a frame to the file, on the file's timeline: time since its first frame, less pauses.
+    private func appendVideoToFile(_ pixelBuffer: CVPixelBuffer, timestamp: CMTime) {
         var adjustedTimestamp = timestamp
+        guard let videoInput = videoInput, let adaptor = pixelBufferAdaptor else { return }
+        guard let assetWriter = assetWriter else { return }
 
-        // If recording to file, handle file-specific logic
-        if isRecording {
-            guard let videoInput = videoInput, let adaptor = pixelBufferAdaptor else { return }
-            guard let assetWriter = assetWriter else { return }
-
-            // Check if asset writer is ready for writing
-            guard assetWriter.status == .writing else {
-                if assetWriter.status == .failed {
-                    print("❌ Asset writer failed before encoding could start")
-                }
-                droppedMedia.video.notWriting += 1
-                return
+        // Check if asset writer is ready for writing
+        guard assetWriter.status == .writing else {
+            if assetWriter.status == .failed {
+                print("❌ Asset writer failed before encoding could start")
             }
-
-            // Wait if input is not ready. Checked before the session starts, so a frame dropped
-            // here can't set the timeline's start, as on the audio-only path (#44)
-            if !videoInput.isReadyForMoreMediaData {
-                droppedMedia.video.notReady += 1
-                return
-            }
-
-            // Initialize session on the first frame the input can take
-            if !sessionStarted {
-                sessionStarted = true
-                startTime = timestamp
-                // Start session at time zero - we'll normalize all timestamps
-                assetWriter.startSession(atSourceTime: .zero)
-                lastVideoTimestamp = nil
-                print("📹 VideoEncoder: Session started, base timestamp \(timestamp.seconds)")
-            }
-
-            // Double-check asset writer is still healthy
-            guard assetWriter.status == .writing else {
-                if assetWriter.status == .failed {
-                    let errorMessage = assetWriter.error?.localizedDescription ?? "Unknown error"
-                    let underlyingError = (assetWriter.error as NSError?)?.userInfo[NSUnderlyingErrorKey] as? NSError
-                    print("❌ Asset writer failed during video encoding: \(errorMessage)")
-                    if let underlyingError = underlyingError {
-                        print("   Underlying error: Domain=\(underlyingError.domain) Code=\(underlyingError.code)")
-                    }
-                }
-                droppedMedia.video.notWriting += 1
-                return
-            }
-
-            // Normalize timestamp relative to recording start
-            guard let baseTime = startTime else { return }
-            adjustedTimestamp = CMTimeSubtract(timestamp, baseTime)
-
-            // Skip frames from before recording started (can happen with preview running)
-            if adjustedTimestamp.seconds < 0 {
-                droppedMedia.video.beforeStart += 1
-                return
-            }
-
-            // Adjust for pauses
-            closePauseGap(at: adjustedTimestamp)
-            if !totalPausedDuration.seconds.isZero {
-                adjustedTimestamp = CMTimeSubtract(adjustedTimestamp, totalPausedDuration)
-            }
-
-            // Ensure timestamps are monotonically increasing. The first frame has nothing to follow:
-            // compared with a zero start it would fail, and every recording lost it (#44)
-            if let lastVideoTimestamp, CMTimeCompare(adjustedTimestamp, lastVideoTimestamp) <= 0 {
-                droppedMedia.video.outOfOrder += 1
-                return
-            }
-
-            // Append pixel buffer to file
-            if !adaptor.append(pixelBuffer, withPresentationTime: adjustedTimestamp) {
-                droppedMedia.video.rejected += 1
-                print("❌ Failed to append video frame at timestamp \(adjustedTimestamp.seconds)")
-                if assetWriter.status == .failed {
-                    let errorMessage = assetWriter.error?.localizedDescription ?? "Unknown error"
-                    let underlyingError = (assetWriter.error as NSError?)?.userInfo[NSUnderlyingErrorKey] as? NSError
-                    print("   Asset writer error: \(errorMessage)")
-                    if let underlyingError = underlyingError {
-                        print("   Underlying error: Domain=\(underlyingError.domain) Code=\(underlyingError.code)")
-                    }
-                }
-                return
-            }
-            appendedMedia = true
-            lastVideoTimestamp = adjustedTimestamp
-            appendedMediaEnd = CMTimeMaximum(appendedMediaEnd, CMTimeAdd(adjustedTimestamp, CMTime(value: 1, timescale: frameRate)))
-        } else if isStreaming || isNTDFStreaming {
-            // Streaming-only mode: initialize stream timing on first frame
-            if !sessionStarted {
-                sessionStarted = true
-                startTime = timestamp
-                lastVideoTimestamp = nil
-                print("📹 VideoEncoder: Stream session started, base timestamp \(timestamp.seconds)")
-            }
-
-            // Normalize timestamp for streaming
-            if let baseTime = startTime {
-                adjustedTimestamp = CMTimeSubtract(timestamp, baseTime)
-            }
-
-            // Skip frames from before stream started
-            if adjustedTimestamp.seconds < 0 {
-                return
-            }
-
-            // Ensure timestamps are monotonically increasing
-            if let lastVideoTimestamp, CMTimeCompare(adjustedTimestamp, lastVideoTimestamp) <= 0 {
-                return
-            }
-            lastVideoTimestamp = adjustedTimestamp
+            droppedMedia.video.notWriting += 1
+            return
         }
 
-        // Stream if streaming is active (either regular RTMP or NTDF-encrypted)
-        if (isStreaming || isNTDFStreaming), let encoder = streamVideoEncoder {
-            do {
-                try encoder.encode(pixelBuffer, timestamp: adjustedTimestamp)
-                streamFrameCount += 1
-            } catch {
-                print("❌ Stream video encoder failed: \(error)")
+        // Wait if input is not ready. Checked before the session starts, so a frame dropped
+        // here can't set the timeline's start, as on the audio-only path (#44)
+        if !videoInput.isReadyForMoreMediaData {
+            droppedMedia.video.notReady += 1
+            return
+        }
+
+        // Initialize session on the first frame the input can take
+        if !sessionStarted {
+            sessionStarted = true
+            startTime = timestamp
+            // Start session at time zero - we'll normalize all timestamps
+            assetWriter.startSession(atSourceTime: .zero)
+            lastVideoTimestamp = nil
+            print("📹 VideoEncoder: Session started, base timestamp \(timestamp.seconds)")
+        }
+
+        // Double-check asset writer is still healthy
+        guard assetWriter.status == .writing else {
+            if assetWriter.status == .failed {
+                let errorMessage = assetWriter.error?.localizedDescription ?? "Unknown error"
+                let underlyingError = (assetWriter.error as NSError?)?.userInfo[NSUnderlyingErrorKey] as? NSError
+                print("❌ Asset writer failed during video encoding: \(errorMessage)")
+                if let underlyingError = underlyingError {
+                    print("   Underlying error: Domain=\(underlyingError.domain) Code=\(underlyingError.code)")
+                }
             }
+            droppedMedia.video.notWriting += 1
+            return
+        }
+
+        // Normalize timestamp relative to recording start
+        guard let baseTime = startTime else { return }
+        adjustedTimestamp = CMTimeSubtract(timestamp, baseTime)
+
+        // Skip frames from before recording started (can happen with preview running)
+        if adjustedTimestamp.seconds < 0 {
+            droppedMedia.video.beforeStart += 1
+            return
+        }
+
+        // Adjust for pauses
+        closePauseGap(at: adjustedTimestamp)
+        if !totalPausedDuration.seconds.isZero {
+            adjustedTimestamp = CMTimeSubtract(adjustedTimestamp, totalPausedDuration)
+        }
+
+        // Ensure timestamps are monotonically increasing. The first frame has nothing to follow:
+        // compared with a zero start it would fail, and every recording lost it (#44)
+        if let lastVideoTimestamp, CMTimeCompare(adjustedTimestamp, lastVideoTimestamp) <= 0 {
+            droppedMedia.video.outOfOrder += 1
+            return
+        }
+
+        // Append pixel buffer to file
+        if !adaptor.append(pixelBuffer, withPresentationTime: adjustedTimestamp) {
+            droppedMedia.video.rejected += 1
+            print("❌ Failed to append video frame at timestamp \(adjustedTimestamp.seconds)")
+            if assetWriter.status == .failed {
+                let errorMessage = assetWriter.error?.localizedDescription ?? "Unknown error"
+                let underlyingError = (assetWriter.error as NSError?)?.userInfo[NSUnderlyingErrorKey] as? NSError
+                print("   Asset writer error: \(errorMessage)")
+                if let underlyingError = underlyingError {
+                    print("   Underlying error: Domain=\(underlyingError.domain) Code=\(underlyingError.code)")
+                }
+            }
+            return
+        }
+        appendedMedia = true
+        lastVideoTimestamp = adjustedTimestamp
+        appendedMediaEnd = CMTimeMaximum(appendedMediaEnd, CMTimeAdd(adjustedTimestamp, CMTime(value: 1, timescale: frameRate)))
+    }
+
+    /// Sends a frame to the stream on the stream's own timeline: time since the stream's first
+    /// frame. A recording's start, pause, resume or finish doesn't move it, so it never goes back.
+    private func streamVideo(_ pixelBuffer: CVPixelBuffer, timestamp: CMTime) {
+        guard let encoder = streamVideoEncoder else { return }
+        let base = streamVideoBase ?? timestamp
+        let streamTime = CMTimeSubtract(timestamp, base)
+        guard streamTime.seconds >= 0 else { return }
+        if let lastStreamVideoTime, CMTimeCompare(streamTime, lastStreamVideoTime) <= 0 { return }
+        streamVideoBase = base
+        lastStreamVideoTime = streamTime
+        do {
+            try encoder.encode(pixelBuffer, timestamp: streamTime)
+            streamFrameCount += 1
+        } catch {
+            print("❌ Stream video encoder failed: \(error)")
         }
     }
 
@@ -648,111 +638,115 @@ public actor VideoEncoder {
     ///   - sampleBuffer: Audio sample buffer (must be 48kHz PCM stereo)
     ///   - sourceID: Unique identifier for the audio source (e.g., "microphone", "screen", "remote-camera-123")
     public func encodeAudioSample(_ sampleBuffer: CMSampleBuffer, sourceID: String) {
-        // Allow audio processing if either recording OR streaming (regular or NTDF-encrypted)
-        guard (isRecording || isStreaming || isNTDFStreaming) && !isPaused else { return }
+        // A pause holds back the file only; a live stream goes on through it.
+        let toFile = isRecording && !isPaused
+        let toStream = isStreaming || isNTDFStreaming
+        guard toFile || toStream else { return }
 
         guard CMSampleBufferIsValid(sampleBuffer) else {
             return
         }
 
-        // Handle file recording if active
-        if isRecording {
-            guard let writer = assetWriter, writer.status == .writing else {
-                droppedMedia.audio.notWriting += 1
-                return
-            }
-
-            // With video, the first video frame starts the session
-            let isAudioOnly = videoInput == nil
-            guard isAudioOnly || startTime != nil else {
-                droppedMedia.audio.beforeSession += 1
-                return
-            }
-
-            // Get audio input for this source (must have been pre-created during startRecording)
-            guard let audioInput = audioInputs[sourceID] else {
-                print("⚠️ No audio input exists for source: \(sourceID). Audio inputs must be pre-created before recording starts.")
-                droppedMedia.audio.noInput += 1
-                return
-            }
-
-            // Wait if input is not ready
-            if !audioInput.isReadyForMoreMediaData {
-                droppedMedia.audio.notReady += 1
-                return
-            }
-
-            // Audio-only: start the session with the first sample that can be appended,
-            // so a dropped sample can't set the start time
-            if isAudioOnly && !sessionStarted {
-                let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-                sessionStarted = true
-                startTime = timestamp
-                writer.startSession(atSourceTime: .zero)
-                print("🎵 VideoEncoder: Audio-only session started, base timestamp \(timestamp.seconds)")
-            }
-
-            // Normalize audio timestamp relative to recording start (same as video)
-            guard let baseTime = startTime else { return }
-            let originalTimestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-            var adjustedTimestamp = CMTimeSubtract(originalTimestamp, baseTime)
-
-            // Skip audio from before recording started
-            if adjustedTimestamp.seconds < 0 {
-                droppedMedia.audio.beforeStart += 1
-                return
-            }
-
-            // Adjust for pauses
-            closePauseGap(at: adjustedTimestamp)
-            if !totalPausedDuration.seconds.isZero {
-                adjustedTimestamp = CMTimeSubtract(adjustedTimestamp, totalPausedDuration)
-            }
-
-            // Keep each audio track moving forward, as video is. A buffer that starts no later
-            // than its input's previous one, or overlaps what the input already wrote by more
-            // than half its own length, is late (e.g. a capture callback that landed after a
-            // recording's drained tail) and would take the track back. Smaller overlaps are clock
-            // drift and resampling, which leave consecutive buffers a little early.
-            let duration = CMSampleBufferGetDuration(sampleBuffer)
-            if let last = lastAudioAppended[sourceID] {
-                let startsBack = CMTimeCompare(adjustedTimestamp, last.start) <= 0
-                let overlapsBack = duration.isValid && CMTimeCompare(
-                    CMTimeSubtract(last.end, adjustedTimestamp),
-                    CMTimeMultiplyByRatio(duration, multiplier: 1, divisor: 2)
-                ) > 0
-                if startsBack || overlapsBack {
-                    droppedMedia.audio.outOfOrder += 1
-                    return
-                }
-            }
-
-            // Create adjusted sample buffer with normalized timing
-            guard let finalBuffer = Self.retimed(sampleBuffer, to: adjustedTimestamp) else {
-                print("⚠️ Failed to create adjusted audio buffer")
-                droppedMedia.audio.retimeFailed += 1
-                return
-            }
-
-            // Append audio sample to file
-            // AVAssetWriterInput will automatically encode PCM to AAC
-            if !audioInput.append(finalBuffer) {
-                droppedMedia.audio.rejected += 1
-                print("⚠️ Audio input [\(sourceID)] rejected sample buffer; dropping frame")
-                return
-            }
-            appendedMedia = true
-            let end = duration.isValid ? CMTimeAdd(adjustedTimestamp, duration) : adjustedTimestamp
-            lastAudioAppended[sourceID] = (adjustedTimestamp, end)
-            appendedMediaEnd = CMTimeMaximum(appendedMediaEnd, CMTimeAdd(adjustedTimestamp, duration))
-        }
+        if toFile { appendAudioToFile(sampleBuffer, sourceID: sourceID) }
 
         // Stream audio for RTMP — accept mixed output (from AudioMixer) or direct microphone
-        if (isStreaming || isNTDFStreaming), let encoder = streamAudioEncoder, (sourceID == "mixed" || sourceID == "microphone") {
+        if toStream, let encoder = streamAudioEncoder, (sourceID == "mixed" || sourceID == "microphone") {
             // Feed PCM audio to encoder for AAC conversion
             lastRealStreamAudio = CMClockGetTime(CMClockGetHostTimeClock())
             encoder.feed(sampleBuffer)
         }
+    }
+
+    /// Appends a source's audio to its track in the file, on the file's timeline.
+    private func appendAudioToFile(_ sampleBuffer: CMSampleBuffer, sourceID: String) {
+        guard let writer = assetWriter, writer.status == .writing else {
+            droppedMedia.audio.notWriting += 1
+            return
+        }
+
+        // With video, the first video frame starts the session
+        let isAudioOnly = videoInput == nil
+        guard isAudioOnly || startTime != nil else {
+            droppedMedia.audio.beforeSession += 1
+            return
+        }
+
+        // Get audio input for this source (must have been pre-created during startRecording)
+        guard let audioInput = audioInputs[sourceID] else {
+            print("⚠️ No audio input exists for source: \(sourceID). Audio inputs must be pre-created before recording starts.")
+            droppedMedia.audio.noInput += 1
+            return
+        }
+
+        // Wait if input is not ready
+        if !audioInput.isReadyForMoreMediaData {
+            droppedMedia.audio.notReady += 1
+            return
+        }
+
+        // Audio-only: start the session with the first sample that can be appended,
+        // so a dropped sample can't set the start time
+        if isAudioOnly && !sessionStarted {
+            let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+            sessionStarted = true
+            startTime = timestamp
+            writer.startSession(atSourceTime: .zero)
+            print("🎵 VideoEncoder: Audio-only session started, base timestamp \(timestamp.seconds)")
+        }
+
+        // Normalize audio timestamp relative to recording start (same as video)
+        guard let baseTime = startTime else { return }
+        let originalTimestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        var adjustedTimestamp = CMTimeSubtract(originalTimestamp, baseTime)
+
+        // Skip audio from before recording started
+        if adjustedTimestamp.seconds < 0 {
+            droppedMedia.audio.beforeStart += 1
+            return
+        }
+
+        // Adjust for pauses
+        closePauseGap(at: adjustedTimestamp)
+        if !totalPausedDuration.seconds.isZero {
+            adjustedTimestamp = CMTimeSubtract(adjustedTimestamp, totalPausedDuration)
+        }
+
+        // Keep each audio track moving forward, as video is. A buffer that starts no later
+        // than its input's previous one, or overlaps what the input already wrote by more
+        // than half its own length, is late (e.g. a capture callback that landed after a
+        // recording's drained tail) and would take the track back. Smaller overlaps are clock
+        // drift and resampling, which leave consecutive buffers a little early.
+        let duration = CMSampleBufferGetDuration(sampleBuffer)
+        if let last = lastAudioAppended[sourceID] {
+            let startsBack = CMTimeCompare(adjustedTimestamp, last.start) <= 0
+            let overlapsBack = duration.isValid && CMTimeCompare(
+                CMTimeSubtract(last.end, adjustedTimestamp),
+                CMTimeMultiplyByRatio(duration, multiplier: 1, divisor: 2)
+            ) > 0
+            if startsBack || overlapsBack {
+                droppedMedia.audio.outOfOrder += 1
+                return
+            }
+        }
+
+        // Create adjusted sample buffer with normalized timing
+        guard let finalBuffer = Self.retimed(sampleBuffer, to: adjustedTimestamp) else {
+            print("⚠️ Failed to create adjusted audio buffer")
+            droppedMedia.audio.retimeFailed += 1
+            return
+        }
+
+        // Append audio sample to file
+        // AVAssetWriterInput will automatically encode PCM to AAC
+        if !audioInput.append(finalBuffer) {
+            droppedMedia.audio.rejected += 1
+            print("⚠️ Audio input [\(sourceID)] rejected sample buffer; dropping frame")
+            return
+        }
+        appendedMedia = true
+        let end = duration.isValid ? CMTimeAdd(adjustedTimestamp, duration) : adjustedTimestamp
+        lastAudioAppended[sourceID] = (adjustedTimestamp, end)
+        appendedMediaEnd = CMTimeMaximum(appendedMediaEnd, CMTimeAdd(adjustedTimestamp, duration))
     }
 
     /// Legacy method for backward compatibility - routes to "microphone" source
@@ -978,7 +972,8 @@ public actor VideoEncoder {
         streamVideoEncoder = videoEncoder
         streamAudioEncoder = audioEncoder
         streamStartTime = startTime ?? CMClockGetTime(CMClockGetHostTimeClock())
-        lastStreamVideoTimestamp = .zero
+        streamVideoBase = nil
+        lastStreamVideoTime = nil
         lastStreamAudioTimestamp = .zero
 
         // Silence fills gaps only, on the host clock the real audio uses. It once ran alongside
@@ -1029,6 +1024,8 @@ public actor VideoEncoder {
         videoEncoder.onFrame = onEncodedVideo
         streamVideoEncoder = videoEncoder
         streamStartTime = startTime ?? CMClockGetTime(CMClockGetHostTimeClock())
+        streamVideoBase = nil
+        lastStreamVideoTime = nil
         streamsWithoutDestinationForTesting = true
     }
 
@@ -1267,7 +1264,8 @@ public actor VideoEncoder {
         ntdfStreamingManager = manager
         isNTDFStreaming = true
         streamStartTime = startTime ?? CMClockGetTime(CMClockGetHostTimeClock())
-        lastStreamVideoTimestamp = .zero
+        streamVideoBase = nil
+        lastStreamVideoTime = nil
         lastStreamAudioTimestamp = .zero
 
         print("✅ NTDF-encrypted stream started")
