@@ -63,17 +63,7 @@ public final class ScreenAudioSource: NSObject, AudioSource, @unchecked Sendable
             exceptingWindows: []
         )
 
-        // Configure stream
-        let streamConfig = SCStreamConfiguration()
-        streamConfig.capturesAudio = true
-        streamConfig.sampleRate = 48000 // 48kHz
-        streamConfig.channelCount = 2   // Stereo
-
-        // Don't capture video in audio-only source
-        // Smallest video surface WindowServer reliably creates (1x1 can fail IOSurface creation).
-        streamConfig.width = 2
-        streamConfig.height = 2
-        streamConfig.minimumFrameInterval = CMTime(value: 1, timescale: 1)
+        let streamConfig = Self.makeStreamConfiguration()
 
         // Create stream output handler
         let output = ScreenAudioStreamOutput { [weak self] sampleBuffer in
@@ -104,6 +94,23 @@ public final class ScreenAudioSource: NSObject, AudioSource, @unchecked Sendable
     }
 
     // MARK: - Private Methods
+
+    /// 48 kHz stereo system audio, excluding this app's own output: audio the host app mixes
+    /// directly (Creator's Muse voice) would otherwise reach the mix a second time, delayed.
+    static func makeStreamConfiguration() -> SCStreamConfiguration {
+        let streamConfig = SCStreamConfiguration()
+        streamConfig.capturesAudio = true
+        streamConfig.excludesCurrentProcessAudio = true
+        streamConfig.sampleRate = 48000 // 48kHz
+        streamConfig.channelCount = 2   // Stereo
+
+        // Don't capture video in audio-only source
+        // Smallest video surface WindowServer reliably creates (1x1 can fail IOSurface creation).
+        streamConfig.width = 2
+        streamConfig.height = 2
+        streamConfig.minimumFrameInterval = CMTime(value: 1, timescale: 1)
+        return streamConfig
+    }
 
     private func checkScreenRecordingPermission() async -> Bool {
         // ScreenCaptureKit doesn't have a direct permission check API

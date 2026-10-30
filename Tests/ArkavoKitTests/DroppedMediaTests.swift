@@ -73,6 +73,91 @@ struct DroppedMediaTests {
         #expect(dropped.notReady > 0 || dropped.outOfOrder == 2, "\(dropped)")
     }
 
+    @Test("Late clock audio inside a recording's drained tail is dropped, so the file's audio never goes back")
+    func lateAudioAfterTheDrainIsDropped() async throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dropped-late-\(UUID().uuidString).m4a")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let encoder = VideoEncoder()
+        try await encoder.startRecording(to: url, title: "late", audioSourceIDs: [AudioMixer.outputSourceID], videoEnabled: false)
+        let mix = Self.mixWithLateClockBuffers()
+        for mixed in mix {
+            let buffer = AudioMixerTests.buffer(frames: mixed.samples.count / 2, pts: mixed.pts) { mixed.samples[$0 * 2] }
+            await encoder.encodeAudioSample(buffer, sourceID: AudioMixer.outputSourceID)
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        _ = try await encoder.finishRecording()
+
+        let dropped = await encoder.droppedMedia.audio
+        #expect(dropped.outOfOrder == 2, "\(dropped)")
+        // The file holds the mix up to the end of the drained tail, on a timeline that only
+        // moves forward. Without the check the writer appended the late audio after the tail.
+        let decoded = try await Self.audioBufferTimes(url)
+        let decodedFrames: Int = decoded.map(\.frames).reduce(0, +)
+        let mixedUntilTheTailEnds: Int = mix.dropLast(2).map { $0.samples.count / 2 }.reduce(0, +)
+        #expect(decodedFrames == mixedUntilTheTailEnds)
+        #expect(zip(decoded, decoded.dropFirst()).allSatisfy { CMTimeCompare($0.pts, $1.pts) < 0 })
+    }
+
+    @Test("Audio slightly early on its input's timeline, as clock drift and resampling leave it, is still written")
+    func slightlyEarlyAudioIsWritten() async throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dropped-drift-\(UUID().uuidString).m4a")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let encoder = VideoEncoder()
+        try await encoder.startRecording(to: url, title: "drift", audioSourceIDs: ["microphone"], videoEnabled: false)
+        // Each 1024-frame buffer starts one frame before the previous one ends.
+        for i in 0..<30 {
+            let pts = CMTime(value: CMTimeValue(i * 1023), timescale: 48000)
+            await encoder.encodeAudioSample(AudioMixerTests.buffer(frames: 1024, value: 1000, pts: pts), sourceID: "microphone")
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        _ = try await encoder.finishRecording()
+        #expect(await encoder.droppedMedia.audio.outOfOrder == 0)
+    }
+
+    /// The mix a recording's stop hands the encoder when two capture callbacks land late: 20 clock
+    /// buffers carrying desktop audio, the drained tail, then two clock buffers stamped inside that
+    /// tail (one at its start, one just after). Each buffer's PTS and interleaved samples.
+    static func mixWithLateClockBuffers() -> [(pts: CMTime, samples: [Int16])] {
+        let mixer = AudioMixer()
+        mixer.setClockSource("microphone")
+        var mixed: [(pts: CMTime, samples: [Int16])] = []
+        mixer.onMixedSample = { mixed.append((CMSampleBufferGetPresentationTimeStamp($0), AudioMixerTests.samples($0))) }
+        for i in 0..<20 {
+            mixer.addSample(AudioMixerTests.buffer(frames: 960, value: 500, pts: .zero), from: "screen")
+            mixer.addSample(AudioMixerTests.buffer(frames: 1024, value: 0, pts: CMTime(value: CMTimeValue(i * 1024), timescale: 48000)),
+                            from: "microphone")
+        }
+        mixer.drain()
+        let tailStart = 20 * 1024
+        for late in [tailStart, tailStart + 128] {
+            mixer.addSample(AudioMixerTests.buffer(frames: 1024, value: 0, pts: CMTime(value: CMTimeValue(late), timescale: 48000)),
+                            from: "microphone")
+        }
+        return mixed
+    }
+
+    /// Presentation times and lengths of the file's decoded audio buffers, in file order. The
+    /// reader's end-of-track and trim markers carry no samples and are left out.
+    static func audioBufferTimes(_ url: URL) async throws -> [(pts: CMTime, frames: Int)] {
+        let asset = AVURLAsset(url: url)
+        let track = try #require(try await asset.loadTracks(withMediaType: .audio).first)
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: [AVFormatIDKey: kAudioFormatLinearPCM])
+        reader.add(output)
+        #expect(reader.startReading())
+        var times: [(pts: CMTime, frames: Int)] = []
+        while let buffer = output.copyNextSampleBuffer() {
+            let frames = CMSampleBufferGetNumSamples(buffer)
+            guard frames > 0 else { continue }
+            times.append((CMSampleBufferGetPresentationTimeStamp(buffer), frames))
+        }
+        return times
+    }
+
     @Test("A new recording starts with no drops counted")
     func countsResetPerRecording() async throws {
         let url = FileManager.default.temporaryDirectory
