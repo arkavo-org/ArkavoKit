@@ -37,8 +37,9 @@ public final class CompositorManager: Sendable {
 
     // Avatar and Muse slot layers
 
-    /// Where the avatar and Muse slot layers go. The four values change together under one
-    /// lock, and each frame reads them once, so a frame never mixes a new slot with an old rect.
+    /// Where the avatar and Muse slot layers go. Each value is written under one lock and a frame
+    /// snapshots all four once, so a rect never tears mid-composite. Each setter writes one value,
+    /// so a frame composed between two writes can pair a slot set this turn with the rect before it.
     private struct LayerPlacement: Sendable {
         var avatarSlot = AvatarSlot(slot: CGRect(x: 0.71, y: 0.38, width: 0.28, height: 0.62), anchor: .bottomRight)
         var avatarVisibleRect = AvatarSlotLayout.fullTexture
