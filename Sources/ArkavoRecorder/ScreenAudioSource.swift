@@ -1,7 +1,20 @@
 import CoreMedia
 #if os(macOS)
 @preconcurrency import AVFoundation
+import os
 import ScreenCaptureKit
+
+/// One running capture of the system audio.
+protocol ScreenAudioCapture: AnyObject {
+    func stop() async throws
+}
+
+/// Opens a capture of the system audio. `onSample` receives its audio; `onStop` is called if the
+/// capture stops by itself (sharing ended, displays changed, the capture service restarted).
+typealias OpenScreenAudioCapture = (
+    _ onSample: @escaping (CMSampleBuffer) -> Void,
+    _ onStop: @escaping (any Error) -> Void
+) async throws -> any ScreenAudioCapture
 
 /// Audio source for capturing system/screen audio on macOS
 public final class ScreenAudioSource: NSObject, AudioSource, @unchecked Sendable {
@@ -17,28 +30,106 @@ public final class ScreenAudioSource: NSObject, AudioSource, @unchecked Sendable
         AudioFormat(sampleRate: 48000.0, channels: 2, bitDepth: 16, formatID: kAudioFormatLinearPCM)
     }
 
-    nonisolated(unsafe) public private(set) var isActive: Bool = false
+    /// Whether a capture is running. False as soon as it is stopped, or stops by itself.
+    public var isActive: Bool { running.withLockUnchecked { $0 != nil } }
 
     nonisolated(unsafe) public var onSample: ((CMSampleBuffer) -> Void)?
 
     // MARK: - Properties
 
-    nonisolated(unsafe) private var stream: SCStream?
-    nonisolated(unsafe) private var streamOutput: ScreenAudioStreamOutput?
-    private let audioQueue = DispatchQueue(label: "com.arkavo.screenaudio")
+    /// The running capture and the token its own stop reports with. A capture's start, its stop
+    /// and its stopping by itself come from different threads.
+    private let running = OSAllocatedUnfairLock<(capture: any ScreenAudioCapture, token: UUID)?>(uncheckedState: nil)
+    private let openCapture: OpenScreenAudioCapture
 
     // MARK: - Initialization
 
-    public init(sourceID: String) {
+    public convenience init(sourceID: String) {
+        self.init(sourceID: sourceID, openCapture: SystemAudioCapture.open)
+    }
+
+    /// Tests: `openCapture` stands in for ScreenCaptureKit.
+    init(sourceID: String, openCapture: @escaping OpenScreenAudioCapture) {
         self.sourceID = sourceID
+        self.openCapture = openCapture
         super.init()
     }
 
     // MARK: - AudioSource Protocol Methods
 
     public func start() async throws {
+        let token = UUID()
+        let capture = try await openCapture(
+            { [weak self] sampleBuffer in self?.onSample?(sampleBuffer) },
+            { [weak self] _ in self?.captureStoppedByItself(token) }
+        )
+        running.withLockUnchecked { $0 = (capture, token) }
+        print("🔊 ScreenAudioSource [\(sourceID)] started")
+    }
+
+    /// Forgets the capture before stopping it: one that already stopped by itself throws here,
+    /// and the source must read as stopped either way, so the next start opens a fresh one.
+    public func stop() async throws {
+        let capture = running.withLockUnchecked { running -> (any ScreenAudioCapture)? in
+            defer { running = nil }
+            return running?.capture
+        }
+        guard let capture else { return }
+
+        try await capture.stop()
+
+        print("🔊 ScreenAudioSource [\(sourceID)] stopped")
+    }
+
+    /// A capture that stopped by itself is over. A late report from one this source has since
+    /// replaced doesn't touch the newer one.
+    private func captureStoppedByItself(_ token: UUID) {
+        running.withLockUnchecked { running in
+            if running?.token == token { running = nil }
+        }
+    }
+
+    // MARK: - Private Methods
+
+    /// 48 kHz stereo system audio, excluding this app's own output: audio the host app mixes
+    /// directly (Creator's Muse voice) would otherwise reach the mix a second time, delayed.
+    static func makeStreamConfiguration() -> SCStreamConfiguration {
+        let streamConfig = SCStreamConfiguration()
+        streamConfig.capturesAudio = true
+        streamConfig.excludesCurrentProcessAudio = true
+        streamConfig.sampleRate = 48000 // 48kHz
+        streamConfig.channelCount = 2   // Stereo
+
+        // Don't capture video in audio-only source
+        // Smallest video surface WindowServer reliably creates (1x1 can fail IOSurface creation).
+        streamConfig.width = 2
+        streamConfig.height = 2
+        streamConfig.minimumFrameInterval = CMTime(value: 1, timescale: 1)
+        return streamConfig
+    }
+}
+
+// MARK: - System Audio Capture
+
+/// The system audio, captured by an SCStream.
+private final class SystemAudioCapture: ScreenAudioCapture {
+    private let stream: SCStream
+    /// The stream keeps neither its output nor its delegate.
+    private let output: ScreenAudioStreamOutput
+    private let delegate: ScreenAudioStreamDelegate
+
+    private init(stream: SCStream, output: ScreenAudioStreamOutput, delegate: ScreenAudioStreamDelegate) {
+        self.stream = stream
+        self.output = output
+        self.delegate = delegate
+    }
+
+    static func open(
+        _ onSample: @escaping (CMSampleBuffer) -> Void,
+        _ onStop: @escaping (any Error) -> Void
+    ) async throws -> any ScreenAudioCapture {
         // Check for screen recording permission on macOS
-        guard await checkScreenRecordingPermission() else {
+        guard await hasScreenRecordingPermission() else {
             throw RecorderError.screenCaptureUnavailable
         }
 
@@ -63,56 +154,19 @@ public final class ScreenAudioSource: NSObject, AudioSource, @unchecked Sendable
             exceptingWindows: []
         )
 
-        let streamConfig = Self.makeStreamConfiguration()
-
-        // Create stream output handler
-        let output = ScreenAudioStreamOutput { [weak self] sampleBuffer in
-            self?.onSample?(sampleBuffer)
-        }
-        self.streamOutput = output
-
-        // Create and start stream
-        let stream = SCStream(filter: filter, configuration: streamConfig, delegate: nil)
-        try stream.addStreamOutput(output, type: .audio, sampleHandlerQueue: audioQueue)
-
-        self.stream = stream
+        let output = ScreenAudioStreamOutput(onAudioSample: onSample)
+        let delegate = ScreenAudioStreamDelegate(onStop: onStop)
+        let stream = SCStream(filter: filter, configuration: ScreenAudioSource.makeStreamConfiguration(), delegate: delegate)
+        try stream.addStreamOutput(output, type: .audio, sampleHandlerQueue: DispatchQueue(label: "com.arkavo.screenaudio"))
         try await stream.startCapture()
-
-        isActive = true
-        print("🔊 ScreenAudioSource [\(sourceID)] started")
+        return SystemAudioCapture(stream: stream, output: output, delegate: delegate)
     }
 
-    public func stop() async throws {
-        guard let stream = stream else { return }
-
+    func stop() async throws {
         try await stream.stopCapture()
-        self.stream = nil
-        self.streamOutput = nil
-        isActive = false
-
-        print("🔊 ScreenAudioSource [\(sourceID)] stopped")
     }
 
-    // MARK: - Private Methods
-
-    /// 48 kHz stereo system audio, excluding this app's own output: audio the host app mixes
-    /// directly (Creator's Muse voice) would otherwise reach the mix a second time, delayed.
-    static func makeStreamConfiguration() -> SCStreamConfiguration {
-        let streamConfig = SCStreamConfiguration()
-        streamConfig.capturesAudio = true
-        streamConfig.excludesCurrentProcessAudio = true
-        streamConfig.sampleRate = 48000 // 48kHz
-        streamConfig.channelCount = 2   // Stereo
-
-        // Don't capture video in audio-only source
-        // Smallest video surface WindowServer reliably creates (1x1 can fail IOSurface creation).
-        streamConfig.width = 2
-        streamConfig.height = 2
-        streamConfig.minimumFrameInterval = CMTime(value: 1, timescale: 1)
-        return streamConfig
-    }
-
-    private func checkScreenRecordingPermission() async -> Bool {
+    private static func hasScreenRecordingPermission() async -> Bool {
         // ScreenCaptureKit doesn't have a direct permission check API
         // Attempting to get shareable content will trigger permission prompt if needed
         do {
@@ -122,6 +176,20 @@ public final class ScreenAudioSource: NSObject, AudioSource, @unchecked Sendable
             print("⚠️ ScreenAudioSource: Screen recording permission denied or unavailable: \(error)")
             return false
         }
+    }
+}
+
+/// Reports a stream that stopped by itself.
+private final class ScreenAudioStreamDelegate: NSObject, SCStreamDelegate {
+    private let onStop: (any Error) -> Void
+
+    init(onStop: @escaping (any Error) -> Void) {
+        self.onStop = onStop
+        super.init()
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: any Error) {
+        onStop(error)
     }
 }
 
