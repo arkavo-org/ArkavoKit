@@ -262,20 +262,20 @@ public final class CompositorManager: Sendable {
             let scaledCamera = cameraImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
 
             // Calculate position based on PiP setting or provided override
-            let placement = layer.position ?? pipPosition
+            let corner = layer.position ?? pipPosition
             let position: CGPoint
             if cameraLayers.count > 1 {
                 position = multiCameraPosition(
                     screenSize: outputSize,
                     pipSize: scaledCameraSize,
-                    preferred: placement,
+                    preferred: corner,
                     index: index
                 )
             } else {
                 position = calculatePiPPosition(
                     screenSize: outputSize,
                     pipSize: scaledCameraSize,
-                    position: placement
+                    position: corner
                 )
             }
 
