@@ -16,7 +16,8 @@
 //
 // ```swift
 // let session = try RecordingSession()
-// session.pipPosition = .bottomRight
+// session.avatarSlot = AvatarSlot(
+//     slot: CGRect(x: 0.71, y: 0.38, width: 0.28, height: 0.62), anchor: .bottomRight)
 // try await session.startRecording(outputURL: url, title: "My Recording")
 // // ... record ...
 // let outputURL = try await session.stopRecording()

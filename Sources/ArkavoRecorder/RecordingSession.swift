@@ -177,6 +177,30 @@ public final class RecordingSession: Sendable {
         set { compositor.pipPosition = newValue }
     }
 
+    /// The avatar overlay's slot over a screen (`CompositorManager.avatarSlot`).
+    public var avatarSlot: AvatarSlot {
+        get { compositor.avatarSlot }
+        set { compositor.avatarSlot = newValue }
+    }
+
+    /// The part of the avatar texture fitted into `avatarSlot` (`CompositorManager.avatarVisibleRect`).
+    public var avatarVisibleRect: CGRect {
+        get { compositor.avatarVisibleRect }
+        set { compositor.avatarVisibleRect = newValue }
+    }
+
+    /// The Muse layer's slot (`CompositorManager.museSlot`).
+    public var museSlot: AvatarSlot {
+        get { compositor.museSlot }
+        set { compositor.museSlot = newValue }
+    }
+
+    /// The part of the Muse texture fitted into `museSlot` (`CompositorManager.museVisibleRect`).
+    public var museVisibleRect: CGRect {
+        get { compositor.museVisibleRect }
+        set { compositor.museVisibleRect = newValue }
+    }
+
     public var watermarkEnabled: Bool {
         get { compositor.watermarkEnabled }
         set { compositor.watermarkEnabled = newValue }
