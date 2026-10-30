@@ -50,9 +50,11 @@ public final class ScreenAudioSource: NSObject, AudioSource, @unchecked Sendable
         var joiners: [CheckedContinuation<Bool, any Error>] = []
         /// A stop came after the last start: the capture is stopped as soon as it opens.
         var stopRequested = false
-        /// Stops made while it opens. Each returns once the opening has ended: after the capture
-        /// is stopped when it is, at once when a later start kept it or the open failed.
-        var stopWaiters: [CheckedContinuation<Void, Never>] = []
+        /// Stops made while it opens, by id. Each returns once the opening has ended (after the
+        /// capture is stopped when it is, at once when a later start kept it or the open failed),
+        /// or once its time limit runs out. Whichever takes a stop out of here under the lock
+        /// resumes it, so it is resumed once.
+        var stopWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
         /// The capture stopped by itself before it finished opening.
         var stoppedByItself = false
     }
@@ -79,16 +81,30 @@ public final class ScreenAudioSource: NSObject, AudioSource, @unchecked Sendable
     private let state = OSAllocatedUnfairLock<State>(uncheckedState: .idle)
     private let openCapture: OpenScreenAudioCapture
 
+    /// The longest a stop waits for a capture that is still opening. An open can sit behind the
+    /// screen recording permission prompt or macOS's screen capture confirmation for as long as
+    /// they stay up, and stopping a recording waits for its audio to stop before it finishes the
+    /// file. Past this the stop returns; the start still stops the capture once it opens.
+    static let openingStopWaitLimit: Duration = .seconds(2)
+
+    /// How long a stop waits for an opening: `openingStopWaitLimit`, shorter in tests.
+    private let stopWaitLimit: Duration
+
     // MARK: - Initialization
 
     public convenience init(sourceID: String) {
         self.init(sourceID: sourceID, openCapture: SystemAudioCapture.open)
     }
 
-    /// Tests: `openCapture` stands in for ScreenCaptureKit.
-    init(sourceID: String, openCapture: @escaping OpenScreenAudioCapture) {
+    /// Tests: `openCapture` stands in for ScreenCaptureKit, and `stopWaitLimit` can be short.
+    init(
+        sourceID: String,
+        openCapture: @escaping OpenScreenAudioCapture,
+        stopWaitLimit: Duration = ScreenAudioSource.openingStopWaitLimit
+    ) {
         self.sourceID = sourceID
         self.openCapture = openCapture
+        self.stopWaitLimit = stopWaitLimit
         super.init()
     }
 
@@ -169,13 +185,14 @@ public final class ScreenAudioSource: NSObject, AudioSource, @unchecked Sendable
     ) {
         state.withLockUnchecked { state in
             guard case .opening(let opening) = state, opening.token == token else { return (.stopped, [], []) }
+            let stops = Array(opening.stopWaiters.values)
             if let capture, !opening.stopRequested, !opening.stoppedByItself {
                 state = .running(capture: capture, token: token)
-                return (.kept, opening.joiners, opening.stopWaiters)
+                return (.kept, opening.joiners, stops)
             }
             state = .idle
             let end: OpeningEnd = opening.stoppedByItself && !opening.stopRequested ? .stoppedByItself : .stopped
-            return (end, opening.joiners, opening.stopWaiters)
+            return (end, opening.joiners, stops)
         }
     }
 
@@ -185,8 +202,12 @@ public final class ScreenAudioSource: NSObject, AudioSource, @unchecked Sendable
     /// A capture still opening is stopped by its start as soon as it opens, and this returns once
     /// it has been, so a caller that awaits this gets no more audio from it. It also returns when
     /// the open fails, and when a start made after it keeps the capture (the latest call wins).
+    /// It waits for the opening at most `openingStopWaitLimit`: past that it returns, and the
+    /// start still stops the capture once it opens, which may deliver audio until then.
     public func stop() async throws {
         var running: (any ScreenAudioCapture)?
+        var timeLimit: Task<Void, Never>?
+        let waiterID = UUID()
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             let waits = state.withLockUnchecked { state -> Bool in
                 switch state {
@@ -194,7 +215,7 @@ public final class ScreenAudioSource: NSObject, AudioSource, @unchecked Sendable
                     return false
                 case .opening(var opening):
                     opening.stopRequested = true
-                    opening.stopWaiters.append(continuation)
+                    opening.stopWaiters[waiterID] = continuation
                     state = .opening(opening)
                     return true
                 case .running(let capture, _):
@@ -203,13 +224,33 @@ public final class ScreenAudioSource: NSObject, AudioSource, @unchecked Sendable
                     return false
                 }
             }
-            if !waits { continuation.resume() }
+            guard waits else { return continuation.resume() }
+            let limit = stopWaitLimit
+            timeLimit = Task { [weak self] in
+                try? await Task.sleep(for: limit)
+                guard !Task.isCancelled else { return }
+                self?.stopWaitTimedOut(waiterID)
+            }
         }
+        // Resumed by the opening's end or by the time limit: the limit has nothing left to do.
+        timeLimit?.cancel()
         guard let capture = running else { return }
 
         try await capture.stop()
 
         print("🔊 ScreenAudioSource [\(sourceID)] stopped")
+    }
+
+    /// Ends the wait of the stop `waiterID` if it is still waiting on the opening. The opening
+    /// keeps `stopRequested`, so its start still stops the capture once it opens.
+    private func stopWaitTimedOut(_ waiterID: UUID) {
+        let waiter = state.withLockUnchecked { state -> CheckedContinuation<Void, Never>? in
+            guard case .opening(var opening) = state,
+                  let waiter = opening.stopWaiters.removeValue(forKey: waiterID) else { return nil }
+            state = .opening(opening)
+            return waiter
+        }
+        waiter?.resume()
     }
 
     /// A capture that stopped by itself is over, including one still opening. A late report from

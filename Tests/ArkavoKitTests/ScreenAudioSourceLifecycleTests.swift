@@ -136,6 +136,45 @@ struct ScreenAudioSourceLifecycleTests {
         #expect(!source.isActive)
     }
 
+    @Test("A stop while the capture is still opening returns within its time limit, and the start stops the capture once it opens")
+    func stopWaitingOnAnOpeningReturnsWithinItsLimit() async throws {
+        let captures = StandInCaptures(held: true)
+        let source = ScreenAudioSource(sourceID: "screen", openCapture: captures.open, stopWaitLimit: .milliseconds(100))
+        let start = Task { try await source.start() }
+        try await Self.waitUntil { captures.opened.count == 1 }
+
+        let stop = StopCall(source, capture: captures.opened[0])
+        try await stop.waitForReturn()
+
+        #expect(stop.hasReturned, "the stop is still waiting on an open that hasn't finished")
+        #expect(stop.captureWasStoppedOnReturn == false)
+        captures.release()
+        try await start.value
+        #expect(captures.opened.allSatisfy { $0.isStopped }, "the start kept the capture a stop asked for")
+        #expect(!source.isActive)
+    }
+
+    @Test("An open that finishes as the stop's time limit runs out resumes the stop once")
+    func openFinishingAtTheStopsLimitResumesItOnce() async throws {
+        // Each round releases the open within a few milliseconds of the 50 ms limit, either side.
+        for releaseAfter in [40, 45, 50, 55, 60] {
+            let captures = StandInCaptures(held: true)
+            let source = ScreenAudioSource(sourceID: "screen", openCapture: captures.open, stopWaitLimit: .milliseconds(50))
+            let start = Task { try await source.start() }
+            try await Self.waitUntil { captures.opened.count == 1 }
+
+            let stop = StopCall(source)
+            try await Task.sleep(for: .milliseconds(releaseAfter))
+            captures.release()
+            try await start.value
+            try await stop.waitForReturn()
+
+            #expect(stop.hasReturned, "release after \(releaseAfter) ms: the stop never returned")
+            #expect(captures.opened.allSatisfy { $0.isStopped }, "release after \(releaseAfter) ms: the capture is still open")
+            #expect(!source.isActive)
+        }
+    }
+
     @Test("A capture that stops by itself while the source is starting fails the start and leaves the source stopped")
     func captureStoppingByItselfDuringTheStartFailsIt() async throws {
         let captures = StandInCaptures(held: true)
