@@ -55,17 +55,109 @@ struct ScreenAudioSourceLifecycleTests {
 
         #expect(source.isActive)
     }
+
+    // Two starts can overlap: a stream's audio starting while a recording starts its own.
+
+    @Test("Two starts that overlap open one desktop audio capture, and stopping the source stops it")
+    func overlappingStartsOpenOneCapture() async throws {
+        let captures = StandInCaptures(held: true)
+        let source = ScreenAudioSource(sourceID: "screen", openCapture: captures.open)
+        let first = Task { try await source.start() }
+        try await Self.waitUntil { captures.opened.count == 1 }
+        let second = Task { try await source.start() }
+        try await Task.sleep(for: .milliseconds(200))   // time for a second open to begin
+
+        captures.release()
+        try await first.value
+        try await second.value
+
+        #expect(captures.opened.count == 1)
+        #expect(source.isActive)
+        try await source.stop()
+        #expect(captures.opened.allSatisfy { $0.isStopped }, "a capture is still open")
+    }
+
+    @Test("A stop while the source is starting leaves no desktop audio capture open")
+    func stopDuringAStartLeavesNoCaptureOpen() async throws {
+        let captures = StandInCaptures(held: true)
+        let source = ScreenAudioSource(sourceID: "screen", openCapture: captures.open)
+        let start = Task { try await source.start() }
+        try await Self.waitUntil { captures.opened.count == 1 }
+
+        try await source.stop()
+        captures.release()
+        try await start.value
+
+        #expect(!source.isActive)
+        #expect(captures.opened.allSatisfy { $0.isStopped }, "the capture opened after the stop is still open")
+    }
+
+    @Test("A start after a stop, both while the source is starting, keeps the capture it opens")
+    func startAfterAStopDuringAStartKeepsTheCapture() async throws {
+        let captures = StandInCaptures(held: true)
+        let source = ScreenAudioSource(sourceID: "screen", openCapture: captures.open)
+        let first = Task { try await source.start() }
+        try await Self.waitUntil { captures.opened.count == 1 }
+        try await source.stop()
+        let second = Task { try await source.start() }
+        try await Task.sleep(for: .milliseconds(200))   // time for a second open to begin
+
+        captures.release()
+        try await first.value
+        try await second.value
+
+        #expect(captures.opened.count == 1)
+        #expect(source.isActive)
+        #expect(captures.opened.allSatisfy { !$0.isStopped })
+        try await source.stop()
+    }
+
+    @Test("A capture that stops by itself while the source is starting leaves the source stopped")
+    func captureStoppingByItselfDuringTheStartLeavesTheSourceStopped() async throws {
+        let captures = StandInCaptures(held: true)
+        let source = ScreenAudioSource(sourceID: "screen", openCapture: captures.open)
+        let start = Task { try await source.start() }
+        try await Self.waitUntil { captures.opened.count == 1 }
+
+        captures.opened[0].stopByItself()
+        captures.release()
+        try await start.value
+
+        #expect(!source.isActive)
+        try await source.start()
+        #expect(captures.opened.count == 2)
+        #expect(source.isActive)
+    }
+
+    /// Polls `condition` for up to five seconds.
+    private static func waitUntil(_ condition: () -> Bool) async throws {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !condition() && .now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+    }
 }
 
-/// Stand-ins for ScreenCaptureKit captures, kept in the order they were opened.
+/// Stand-ins for ScreenCaptureKit captures, kept in the order they were opened. Held ones don't
+/// finish opening until `release()`.
 @MainActor
 private final class StandInCaptures {
     private(set) var opened: [StandInCapture] = []
+    private let held: OSAllocatedUnfairLock<Bool>
+
+    init(held: Bool = false) {
+        self.held = OSAllocatedUnfairLock(initialState: held)
+    }
+
+    func release() {
+        held.withLock { $0 = false }
+    }
 
     var open: OpenScreenAudioCapture {
-        { [self] _, onStop in
+        { [self, held] _, onStop in
             let capture = StandInCapture(onStop: onStop)
             await MainActor.run { opened.append(capture) }
+            while held.withLock({ $0 }) { try? await Task.sleep(for: .milliseconds(10)) }
             return capture
         }
     }
@@ -73,7 +165,7 @@ private final class StandInCaptures {
 
 private final class StandInCapture: ScreenAudioCapture, @unchecked Sendable {
     private let onStop: (any Error) -> Void
-    private let state = OSAllocatedUnfairLock(initialState: false)
+    private let state = OSAllocatedUnfairLock(initialState: (stopFails: false, isStopped: false))
 
     init(onStop: @escaping (any Error) -> Void) {
         self.onStop = onStop
@@ -81,12 +173,19 @@ private final class StandInCapture: ScreenAudioCapture, @unchecked Sendable {
 
     /// `stop()` throws, as it does for a stream that has already stopped.
     var stopFails: Bool {
-        get { state.withLock { $0 } }
-        set { state.withLock { $0 = newValue } }
+        get { state.withLock { $0.stopFails } }
+        set { state.withLock { $0.stopFails = newValue } }
     }
 
+    /// Whether `stop()` has been called.
+    var isStopped: Bool { state.withLock { $0.isStopped } }
+
     func stop() async throws {
-        if stopFails { throw RecorderError.screenCaptureUnavailable }
+        let fails = state.withLock { state in
+            state.isStopped = true
+            return state.stopFails
+        }
+        if fails { throw RecorderError.screenCaptureUnavailable }
     }
 
     /// The stream stops without being asked, as when the user ends sharing.

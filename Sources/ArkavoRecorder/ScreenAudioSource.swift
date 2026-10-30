@@ -30,16 +30,40 @@ public final class ScreenAudioSource: NSObject, AudioSource, @unchecked Sendable
         AudioFormat(sampleRate: 48000.0, channels: 2, bitDepth: 16, formatID: kAudioFormatLinearPCM)
     }
 
-    /// Whether a capture is running. False as soon as it is stopped, or stops by itself.
-    public var isActive: Bool { running.withLockUnchecked { $0 != nil } }
+    /// Whether a capture is running. False while one is still opening, and as soon as it is
+    /// stopped or stops by itself.
+    public var isActive: Bool {
+        state.withLockUnchecked { state in
+            if case .running = state { return true }
+            return false
+        }
+    }
 
     nonisolated(unsafe) public var onSample: ((CMSampleBuffer) -> Void)?
 
     // MARK: - Properties
 
-    /// The running capture and the token its own stop reports with. A capture's start, its stop
-    /// and its stopping by itself come from different threads.
-    private let running = OSAllocatedUnfairLock<(capture: any ScreenAudioCapture, token: UUID)?>(uncheckedState: nil)
+    /// A capture that is opening. Each capture has a token its own stop reports with.
+    private struct Opening {
+        let token: UUID
+        /// Starts made while it opens: they get its outcome (`false`: they don't open one).
+        var joiners: [CheckedContinuation<Bool, any Error>] = []
+        /// A stop came after the last start: the capture is stopped as soon as it opens.
+        var stopRequested = false
+        /// The capture stopped by itself before it finished opening.
+        var stoppedByItself = false
+    }
+
+    private enum State {
+        case idle
+        case opening(Opening)
+        case running(capture: any ScreenAudioCapture, token: UUID)
+    }
+
+    /// One state for the source's start, its stop and the capture stopping by itself, which come
+    /// from different threads. Holding the opening state here is what keeps two starts from
+    /// opening two captures, and a stop during a start from missing the capture it opens.
+    private let state = OSAllocatedUnfairLock<State>(uncheckedState: .idle)
     private let openCapture: OpenScreenAudioCapture
 
     // MARK: - Initialization
@@ -57,22 +81,85 @@ public final class ScreenAudioSource: NSObject, AudioSource, @unchecked Sendable
 
     // MARK: - AudioSource Protocol Methods
 
+    /// Opens a capture. Returns at once while one is running. A start made while one is opening
+    /// waits for it and returns or throws as it does, so overlapping starts open one capture.
+    /// It also cancels a stop made during that opening: the latest call wins.
     public func start() async throws {
         let token = UUID()
-        let capture = try await openCapture(
-            { [weak self] sampleBuffer in self?.onSample?(sampleBuffer) },
-            { [weak self] _ in self?.captureStoppedByItself(token) }
-        )
-        running.withLockUnchecked { $0 = (capture, token) }
-        print("🔊 ScreenAudioSource [\(sourceID)] started")
+        let opens = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Bool, any Error>) in
+            let joined = state.withLockUnchecked { state -> Bool? in
+                switch state {
+                case .running:
+                    return false
+                case .idle:
+                    state = .opening(Opening(token: token))
+                    return true
+                case .opening(var opening):
+                    opening.stopRequested = false
+                    opening.joiners.append(continuation)
+                    state = .opening(opening)
+                    return nil
+                }
+            }
+            if let joined { continuation.resume(returning: joined) }
+        }
+        guard opens else { return }
+
+        let capture: any ScreenAudioCapture
+        do {
+            capture = try await openCapture(
+                { [weak self] sampleBuffer in self?.onSample?(sampleBuffer) },
+                { [weak self] _ in self?.captureStoppedByItself(token) }
+            )
+        } catch {
+            for joiner in finishOpening(token, keeping: nil).joiners { joiner.resume(throwing: error) }
+            throw error
+        }
+
+        // Kept unless a stop came while it opened, or it has already stopped by itself.
+        let (kept, joiners) = finishOpening(token, keeping: capture)
+        for joiner in joiners { joiner.resume(returning: false) }
+        if kept {
+            print("🔊 ScreenAudioSource [\(sourceID)] started")
+        } else {
+            try? await capture.stop()
+            print("🔊 ScreenAudioSource [\(sourceID)] stopped as it started")
+        }
+    }
+
+    /// Ends the opening of the capture with `token`: the source runs `capture` unless a stop
+    /// came meanwhile or it stopped by itself, and is idle otherwise. Returns whether it was
+    /// kept, and the starts that joined the opening.
+    private func finishOpening(
+        _ token: UUID, keeping capture: (any ScreenAudioCapture)?
+    ) -> (kept: Bool, joiners: [CheckedContinuation<Bool, any Error>]) {
+        state.withLockUnchecked { state in
+            guard case .opening(let opening) = state, opening.token == token else { return (false, []) }
+            if let capture, !opening.stopRequested, !opening.stoppedByItself {
+                state = .running(capture: capture, token: token)
+                return (true, opening.joiners)
+            }
+            state = .idle
+            return (false, opening.joiners)
+        }
     }
 
     /// Forgets the capture before stopping it: one that already stopped by itself throws here,
     /// and the source must read as stopped either way, so the next start opens a fresh one.
+    /// A capture still opening is stopped by its start as soon as it opens; this returns at once.
     public func stop() async throws {
-        let capture = running.withLockUnchecked { running -> (any ScreenAudioCapture)? in
-            defer { running = nil }
-            return running?.capture
+        let capture = state.withLockUnchecked { state -> (any ScreenAudioCapture)? in
+            switch state {
+            case .idle:
+                return nil
+            case .opening(var opening):
+                opening.stopRequested = true
+                state = .opening(opening)
+                return nil
+            case .running(let capture, _):
+                state = .idle
+                return capture
+            }
         }
         guard let capture else { return }
 
@@ -81,11 +168,19 @@ public final class ScreenAudioSource: NSObject, AudioSource, @unchecked Sendable
         print("🔊 ScreenAudioSource [\(sourceID)] stopped")
     }
 
-    /// A capture that stopped by itself is over. A late report from one this source has since
-    /// replaced doesn't touch the newer one.
+    /// A capture that stopped by itself is over, including one still opening. A late report from
+    /// one this source has since replaced doesn't touch the newer one.
     private func captureStoppedByItself(_ token: UUID) {
-        running.withLockUnchecked { running in
-            if running?.token == token { running = nil }
+        state.withLockUnchecked { state in
+            switch state {
+            case .running(_, let running) where running == token:
+                state = .idle
+            case .opening(var opening) where opening.token == token:
+                opening.stoppedByItself = true
+                state = .opening(opening)
+            default:
+                break
+            }
         }
     }
 
