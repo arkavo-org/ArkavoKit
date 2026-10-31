@@ -286,6 +286,35 @@ public final class RecordingSession: Sendable {
     /// Provider for Muse AI avatar texture frames (for dual avatar mode)
     nonisolated(unsafe) public var museTextureProvider: (@Sendable () -> CVPixelBuffer?)?
 
+    /// Supplies the microphone in place of the built-in capture device. Called with the source ID
+    /// the session uses for it (`"microphone"`, which keeps it the mix clock); returning nil keeps
+    /// the built-in `MicrophoneAudioSource`. An app whose own voice-processing engine already holds
+    /// the device feeds the mix from that engine this way: on some Macs a second capture client of
+    /// a voice-processed microphone receives silence.
+    public var microphoneSourceProvider: (@MainActor (_ sourceID: String) -> (any AudioSource)?)?
+
+    /// Rebuilds the microphone through `microphoneSourceProvider`, for when the right source
+    /// changes mid-session (a voice-processing engine started or stopped). Does nothing when the
+    /// session has no microphone. A running microphone's replacement starts at once and stays
+    /// the mix clock.
+    public func replaceMicrophoneSource() async {
+        let id = Self.microphoneSourceID
+        guard audioRouter.allSourceIDs.contains(id) else { return }
+        let wasActive = audioRouter.activeSourceIDs.contains(id)
+        await audioRouter.stopAndRemoveSource(id)
+        audioMixer.unregisterSource(id)
+        addMicrophone()
+        syncAudioMixerRouting()
+        guard wasActive else { return }
+        do {
+            try await audioRouter.startSource(id)
+        } catch {
+            print("⚠️ RecordingSession: replacement microphone failed to start: \(error)")
+        }
+    }
+
+    nonisolated static let microphoneSourceID = "microphone"
+
     /// Register a Muse TTS audio source for mixing into the stream
     public func addMuseAudioSource(_ source: AudioSource) {
         audioRouter.addSource(source)
@@ -327,7 +356,7 @@ public final class RecordingSession: Sendable {
 
     /// Adds a microphone that reports its level as `audioLevel`.
     private func addMicrophone() {
-        let microphone = audioInputs.makeMicrophone()
+        let microphone = microphoneSourceProvider?(Self.microphoneSourceID) ?? audioInputs.makeMicrophone()
         (microphone as? MicrophoneAudioSource)?.onLevelUpdate = { @Sendable [weak self] level in
             self?.audioLevel = level
         }

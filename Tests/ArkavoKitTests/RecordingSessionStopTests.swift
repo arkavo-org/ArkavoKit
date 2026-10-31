@@ -303,6 +303,64 @@ struct RecordingSessionStopTests {
         #expect(inputs.microphones.allSatisfy { !$0.isActive })
     }
 
+    @Test("A microphone source provider supplies the session's microphone instead of a capture device")
+    func microphoneSourceProviderSuppliesTheMicrophone() async throws {
+        let url = Self.outputURL("provided-microphone")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let inputs = StandInAudioInputs()
+        let session = try Self.avatarSession(audioInputs: inputs.audioInputs)
+        session.enableMicrophone = true
+        let provided = FakeAudioSource(sourceID: "microphone")
+        var askedFor: [String] = []
+        session.microphoneSourceProvider = { id in askedFor.append(id); return provided }
+
+        try await session.startRecording(outputURL: url, title: "provided")
+
+        #expect(askedFor == ["microphone"])
+        #expect(inputs.microphones.isEmpty, "no capture device is opened")
+        #expect(provided.isActive)
+        #expect(session.registeredAudioSourceIDs.contains("microphone"))
+        _ = try? await session.stopRecording()
+        #expect(!provided.isActive)
+    }
+
+    @Test("Replacing the microphone mid-recording stops the old source and starts the provider's")
+    func replacingTheMicrophoneMidRecordingSwapsTheSource() async throws {
+        let url = Self.outputURL("replaced-microphone")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let inputs = StandInAudioInputs()
+        let session = try Self.avatarSession(audioInputs: inputs.audioInputs)
+        session.enableMicrophone = true
+        try await session.startRecording(outputURL: url, title: "replaced")
+        let original = try #require(inputs.microphones.first)
+        #expect(original.isActive)
+
+        let provided = FakeAudioSource(sourceID: "microphone")
+        session.microphoneSourceProvider = { _ in provided }
+        await session.replaceMicrophoneSource()
+
+        #expect(!original.isActive)
+        #expect(provided.isActive)
+        #expect(session.registeredAudioSourceIDs.filter { $0 == "microphone" }.count == 1)
+
+        // Back to the built-in microphone: a nil provider result keeps the default.
+        session.microphoneSourceProvider = { _ in nil }
+        await session.replaceMicrophoneSource()
+        #expect(!provided.isActive)
+        #expect(inputs.microphones.count == 2)
+        #expect(inputs.microphones.last?.isActive == true)
+        _ = try? await session.stopRecording()
+    }
+
+    @Test("Replacing the microphone does nothing when the session has none")
+    func replacingWithoutAMicrophoneAddsNone() async throws {
+        let inputs = StandInAudioInputs()
+        let session = try Self.avatarSession(audioInputs: inputs.audioInputs)
+        session.microphoneSourceProvider = { _ in FakeAudioSource(sourceID: "microphone") }
+        await session.replaceMicrophoneSource()
+        #expect(!session.registeredAudioSourceIDs.contains("microphone"))
+    }
+
     @Test("Stopping the stream while a recording is starting leaves that recording its screen and audio")
     func stoppingTheStreamWhileARecordingStartsKeepsItsSources() async throws {
         let url = Self.outputURL("stream-stops-during-start")
