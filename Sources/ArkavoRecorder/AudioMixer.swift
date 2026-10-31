@@ -276,6 +276,20 @@ public final class AudioMixer: @unchecked Sendable {
         framesWaited.removeValue(forKey: sourceID)
     }
 
+    // MARK: - Test Seams
+
+    /// Tests: the source setting the mix's cadence, pinned or picked; nil before one is chosen.
+    var clockSourceIDForTesting: String? {
+        lock.lock(); defer { lock.unlock() }
+        return clockSourceID
+    }
+
+    /// Tests: how many samples `sourceID` has queued to be mixed.
+    func queuedSampleCountForTesting(of sourceID: String) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        return fifos[sourceID]?.count ?? 0
+    }
+
     // MARK: - Buffers
 
     private static func samples(of sb: CMSampleBuffer) -> [Int16] {

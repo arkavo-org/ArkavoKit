@@ -14,7 +14,10 @@ import AppKit
 /// private serial queue, in the order the calls were made; `startCapture` and `stopCapture`
 /// return without waiting for it. Frame routing doesn't wait for the queue either: the
 /// capture a frame must belong to changes before each call returns, so frames from a replaced
-/// or stopped display are dropped at once.
+/// or stopped display are dropped at once. A routing change is atomic with delivery: a frame
+/// validated for the replaced or stopped display that hasn't been handed over yet is dropped,
+/// and one already being handed over is delivered before the call returns. Nothing from that
+/// display is delivered afterwards.
 @MainActor
 public final class ScreenCaptureManager: NSObject, Sendable {
     // MARK: - Properties
@@ -23,16 +26,31 @@ public final class ScreenCaptureManager: NSObject, Sendable {
 
     private let outputQueue = DispatchQueue(label: "com.arkavo.screencapture")
 
+    /// Called with each frame of the current capture, on the capture's callback queue. A start or
+    /// stop waits while a call is running, so it must not wait for the main actor.
     nonisolated(unsafe) public var onFrame: (@Sendable (CMSampleBuffer) -> Void)?
     /// Called on the main actor when `startCapture` can't attach its display because the session
     /// can't take its input (`RecorderError.cannotAddInput`). The display captured before keeps
     /// capturing. `startCaptureAndWaitForFirstFrame` throws instead.
     public var onCaptureError: (@MainActor (any Error) -> Void)?
     nonisolated(unsafe) var onFrameForCapture: (@Sendable (CMSampleBuffer, UUID) -> Void)?
+    /// Tests: called on the callback's thread once a frame has been matched to its capture, before
+    /// it's delivered.
+    nonisolated(unsafe) var frameValidatedForTesting: (@Sendable (UUID) -> Void)?
     private let activeCapture = OSAllocatedUnfairLock<ActiveCapture?>(initialState: nil)
+    /// Held by every change to `activeCapture` and by a frame's last check and its delivery, so a
+    /// change is atomic with delivery. Taken before `activeCapture`, never while `activeCapture`
+    /// is held.
+    private let routingLock = OSAllocatedUnfairLock()
 
     nonisolated func isCurrentCapture(_ id: UUID) -> Bool {
         activeCapture.withLock { $0?.id == id }
+    }
+
+    /// Routes frames to `capture` (nil: to none) atomically with delivery.
+    private func route(to capture: ActiveCapture?) {
+        let activeCapture = activeCapture
+        routingLock.withLock { activeCapture.withLock { $0 = capture } }
     }
 
     /// The `startCaptureAndWaitForFirstFrame` call waiting for its capture to start and deliver a
@@ -121,10 +139,11 @@ public final class ScreenCaptureManager: NSObject, Sendable {
 
     /// Stops screen capture.
     ///
-    /// Frames stop being delivered before this returns; the session is stopped and its input
-    /// removed on the session queue, after any earlier start.
+    /// Frames stop being delivered before this returns; a frame already being handed over is
+    /// delivered first. The session is stopped and its input removed on the session queue, after
+    /// any earlier start.
     public func stopCapture() {
-        activeCapture.withLock { $0 = nil }
+        route(to: nil)
         let graph = graph
         graph.queue.async { graph.stop() }
 
@@ -161,7 +180,7 @@ public final class ScreenCaptureManager: NSObject, Sendable {
         input.capturesMouseClicks = false
 
         let capture = ActiveCapture(input: ObjectIdentifier(input), id: UUID())
-        activeCapture.withLock { $0 = capture }
+        route(to: capture)
 
         // Reset first frame tracking; a wait for the replaced capture's frame can't succeed now.
         hasDeliveredFirstFrame = false
@@ -187,16 +206,19 @@ public final class ScreenCaptureManager: NSObject, Sendable {
         reportsFailure: Bool,
         completion: @escaping @Sendable (Result<Void, any Error>) -> Void = { _ in }
     ) {
-        let graph = graph, activeCapture = activeCapture
+        let graph = graph, activeCapture = activeCapture, routingLock = routingLock
         graph.queue.async { [weak self] in
             do {
                 try graph.start(with: request.input, captureID: request.captureID)
                 completion(.success(()))
             } catch {
-                let wasCurrent = activeCapture.withLock { state in
-                    guard state?.id == request.captureID else { return false }
-                    state = graph.attachedCapture
-                    return true
+                let attached = graph.attachedCapture
+                let wasCurrent = routingLock.withLock {
+                    activeCapture.withLock { state in
+                        guard state?.id == request.captureID else { return false }
+                        state = attached
+                        return true
+                    }
                 }
                 print("🖥️ [ScreenCaptureManager] Screen capture couldn't start: \(error)")
                 if wasCurrent && reportsFailure {
@@ -254,10 +276,17 @@ extension ScreenCaptureManager: AVCaptureVideoDataOutputSampleBufferDelegate {
               let captureID = activeCapture.withLock({ state in
                   state?.input == ObjectIdentifier(input) ? state?.id : nil
               }) else { return }
-        // Forward frame to handler - calling directly on callback queue
-        // CMSampleBuffer is not Sendable but we handle it synchronously
-        onFrame?(sampleBuffer)
-        onFrameForCapture?(sampleBuffer, captureID)
+        frameValidatedForTesting?(captureID)
+        // The last check and the handover share the lock routing changes take: a stop or
+        // replacement that came after the check above drops the frame here, and one that comes
+        // during the handover waits for it to finish.
+        let delivered = routingLock.withLockUnchecked { () -> Bool in
+            guard isCurrentCapture(captureID) else { return false }
+            onFrame?(sampleBuffer)
+            onFrameForCapture?(sampleBuffer, captureID)
+            return true
+        }
+        guard delivered else { return }
 
         // Signal first frame for async startup
         Task { @MainActor [weak self] in

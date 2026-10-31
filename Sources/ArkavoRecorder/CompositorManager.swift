@@ -3,6 +3,7 @@ import CoreImage
 import CoreVideo
 import Metal
 import MetalKit
+import os
 
 /// Manages Metal-based composition of screen and camera frames for picture-in-picture
 public final class CompositorManager: Sendable {
@@ -27,9 +28,63 @@ public final class CompositorManager: Sendable {
         }
     }
 
-    // PiP configuration
+    // Camera PiP configuration. Avatar and Muse are placed by their slots, not by these.
+
+    /// The corner a camera PiP goes to when its layer names none.
     public nonisolated(unsafe) var pipPosition: PiPPosition = .bottomRight
-    public nonisolated(unsafe) var pipScale: Float = 0.2 // 20% of screen size
+    /// A camera PiP's size, as a fraction of the output size.
+    public nonisolated(unsafe) var pipScale: Float = 0.2
+
+    // Avatar and Muse slot layers
+
+    /// Where the avatar and Muse slot layers go. Each value is written under one lock and a frame
+    /// snapshots all four once, so a rect never tears mid-composite. Each setter writes one value,
+    /// so a frame composed between two writes can pair a slot set this turn with the rect before it;
+    /// `setLayerPlacement` writes all four at once.
+    private struct LayerPlacement: Sendable {
+        var avatarSlot = AvatarSlot(slot: CGRect(x: 0.71, y: 0.38, width: 0.28, height: 0.62), anchor: .bottomRight)
+        var avatarVisibleRect = AvatarSlotLayout.fullTexture
+        var museSlot = AvatarSlot(slot: CGRect(x: 0.01, y: 0.38, width: 0.28, height: 0.62), anchor: .bottomLeft)
+        var museVisibleRect = AvatarSlotLayout.fullTexture
+    }
+
+    private let layerPlacement = OSAllocatedUnfairLock(initialState: LayerPlacement())
+
+    /// The slot the avatar overlay fits into over a screen, normalized to the output with a top-left
+    /// origin. Gameplay right by default. An avatar that is itself the base fills the output instead.
+    public var avatarSlot: AvatarSlot {
+        get { layerPlacement.withLock { $0.avatarSlot } }
+        set { layerPlacement.withLock { $0.avatarSlot = newValue } }
+    }
+
+    /// The part of the avatar texture that holds the avatar, normalized with a top-left origin: the
+    /// part fitted into `avatarSlot`. The whole texture by default.
+    public var avatarVisibleRect: CGRect {
+        get { layerPlacement.withLock { $0.avatarVisibleRect } }
+        set { layerPlacement.withLock { $0.avatarVisibleRect = newValue } }
+    }
+
+    /// The slot the Muse layer fits into, over any base. Gameplay left by default.
+    public var museSlot: AvatarSlot {
+        get { layerPlacement.withLock { $0.museSlot } }
+        set { layerPlacement.withLock { $0.museSlot = newValue } }
+    }
+
+    /// The part of the Muse texture fitted into `museSlot`. The whole texture by default.
+    public var museVisibleRect: CGRect {
+        get { layerPlacement.withLock { $0.museVisibleRect } }
+        set { layerPlacement.withLock { $0.museVisibleRect = newValue } }
+    }
+
+    /// Swaps both slots and both visible rects in one step, so no frame pairs a new slot with an old rect.
+    public func setLayerPlacement(
+        avatarSlot: AvatarSlot, avatarVisibleRect: CGRect, museSlot: AvatarSlot, museVisibleRect: CGRect
+    ) {
+        let placement = LayerPlacement(
+            avatarSlot: avatarSlot, avatarVisibleRect: avatarVisibleRect,
+            museSlot: museSlot, museVisibleRect: museVisibleRect)
+        layerPlacement.withLock { $0 = placement }
+    }
 
     // Watermark configuration
     public nonisolated(unsafe) var watermarkEnabled: Bool = true // Enabled by default per MVP spec
@@ -92,7 +147,7 @@ public final class CompositorManager: Sendable {
 
         return compositeWithBase(
             baseImage: screenImage,
-            screenSize: screenSize,
+            baseSize: screenSize,
             cameraLayers: cameraLayers,
             avatarTexture: avatarTexture,
             museTexture: museTexture
@@ -101,6 +156,10 @@ public final class CompositorManager: Sendable {
 
     /// Composites camera frames without a screen base layer (camera-only mode)
     /// First camera becomes the primary full-canvas source, additional cameras become PiP overlays
+    ///
+    /// - Parameter canvasSize: The canvas the first camera fills and crops to. Give it the
+    ///   output's shape (`outputSize` itself, as production does): the filled canvas is then
+    ///   fitted into the output like any base, so a canvas of another shape gets bars.
     public func composite(
         cameraLayers: [CameraLayer],
         canvasSize: CGSize,
@@ -123,7 +182,7 @@ public final class CompositorManager: Sendable {
         // Remaining cameras become PiP overlays
         let overlayLayers = Array(cameraLayers.dropFirst())
 
-        return compositeWithBase(baseImage: scaledBaseImage, screenSize: canvasSize, cameraLayers: overlayLayers, museTexture: museTexture)
+        return compositeWithBase(baseImage: scaledBaseImage, baseSize: canvasSize, cameraLayers: overlayLayers, museTexture: museTexture)
     }
 
     /// Composites an avatar texture as the primary source with optional camera overlays
@@ -135,108 +194,49 @@ public final class CompositorManager: Sendable {
         let avatarImage = CIImage(cvPixelBuffer: avatarTexture)
         let screenSize = avatarImage.extent.size
 
-        return compositeWithBase(baseImage: avatarImage, screenSize: screenSize, cameraLayers: cameraLayers, museTexture: museTexture)
+        return compositeWithBase(baseImage: avatarImage, baseSize: screenSize, cameraLayers: cameraLayers, museTexture: museTexture)
     }
 
     // MARK: - Private Composition Core
 
-    /// Core composition logic: takes a base image and overlays camera layers as PiP
+    /// Core composition logic: fits the base into the output, then overlays the avatar and Muse in
+    /// their slots, the camera PiPs, the watermark and the scene overlay, all placed in output space.
+    ///
+    /// The base (`baseSize` is its size) is fitted inside the output and centred over black, so a
+    /// base whose shape differs from the output gets bars rather than being stretched. Its scale is
+    /// uniform, except that an axis within a pixel of the output is stretched to fill it, by under a
+    /// pixel (`fittedBase`). Every overlay is sized and positioned against `outputSize`, independent
+    /// of the base.
     private func compositeWithBase(
         baseImage: CIImage,
-        screenSize: CGSize,
+        baseSize: CGSize,
         cameraLayers: [CameraLayer],
         avatarTexture: CVPixelBuffer? = nil,
         museTexture: CVPixelBuffer? = nil
     ) -> CVPixelBuffer? {
-        var composited = baseImage
+        // Read once: the whole frame is composed against one output size.
+        let outputSize = self.outputSize
+        let outputRect = CGRect(origin: .zero, size: outputSize)
 
-        // Add avatar as PiP overlay if provided
+        var composited = fittedBase(baseImage, baseSize: baseSize, outputSize: outputSize)
+            .composited(over: CIImage(color: .black).cropped(to: outputRect))
+
+        // Read once: the whole frame uses one placement, even if the main actor changes it mid-frame.
+        let placement = layerPlacement.withLock { $0 }
+
         if let avatarBuffer = avatarTexture {
-            let avatarImage = CIImage(cvPixelBuffer: avatarBuffer)
-
-            // Check if avatar image is valid
-            guard avatarImage.extent.width > 0 && avatarImage.extent.height > 0 else {
-                print("⚠️ [Compositor] Avatar image has zero extent: \(avatarImage.extent)")
-                return compositeWithBase(baseImage: baseImage, screenSize: screenSize, cameraLayers: cameraLayers, avatarTexture: nil)
+            if let avatar = slotLayer(
+                avatarBuffer, slot: placement.avatarSlot, visibleRect: placement.avatarVisibleRect,
+                outputSize: outputSize) {
+                composited = avatar.composited(over: composited)
             }
-
-            // Debug: Sample pixels from avatar buffer to verify content
-            #if DEBUG
-            debugSampleAvatarBuffer(avatarBuffer)
-            #endif
-
-            // Calculate PiP dimensions for avatar (treat as single overlay)
-            let totalOverlays = cameraLayers.count + 1
-            let pipSize = pipSize(for: screenSize, cameraCount: totalOverlays)
-
-            // Scale avatar to PiP size maintaining aspect ratio
-            let avatarAspect = avatarImage.extent.width / avatarImage.extent.height
-            let pipAspect = pipSize.width / pipSize.height
-
-            var scaledAvatarSize = pipSize
-            if avatarAspect > pipAspect {
-                scaledAvatarSize.height = pipSize.width / avatarAspect
-            } else {
-                scaledAvatarSize.width = pipSize.height * avatarAspect
-            }
-
-            let scaleX = scaledAvatarSize.width / avatarImage.extent.width
-            let scaleY = scaledAvatarSize.height / avatarImage.extent.height
-            let scaledAvatar = avatarImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
-
-            // Add rounded corners BEFORE positioning (mask needs to be at same origin as image)
-            let avatarWithEffects = addPiPEffects(to: scaledAvatar, size: scaledAvatarSize)
-
-            // Position avatar at the configured PiP position (first position)
-            let position = calculatePiPPosition(
-                screenSize: screenSize,
-                pipSize: scaledAvatarSize,
-                position: pipPosition
-            )
-
-            let positionedAvatar = avatarWithEffects.transformed(by: CGAffineTransform(translationX: position.x, y: position.y))
-
-            composited = positionedAvatar.composited(over: composited)
         }
 
-        // Add Muse AI avatar as additional PiP overlay (for dual avatar mode)
-        if let museBuffer = museTexture {
-            let museImage = CIImage(cvPixelBuffer: museBuffer)
-
-            guard museImage.extent.width > 0 && museImage.extent.height > 0 else {
-                // Skip invalid muse texture
-                return compositeWithBase(baseImage: baseImage, screenSize: screenSize, cameraLayers: cameraLayers, avatarTexture: avatarTexture, museTexture: nil)
-            }
-
-            let totalOverlays = cameraLayers.count + (avatarTexture != nil ? 2 : 1)
-            let musePipSize = pipSize(for: screenSize, cameraCount: totalOverlays)
-
-            let museAspect = museImage.extent.width / museImage.extent.height
-            let pipAspect = musePipSize.width / musePipSize.height
-
-            var scaledMuseSize = musePipSize
-            if museAspect > pipAspect {
-                scaledMuseSize.height = musePipSize.width / museAspect
-            } else {
-                scaledMuseSize.width = musePipSize.height * museAspect
-            }
-
-            let scaleX = scaledMuseSize.width / museImage.extent.width
-            let scaleY = scaledMuseSize.height / museImage.extent.height
-            let scaledMuse = museImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
-
-            let museWithEffects = addPiPEffects(to: scaledMuse, size: scaledMuseSize)
-
-            // Position muse opposite to the mocap avatar
-            let musePosition: PiPPosition = (pipPosition == .bottomRight) ? .bottomLeft : .bottomRight
-            let position = calculatePiPPosition(
-                screenSize: screenSize,
-                pipSize: scaledMuseSize,
-                position: musePosition
-            )
-
-            let positionedMuse = museWithEffects.transformed(by: CGAffineTransform(translationX: position.x, y: position.y))
-            composited = positionedMuse.composited(over: composited)
+        if let museBuffer = museTexture,
+           let muse = slotLayer(
+               museBuffer, slot: placement.museSlot, visibleRect: placement.museVisibleRect,
+               outputSize: outputSize) {
+            composited = muse.composited(over: composited)
         }
 
         for (index, layer) in cameraLayers.enumerated() {
@@ -257,7 +257,7 @@ public final class CompositorManager: Sendable {
             }
 
             // Calculate PiP dimensions and position
-            let pipSize = pipSize(for: screenSize, cameraCount: cameraLayers.count)
+            let pipSize = pipSize(for: outputSize, cameraCount: cameraLayers.count)
 
             // Scale camera to PiP size maintaining aspect ratio
             let cameraAspect = cameraImage.extent.width / cameraImage.extent.height
@@ -275,20 +275,20 @@ public final class CompositorManager: Sendable {
             let scaledCamera = cameraImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
 
             // Calculate position based on PiP setting or provided override
-            let placement = layer.position ?? pipPosition
+            let corner = layer.position ?? pipPosition
             let position: CGPoint
             if cameraLayers.count > 1 {
                 position = multiCameraPosition(
-                    screenSize: screenSize,
+                    screenSize: outputSize,
                     pipSize: scaledCameraSize,
-                    preferred: placement,
+                    preferred: corner,
                     index: index
                 )
             } else {
                 position = calculatePiPPosition(
-                    screenSize: screenSize,
+                    screenSize: outputSize,
                     pipSize: scaledCameraSize,
-                    position: placement
+                    position: corner
                 )
             }
 
@@ -305,28 +305,53 @@ public final class CompositorManager: Sendable {
 
         // Add watermark if enabled
         if watermarkEnabled {
-            composited = addWatermark(to: composited, screenSize: screenSize)
+            composited = addWatermark(to: composited, screenSize: outputSize)
         }
 
         // Add scene overlay if active (Starting Soon, BRB, Ending)
         #if os(macOS)
         if let overlayText = sceneOverlayText, !overlayText.isEmpty {
-            composited = addSceneOverlay(to: composited, screenSize: screenSize, text: overlayText)
+            composited = addSceneOverlay(to: composited, screenSize: outputSize, text: overlayText)
         }
         #endif
 
-        // Scale to output resolution if different from source
-        let finalImage: CIImage
-        if screenSize != outputSize {
-            let scaleX = outputSize.width / screenSize.width
-            let scaleY = outputSize.height / screenSize.height
-            finalImage = composited.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
-        } else {
-            finalImage = composited
-        }
+        // Everything is already in output space; clip whatever overhangs the output.
+        return renderToPixelBuffer(image: composited.cropped(to: outputRect), size: outputSize)
+    }
 
-        // Render to pixel buffer at output resolution
-        return renderToPixelBuffer(image: finalImage, size: outputSize)
+    /// An avatar or Muse texture placed in its slot: the whole texture, drawn at the slot's
+    /// `textureFrame` with one uniform scale, so its visible part lands on the fitted `visible` rect.
+    /// The fit uses the texture's own size, so a texture of any shape lands inside its slot; every
+    /// 16:9 size lands in the same place. It has no rounded PiP mask; only the output crop clips it.
+    /// Nil when the texture or the slot is empty, so the frame goes on without that layer.
+    private func slotLayer(
+        _ buffer: CVPixelBuffer, slot: AvatarSlot, visibleRect: CGRect, outputSize: CGSize
+    ) -> CIImage? {
+        let image = CIImage(cvPixelBuffer: buffer)
+        let extent = image.extent
+        guard extent.width > 0, extent.height > 0 else { return nil }
+        let textureFrame = AvatarSlotLayout.frame(
+            slot: slot, visibleRect: visibleRect, textureSize: extent.size, output: outputSize
+        ).textureFrame
+        guard textureFrame.width > 0, textureFrame.height > 0 else { return nil }
+        let target = AvatarSlotLayout.coreImageRect(textureFrame, outputHeight: outputSize.height)
+        let scale = textureFrame.width / extent.width
+        let scaled = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        return scaled.transformed(by: CGAffineTransform(
+            translationX: target.minX - scaled.extent.minX, y: target.minY - scaled.extent.minY))
+    }
+
+    /// Scales the base uniformly to fit inside the output and centres it, leaving bars on the
+    /// unused axis. The base is not stretched, except that an axis within a pixel of the output
+    /// fills it (`AvatarSlotLayout.aspectFit`), so no sub-pixel bar darkens the edge.
+    private func fittedBase(_ base: CIImage, baseSize: CGSize, outputSize: CGSize) -> CIImage {
+        let fit = AvatarSlotLayout.coreImageRect(
+            AvatarSlotLayout.aspectFit(baseSize, in: outputSize), outputHeight: outputSize.height)
+        guard fit.width > 0, fit.height > 0 else { return base }
+        let scaled = base.transformed(by: CGAffineTransform(
+            scaleX: fit.width / baseSize.width, y: fit.height / baseSize.height))
+        return scaled.transformed(by: CGAffineTransform(
+            translationX: fit.minX - scaled.extent.minX, y: fit.minY - scaled.extent.minY))
     }
 
     /// Scales an image to fill the canvas size (center crop)
@@ -685,53 +710,6 @@ public final class CompositorManager: Sendable {
             )
         }
     }
-
-    // Debug logging throttle
-    private nonisolated(unsafe) static var lastAvatarDebugTime: Date?
-
-    #if DEBUG
-    private func debugSampleAvatarBuffer(_ buffer: CVPixelBuffer) {
-        // Throttle to once every 2 seconds
-        let now = Date()
-        if let last = Self.lastAvatarDebugTime, now.timeIntervalSince(last) < 2.0 {
-            return
-        }
-        Self.lastAvatarDebugTime = now
-
-        CVPixelBufferLockBaseAddress(buffer, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
-
-        guard let baseAddress = CVPixelBufferGetBaseAddress(buffer) else {
-            print("🎭 [Compositor] Avatar buffer has no base address")
-            return
-        }
-
-        let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
-        let width = CVPixelBufferGetWidth(buffer)
-        let height = CVPixelBufferGetHeight(buffer)
-        let ptr = baseAddress.assumingMemoryBound(to: UInt8.self)
-
-        // Sample center pixel
-        let cx = width / 2
-        let cy = height / 2
-        let centerOffset = cy * bytesPerRow + cx * 4
-        let centerB = ptr[centerOffset + 0]
-        let centerG = ptr[centerOffset + 1]
-        let centerR = ptr[centerOffset + 2]
-        let centerA = ptr[centerOffset + 3]
-
-        // Sample corner pixel (where avatar might not be)
-        let cornerOffset = 10 * bytesPerRow + 10 * 4
-        let cornerB = ptr[cornerOffset + 0]
-        let cornerG = ptr[cornerOffset + 1]
-        let cornerR = ptr[cornerOffset + 2]
-        let cornerA = ptr[cornerOffset + 3]
-
-        print("🎭 [Compositor] Avatar \(width)x\(height)")
-        print("   Center: r=\(centerR) g=\(centerG) b=\(centerB) a=\(centerA)")
-        print("   Corner: r=\(cornerR) g=\(cornerG) b=\(cornerB) a=\(cornerA)")
-    }
-    #endif
 
     private func multiCameraPosition(
         screenSize: CGSize,

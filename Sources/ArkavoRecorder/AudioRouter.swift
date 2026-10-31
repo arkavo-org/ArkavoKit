@@ -25,10 +25,16 @@ public class AudioRouter {
 
     // MARK: - Public Methods
 
-    /// Add an audio source to the router
+    /// Add an audio source to the router. A source already added with the same ID is replaced:
+    /// it is detached and stopped, since nothing could stop it once the router lets it go.
     /// - Parameter source: Audio source to add
     public func addSource(_ source: AudioSource) {
         let sourceID = source.sourceID
+        if let replaced = sources[sourceID], replaced !== source {
+            replaced.onSample = nil
+            let stopping = ReplacedSource(source: replaced)
+            Task { @MainActor in try? await stopping.source.stop() }
+        }
 
         // Create format converter for this source
         let converter = AudioFormatConverter(
@@ -64,19 +70,23 @@ public class AudioRouter {
         removeSource(sourceID)
     }
 
-    /// Start all audio sources
+    /// Start all audio sources that aren't running. Starting a running source again could open a
+    /// second capture of it. A source that fails to start doesn't keep the others from starting:
+    /// each is tried, and the first error is thrown once all have been.
     public func startAll() async throws {
         print("🎛️ AudioRouter: Starting all sources...")
 
-        for (sourceID, source) in sources {
+        var firstError: (any Error)?
+        for (sourceID, source) in sources where !source.isActive {
             do {
                 try await source.start()
                 print("  ✓ Started [\(sourceID)]")
             } catch {
                 print("  ✗ Failed to start [\(sourceID)]: \(error)")
-                throw error
+                if firstError == nil { firstError = error }
             }
         }
+        if let firstError { throw firstError }
 
         print("🎛️ AudioRouter: All sources started")
     }
@@ -137,6 +147,11 @@ public class AudioRouter {
         // Forward converted sample to encoder callback
         onConvertedSample?(convertedSample, sourceID)
     }
+}
+
+/// A source the router no longer holds, handed to the task that stops it.
+private struct ReplacedSource: @unchecked Sendable {
+    let source: any AudioSource
 }
 
 // MARK: - Convenience Methods
