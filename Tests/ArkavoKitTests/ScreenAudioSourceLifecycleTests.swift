@@ -18,7 +18,7 @@ struct ScreenAudioSourceLifecycleTests {
         try await router.startAll()
         #expect(source.isActive)
 
-        captures.opened[0].stopByItself()
+        try #require(captures.opened.first).stopByItself()
 
         #expect(!source.isActive)
         try await router.startAll()
@@ -33,7 +33,7 @@ struct ScreenAudioSourceLifecycleTests {
         let router = AudioRouter()
         router.addSource(source)
         try await router.startAll()
-        captures.opened[0].stopFails = true
+        try #require(captures.opened.first).stopFails = true
 
         try? await router.stopAll()
 
@@ -51,7 +51,7 @@ struct ScreenAudioSourceLifecycleTests {
         try await source.stop()
         try await source.start()
 
-        captures.opened[0].stopByItself()
+        try #require(captures.opened.first).stopByItself()
 
         #expect(source.isActive)
     }
@@ -84,7 +84,8 @@ struct ScreenAudioSourceLifecycleTests {
         let start = Task { try await source.start() }
         try await Self.waitUntil { captures.opened.count == 1 }
 
-        let stop = StopCall(source, capture: captures.opened[0])
+        let capture = try #require(captures.opened.first)
+        let stop = StopCall(source, capture: capture)
         try await Task.sleep(for: .milliseconds(200))   // time for a stop that doesn't wait to return
         #expect(!stop.hasReturned, "the stop returned while the capture was still opening")
         captures.release()
@@ -143,7 +144,8 @@ struct ScreenAudioSourceLifecycleTests {
         let start = Task { try await source.start() }
         try await Self.waitUntil { captures.opened.count == 1 }
 
-        let stop = StopCall(source, capture: captures.opened[0])
+        let capture = try #require(captures.opened.first)
+        let stop = StopCall(source, capture: capture)
         try await stop.waitForReturn()
 
         #expect(stop.hasReturned, "the stop is still waiting on an open that hasn't finished")
@@ -182,7 +184,7 @@ struct ScreenAudioSourceLifecycleTests {
         let start = Task { try await source.start() }
         try await Self.waitUntil { captures.opened.count == 1 }
 
-        captures.opened[0].stopByItself()
+        try #require(captures.opened.first).stopByItself()
         captures.release()
         await #expect(throws: RecorderError.screenCaptureUnavailable) { try await start.value }
 
@@ -201,7 +203,7 @@ struct ScreenAudioSourceLifecycleTests {
         let second = Task { try await source.start() }
         try await Task.sleep(for: .milliseconds(200))   // time for the second start to join
 
-        captures.opened[0].stopByItself()
+        try #require(captures.opened.first).stopByItself()
         captures.release()
         await #expect(throws: RecorderError.screenCaptureUnavailable) { try await first.value }
         await #expect(throws: RecorderError.screenCaptureUnavailable) { try await second.value }
@@ -217,9 +219,10 @@ struct ScreenAudioSourceLifecycleTests {
         let start = Task { try await source.start() }
         try await Self.waitUntil { captures.opened.count == 1 }
 
-        let stop = StopCall(source, capture: captures.opened[0])
+        let capture = try #require(captures.opened.first)
+        let stop = StopCall(source, capture: capture)
         try await Task.sleep(for: .milliseconds(200))   // time for the stop to begin
-        captures.opened[0].stopByItself()
+        capture.stopByItself()
         captures.release()
         try await start.value
         try await stop.waitForReturn()
@@ -229,12 +232,16 @@ struct ScreenAudioSourceLifecycleTests {
         #expect(captures.opened.allSatisfy { $0.isStopped })
     }
 
-    /// Polls `condition` for up to five seconds.
-    private static func waitUntil(_ condition: () -> Bool) async throws {
-        let deadline = ContinuousClock.now + .seconds(5)
+    /// Polls `condition` for up to fifteen seconds, and records an issue if it is still false then.
+    /// A busy CI host can hold the main actor for seconds, so the deadline is generous.
+    private static func waitUntil(
+        _ condition: () -> Bool, sourceLocation: SourceLocation = #_sourceLocation
+    ) async throws {
+        let deadline = ContinuousClock.now + .seconds(15)
         while !condition() && .now < deadline {
             try await Task.sleep(for: .milliseconds(10))
         }
+        if !condition() { Issue.record("Timed out waiting for the condition", sourceLocation: sourceLocation) }
     }
 }
 
@@ -286,9 +293,9 @@ private final class StopCall {
     /// Whether the capture had been stopped when the stop returned; nil before it returns.
     var captureWasStoppedOnReturn: Bool? { returned.withLock { $0 } }
 
-    /// Polls for up to five seconds for the stop to return.
+    /// Polls for up to fifteen seconds for the stop to return. Each test then checks that it did.
     func waitForReturn() async throws {
-        let deadline = ContinuousClock.now + .seconds(5)
+        let deadline = ContinuousClock.now + .seconds(15)
         while !hasReturned && .now < deadline {
             try await Task.sleep(for: .milliseconds(10))
         }

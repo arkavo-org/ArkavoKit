@@ -516,13 +516,18 @@ private func startFirstFrameWait(_ manager: ScreenCaptureManager) -> FirstFrameW
     return FirstFrameWait(task: task, ending: ending)
 }
 
-/// Polls `condition` for up to two seconds, so a wait that never ends fails instead of hanging.
+/// Polls `condition` for up to fifteen seconds, so a wait that never ends fails instead of hanging:
+/// a condition still false then is recorded as an issue. A busy CI host can hold the main actor for
+/// seconds, so the deadline is generous.
 @MainActor
-private func waitUntil(_ condition: () -> Bool) async throws {
-    let deadline = ContinuousClock.now + .seconds(2)
+private func waitUntil(
+    _ condition: () -> Bool, sourceLocation: SourceLocation = #_sourceLocation
+) async throws {
+    let deadline = ContinuousClock.now + .seconds(15)
     while !condition() && .now < deadline {
         try await Task.sleep(for: .milliseconds(10))
     }
+    if !condition() { Issue.record("Timed out waiting for the condition", sourceLocation: sourceLocation) }
 }
 
 /// Exercise AVFoundation's real input configuration without capturing the user's screen.

@@ -667,12 +667,16 @@ struct RecordingSessionStopTests {
         return frames.withLock { $0 } - before
     }
 
-    /// Polls `condition` for up to five seconds.
-    private static func waitUntil(_ condition: () -> Bool) async throws {
-        let deadline = ContinuousClock.now + .seconds(5)
+    /// Polls `condition` for up to fifteen seconds, and records an issue if it is still false then.
+    /// A busy CI host can hold the main actor for seconds, so the deadline is generous.
+    private static func waitUntil(
+        _ condition: () -> Bool, sourceLocation: SourceLocation = #_sourceLocation
+    ) async throws {
+        let deadline = ContinuousClock.now + .seconds(15)
         while !condition() && .now < deadline {
             try await Task.sleep(for: .milliseconds(10))
         }
+        if !condition() { Issue.record("Timed out waiting for the condition", sourceLocation: sourceLocation) }
     }
 
     /// The average color at the center of each video frame in the file.
@@ -769,7 +773,7 @@ private struct SharedSources {
         let streamFrames = OSAllocatedUnfairLock(initialState: 0)
         try await session.startStreamingForTesting { _ in streamFrames.withLock { $0 += 1 } }
         // Each frame reaches the file before the stream.
-        let deadline = ContinuousClock.now + .seconds(5)
+        let deadline = ContinuousClock.now + .seconds(15)
         while streamFrames.withLock({ $0 }) < 5 && .now < deadline {
             try await Task.sleep(for: .milliseconds(10))
         }
