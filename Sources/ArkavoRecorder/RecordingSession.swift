@@ -288,7 +288,7 @@ public final class RecordingSession: Sendable {
 
     /// Supplies the microphone in place of the built-in capture device. Called with the source ID
     /// the session uses for it (`"microphone"`, which keeps it the mix clock); returning nil keeps
-    /// the built-in `MicrophoneAudioSource`. An app whose own voice-processing engine already holds
+    /// the built-in `MicrophoneAudioSource`, as does a source with any other ID. An app whose own voice-processing engine already holds
     /// the device feeds the mix from that engine this way: on some Macs a second capture client of
     /// a voice-processed microphone receives silence.
     public var microphoneSourceProvider: (@MainActor (_ sourceID: String) -> (any AudioSource)?)?
@@ -296,8 +296,9 @@ public final class RecordingSession: Sendable {
     /// Rebuilds the microphone through `microphoneSourceProvider`, for when the right source
     /// changes mid-session (a voice-processing engine started or stopped). Does nothing when the
     /// session has no microphone. A running microphone's replacement starts at once and stays
-    /// the mix clock.
-    public func replaceMicrophoneSource() async {
+    /// the mix clock; it is left stopped if the recording and stream stop meanwhile.
+    /// - Throws: the replacement's start error. The replacement stays registered, inactive.
+    public func replaceMicrophoneSource() async throws {
         let id = Self.microphoneSourceID
         guard audioRouter.allSourceIDs.contains(id) else { return }
         let wasActive = audioRouter.activeSourceIDs.contains(id)
@@ -305,13 +306,15 @@ public final class RecordingSession: Sendable {
         audioMixer.unregisterSource(id)
         addMicrophone()
         syncAudioMixerRouting()
-        guard wasActive else { return }
-        do {
-            try await audioRouter.startSource(id)
-        } catch {
-            print("⚠️ RecordingSession: replacement microphone failed to start: \(error)")
-        }
+        // A stop that ran while the old source stopped has already stopped the router's sources.
+        guard wasActive, audioCaptureIsRunning else { return }
+        try await audioRouter.startSource(id)
+        // A stop that ran while the replacement started missed it.
+        if !audioCaptureIsRunning { try? await audioRouter.stopSource(id) }
     }
+
+    /// A recording (paused or not) or a stream holds the audio sources.
+    private var audioCaptureIsRunning: Bool { _isRecording || _streamingActive.withLock { $0 } }
 
     nonisolated static let microphoneSourceID = "microphone"
 
@@ -356,7 +359,12 @@ public final class RecordingSession: Sendable {
 
     /// Adds a microphone that reports its level as `audioLevel`.
     private func addMicrophone() {
-        let microphone = microphoneSourceProvider?(Self.microphoneSourceID) ?? audioInputs.makeMicrophone()
+        let id = Self.microphoneSourceID
+        let provided = microphoneSourceProvider?(id)
+        if let provided, provided.sourceID != id {
+            print("⚠️ RecordingSession: ignoring a provided microphone with source ID \(provided.sourceID); it must be \(id)")
+        }
+        let microphone = provided.flatMap { $0.sourceID == id ? $0 : nil } ?? audioInputs.makeMicrophone()
         (microphone as? MicrophoneAudioSource)?.onLevelUpdate = { @Sendable [weak self] level in
             self?.audioLevel = level
         }

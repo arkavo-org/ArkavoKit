@@ -76,6 +76,11 @@ public class AudioRouter {
         try await source.start()
     }
 
+    /// Stops one source, leaving it registered.
+    func stopSource(_ sourceID: String) async throws {
+        try await sources[sourceID]?.stop()
+    }
+
     /// Start all audio sources that aren't running. Starting a running source again could open a
     /// second capture of it. A source that fails to start doesn't keep the others from starting:
     /// each is tried, and the first error is thrown once all have been.

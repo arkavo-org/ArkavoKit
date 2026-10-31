@@ -337,7 +337,7 @@ struct RecordingSessionStopTests {
 
         let provided = FakeAudioSource(sourceID: "microphone")
         session.microphoneSourceProvider = { _ in provided }
-        await session.replaceMicrophoneSource()
+        try await session.replaceMicrophoneSource()
 
         #expect(!original.isActive)
         #expect(provided.isActive)
@@ -345,10 +345,58 @@ struct RecordingSessionStopTests {
 
         // Back to the built-in microphone: a nil provider result keeps the default.
         session.microphoneSourceProvider = { _ in nil }
-        await session.replaceMicrophoneSource()
+        try await session.replaceMicrophoneSource()
         #expect(!provided.isActive)
         #expect(inputs.microphones.count == 2)
         #expect(inputs.microphones.last?.isActive == true)
+        _ = try? await session.stopRecording()
+    }
+
+    @Test("A provided microphone with another source ID is ignored for the built-in one")
+    func providedMicrophoneWithAnotherIDIsIgnored() async throws {
+        let url = Self.outputURL("misnamed-microphone")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let inputs = StandInAudioInputs()
+        let session = try Self.avatarSession(audioInputs: inputs.audioInputs)
+        session.enableMicrophone = true
+        let misnamed = FakeAudioSource(sourceID: "mic")
+        session.microphoneSourceProvider = { _ in misnamed }
+        try await session.startRecording(outputURL: url, title: "misnamed")
+        #expect(!misnamed.started)
+        #expect(inputs.microphones.count == 1)
+        #expect(inputs.microphones.first?.isActive == true)
+        _ = try? await session.stopRecording()
+    }
+
+    @Test("A replacement that races the recording's stop is left stopped")
+    func replacementRacingTheStopIsLeftStopped() async throws {
+        let url = Self.outputURL("replace-during-stop")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let inputs = StandInAudioInputs()
+        let session = try Self.avatarSession(audioInputs: inputs.audioInputs)
+        session.enableMicrophone = true
+        try await session.startRecording(outputURL: url, title: "racing")
+        let slow = SlowStartingAudioSource(sourceID: "microphone")
+        session.microphoneSourceProvider = { _ in slow }
+
+        let replace = Task { try await session.replaceMicrophoneSource() }
+        _ = try? await session.stopRecording()
+        try? await replace.value
+
+        #expect(!slow.isActive, "nothing records, so the microphone must not run")
+        #expect(inputs.microphones.allSatisfy { !$0.isActive })
+    }
+
+    @Test("A replacement that fails to start throws")
+    func replacementStartFailureThrows() async throws {
+        let url = Self.outputURL("replace-fails")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let inputs = StandInAudioInputs()
+        let session = try Self.avatarSession(audioInputs: inputs.audioInputs)
+        session.enableMicrophone = true
+        try await session.startRecording(outputURL: url, title: "fails")
+        session.microphoneSourceProvider = { _ in FailingAudioSource(sourceID: "microphone") }
+        await #expect(throws: FailingAudioSource.Failure.self) { try await session.replaceMicrophoneSource() }
         _ = try? await session.stopRecording()
     }
 
@@ -357,7 +405,7 @@ struct RecordingSessionStopTests {
         let inputs = StandInAudioInputs()
         let session = try Self.avatarSession(audioInputs: inputs.audioInputs)
         session.microphoneSourceProvider = { _ in FakeAudioSource(sourceID: "microphone") }
-        await session.replaceMicrophoneSource()
+        try await session.replaceMicrophoneSource()
         #expect(!session.registeredAudioSourceIDs.contains("microphone"))
     }
 
@@ -889,6 +937,21 @@ private final class StandInAudioInputs {
             }
         )
     }
+}
+
+/// An audio source whose start always fails.
+private final class FailingAudioSource: AudioSource, @unchecked Sendable {
+    struct Failure: Error {}
+    let sourceID: String
+    let sourceName = "Failing"
+    let format = AudioFormat(sampleRate: 48000, channels: 2, bitDepth: 16, formatID: kAudioFormatLinearPCM)
+    var onSample: ((CMSampleBuffer) -> Void)?
+    let isActive = false
+
+    init(sourceID: String) { self.sourceID = sourceID }
+
+    func start() async throws { throw Failure() }
+    func stop() async throws {}
 }
 
 /// An audio source whose start takes 100 ms, as opening a capture device does.
