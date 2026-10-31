@@ -63,9 +63,9 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/arkavo-org/OpenTDFKit", from: "5.1.0"),
-        .package(url: "https://github.com/arkavo-org/iroh-swift", from: "0.5.0"),
+        .package(url: "https://github.com/arkavo-org/iroh-swift", from: "0.6.0"),
         .package(url: "https://github.com/weichsel/ZIPFoundation", from: "0.9.20"),
-        .package(url: "https://github.com/arkavo-org/ArkavoMediaKit", from: "0.2.0")
+        .package(url: "https://github.com/arkavo-org/ArkavoMediaKit", from: "0.5.1")
     ],
     targets: [
         .target(

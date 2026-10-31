@@ -1,13 +1,13 @@
 {
-  "originHash" : "8e80d9e6d91171b0893cac8bac39ebd054e83e93cd968f6c4f03a8254e15a21b",
+  "originHash" : "923cb7b69b40fe85a0febb38c4476c7a501ba064f926517fc03e2295fce98d60",
   "pins" : [
     {
       "identity" : "arkavomediakit",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/arkavo-org/ArkavoMediaKit",
       "state" : {
-        "revision" : "9c0068df15e8726302563923b66d8ad4a6c5d04e",
-        "version" : "0.2.0"
+        "revision" : "73b12aa82488b469c1fda9fb17be6afa008ae5e8",
+        "version" : "0.5.1"
       }
     },
     {
@@ -24,8 +24,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/arkavo-org/iroh-swift",
       "state" : {
-        "revision" : "b62347b05546010ec13ebe9eddec008ca5172f02",
-        "version" : "0.5.1"
+        "revision" : "28d34749c39d3c682641f2a4f1d5c9797b4bb67e",
+        "version" : "0.6.0"
       }
     },
     {
