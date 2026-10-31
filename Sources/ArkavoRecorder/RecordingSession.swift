@@ -852,8 +852,9 @@ public final class RecordingSession: Sendable {
         }
     }
 
-    /// Processes a frame for camera-only or avatar-only modes (called by timer)
-    private nonisolated func processCameraOrAvatarFrame() async {
+    /// Processes a frame for camera-only or avatar-only modes (called by timer).
+    /// `fromPreviewTimer`: the idle preview's 1 s timer asked for it (tests count those).
+    private nonisolated func processCameraOrAvatarFrame(fromPreviewTimer: Bool = false) async {
         let monitorHandler = monitorFrameHandler
         guard let delivery = beginFrameDelivery(handler: monitorHandler) else { return }
         var delivered = false
@@ -903,6 +904,8 @@ public final class RecordingSession: Sendable {
         guard let output = composited else { return }
 
         guard isCurrent(delivery) else { return }
+        // Counted before the handler sees the frame, so a test's handler can tell which path delivered it.
+        if fromPreviewTimer, delivery.previewGeneration != nil { previewTimerFrames.withLock { $0 += 1 } }
         delivery.handler?(output, timestamp)
         delivered = true
 
@@ -963,7 +966,7 @@ public final class RecordingSession: Sendable {
                 timer.invalidate()
                 return
             }
-            Task { @MainActor [weak self] in await self?.processCameraOrAvatarFrame() }
+            Task { @MainActor [weak self] in await self?.processCameraOrAvatarFrame(fromPreviewTimer: true) }
         }
         composedPreviewTimer = timer
         RunLoop.main.add(timer, forMode: .common)
@@ -1190,6 +1193,13 @@ public final class RecordingSession: Sendable {
 
     /// Tests: how many times a stream's frame generation has started.
     private(set) var streamFrameGenerationStartsForTesting = 0
+
+    /// Idle preview frames the 1 s timer delivered (`previewTimerFramesForTesting`).
+    private let previewTimerFrames = OSAllocatedUnfairLock(initialState: 0)
+
+    /// Tests: how many idle preview frames the 1 s timer delivered. Readable from a monitor
+    /// handler: a frame the timer delivers is counted before its handler sees it.
+    nonisolated var previewTimerFramesForTesting: Int { previewTimerFrames.withLock { $0 } }
 
     /// Tests: `startStreaming(to:streamKey:)` without RTMP. The encoder's stream output goes to
     /// `onEncodedVideo` instead of a destination; `stopStreaming()` ends it.

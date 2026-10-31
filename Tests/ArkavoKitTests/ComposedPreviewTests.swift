@@ -183,29 +183,36 @@ struct ComposedPreviewTests {
     func sourceChangeDuringInFlightFrameDeliversPromptly() async throws {
         let session = try Self.avatarSession()
         let compositions = OSAllocatedUnfairLock(initialState: 0)
+        // The first frame stays composing until the sources have changed.
+        let firstFrameHeld = OSAllocatedUnfairLock(initialState: true)
         session.avatarTextureProvider = {
-            // The first frame is still composing when the sources change.
             if compositions.withLock({ count in count += 1; return count }) == 1 {
-                Thread.sleep(forTimeInterval: 0.25)
+                let deadline = ContinuousClock.now + .seconds(15)
+                while firstFrameHeld.withLock({ $0 }) && .now < deadline { Thread.sleep(forTimeInterval: 0.01) }
             }
             return createTestPixelBuffer(width: 1920, height: 1080, red: 0, green: 255, blue: 0)
         }
+        // The timer's frame count when the first frame arrives: 1 if that frame waited for the timer.
+        let timerFramesAtFirstFrame = OSAllocatedUnfairLock<Int?>(initialState: nil)
         let frames = OSAllocatedUnfairLock(initialState: [Frame]())
         session.monitorFrameHandler = { buffer, _ in
+            let timerFrames = session.previewTimerFramesForTesting
+            timerFramesAtFirstFrame.withLock { if $0 == nil { $0 = timerFrames } }
             let frame = Frame(buffer)
             frames.withLock { $0.append(frame) }
         }
         session.setComposedPreviewEnabled(true)
         defer { session.setComposedPreviewEnabled(false) }
-        try await Task.sleep(for: .milliseconds(50))
+        try await Self.waitUntil { compositions.withLock { $0 } == 1 }
 
-        let changed = ContinuousClock.now
         session.inputsDidChange()
+        firstFrameHeld.withLock { $0 = false }
         try await Self.waitForFrames(frames, count: 1)
-        let first = try #require(frames.withLock { $0.first })
-        // The frame composed before the change isn't delivered; its replacement follows at once.
+
+        // The frame composed before the change isn't delivered; the next one doesn't wait for the
+        // timer. Which path delivered it, not how long it took: a busy host delays both.
         #expect(compositions.withLock { $0 } >= 2)
-        #expect(changed.duration(to: first.time) < .milliseconds(900))
+        #expect(timerFramesAtFirstFrame.withLock { $0 } == 0, "the first frame after the change waited for the 1 s timer")
     }
 
     @Test("The session forwards slots to the compositor")
@@ -278,6 +285,17 @@ struct ComposedPreviewTests {
             avatar = getAverageColor(in: buffer, region: CGRect(x: 1612, y: 909, width: 40, height: 40))!
             muse = getAverageColor(in: buffer, region: CGRect(x: 268, y: 909, width: 40, height: 40))!
         }
+    }
+
+    /// Polls `condition` for up to fifteen seconds, and records an issue if it is still false then.
+    private static func waitUntil(
+        _ condition: () -> Bool, sourceLocation: SourceLocation = #_sourceLocation
+    ) async throws {
+        let deadline = ContinuousClock.now + .seconds(15)
+        while !condition() && .now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        if !condition() { Issue.record("Timed out waiting for the condition", sourceLocation: sourceLocation) }
     }
 
     private static func waitForFrames(_ frames: OSAllocatedUnfairLock<[Frame]>, count: Int) async throws {
