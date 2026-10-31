@@ -100,18 +100,18 @@ struct RecordingSessionStopTests {
         try await session.startRecording(outputURL: url, title: "stream continues")
         try await session.startStreamingForTesting { _ in streamFrames.withLock { $0 += 1 } }
         try await Self.waitUntil { streamFrames.withLock { $0 } >= 10 }
+        let flowing = try await Self.frames(counting: streamFrames, over: .seconds(1))
+        try #require(flowing > Self.flowingStreamFloor, "\(flowing) stream frames a second is too slow to tell flowing from stopped")
 
         _ = try await session.stopRecording()
-        let atStop = streamFrames.withLock { $0 }
-        try await Self.waitUntil { streamFrames.withLock { $0 } >= atStop + 10 }
-        let afterStop = streamFrames.withLock { $0 } - atStop
+        let afterStop = try await Self.frames(counting: streamFrames, over: .seconds(1))
         await session.stopStreaming()
 
-        // About 30 frames at 30 fps while the file finished, and the stream went on after it. A
-        // stopped driver still shows a few: frames from before the stop leave the stream's encoder late.
+        // The stream went on at its rate while the file finished, and after it.
         let whileFinishing = try #require(streamFramesWhileFinishing.withLock { $0 })
-        #expect(whileFinishing >= 15)
-        #expect(afterStop >= 10)
+        let minimum = Self.stillFlowing(given: flowing)
+        #expect(whileFinishing >= minimum, "\(whileFinishing) stream frames while the file finished, \(flowing) a second before")
+        #expect(afterStop >= minimum, "\(afterStop) stream frames a second after the stop, \(flowing) a second before")
         let colors = try await Self.centerColors(in: url)
         #expect(!colors.isEmpty)
         #expect(colors.allSatisfy { $0.g > 150 && $0.r < 100 }, "a frame composed after finishing began reached the file")
@@ -471,18 +471,17 @@ struct RecordingSessionStopTests {
         try await session.startRecording(outputURL: url, title: "paused stream")
         try await session.startStreamingForTesting { _ in streamFrames.withLock { $0 += 1 } }
         try await Self.waitUntil { streamFrames.withLock { $0 } >= 10 }
+        let flowing = try await Self.frames(counting: streamFrames, over: .seconds(1))
+        try #require(flowing > Self.flowingStreamFloor, "\(flowing) stream frames a second is too slow to tell flowing from stopped")
 
         session.pauseRecording()
         await encoder.pause()   // the session's pause reaches the encoder in a task; this one is done on return
         paused.withLock { $0 = true }
-        let atPause = streamFrames.withLock { $0 }
-        try await Task.sleep(for: .seconds(1))
-        let whilePaused = streamFrames.withLock { $0 } - atPause
+        let whilePaused = try await Self.frames(counting: streamFrames, over: .seconds(1))
         _ = try await session.stopRecording()
         await session.stopStreaming()
 
-        // About 30 at 30 fps; a held-back stream still shows a few from the encoder's lag.
-        #expect(whilePaused >= 15)
+        #expect(whilePaused >= Self.stillFlowing(given: flowing), "\(whilePaused) stream frames a second while paused, \(flowing) a second before")
         let colors = try await Self.centerColors(in: url)
         #expect(!colors.isEmpty)
         #expect(colors.allSatisfy { $0.g > 150 && $0.r < 100 }, "a frame composed while paused reached the file")
@@ -648,6 +647,24 @@ struct RecordingSessionStopTests {
         let green = try SolidFrame(red: 0, green: 255, blue: 0)
         session.avatarTextureProvider = { green.buffer }
         return session
+    }
+
+    /// More stream frames than a second of a stopped stream shows. Its frames stop, but a few still
+    /// arrive: frames from before the stop leave the stream's encoder late.
+    private static let flowingStreamFloor = 5
+
+    /// The fewest frames a second of a stream that keeps flowing shows, given `flowing` frames in a
+    /// second before: half as many, and more than `flowingStreamFloor`. The rate is the host's: the
+    /// 30 fps driver composes one frame at a time, so a slow host (a CI VM manages 10–14) lowers it.
+    private static func stillFlowing(given flowing: Int) -> Int {
+        max(flowing / 2, flowingStreamFloor + 1)
+    }
+
+    /// How much `frames` counts over `window`.
+    private static func frames(counting frames: OSAllocatedUnfairLock<Int>, over window: Duration) async throws -> Int {
+        let before = frames.withLock { $0 }
+        try await Task.sleep(for: window)
+        return frames.withLock { $0 } - before
     }
 
     /// Polls `condition` for up to five seconds.
