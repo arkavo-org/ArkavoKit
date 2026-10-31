@@ -302,19 +302,29 @@ public final class RecordingSession: Sendable {
         let id = Self.microphoneSourceID
         guard audioRouter.allSourceIDs.contains(id) else { return }
         let wasActive = audioRouter.activeSourceIDs.contains(id)
+        let stops = audioStopCount
         await audioRouter.stopAndRemoveSource(id)
         audioMixer.unregisterSource(id)
         addMicrophone()
         syncAudioMixerRouting()
         // A stop that ran while the old source stopped has already stopped the router's sources.
-        guard wasActive, audioCaptureIsRunning else { return }
+        guard wasActive, audioKeepsRunning(since: stops) else { return }
         try await audioRouter.startSource(id)
         // A stop that ran while the replacement started missed it.
-        if !audioCaptureIsRunning { try? await audioRouter.stopSource(id) }
+        if !audioKeepsRunning(since: stops) { try? await audioRouter.stopSource(id) }
     }
 
-    /// A recording (paused or not) or a stream holds the audio sources.
-    private var audioCaptureIsRunning: Bool { _isRecording || _streamingActive.withLock { $0 } }
+    /// Bumped as each stop of the audio sources begins, so work that suspended can tell one ran.
+    private var audioStopCount: UInt64 = 0
+    /// From the start of `stopRecording()` until its file is finished; `_isRecording` stays true
+    /// that long.
+    private var recordingStopping = false
+
+    /// The audio sources should be running, and no stop of them began since `stops` was read.
+    private func audioKeepsRunning(since stops: UInt64) -> Bool {
+        guard stops == audioStopCount else { return false }
+        return (_isRecording && !recordingStopping) || _streamingActive.withLock { $0 }
+    }
 
     nonisolated static let microphoneSourceID = "microphone"
 
@@ -695,6 +705,8 @@ public final class RecordingSession: Sendable {
     /// more into the file once finishing has begun. A stream that starts while this stops the
     /// sources, or while the file finishes, gets them back once the recording is over.
     public func stopRecording() async throws -> URL {
+        recordingStopping = true
+        defer { recordingStopping = false }
         let streamKeepsSources = _streamingActive.withLock { $0 }
         // A stream that starts once this has stopped the sources finds the recording still
         // running, so it neither starts them nor its frames: this does once the recording is over.
@@ -777,6 +789,7 @@ public final class RecordingSession: Sendable {
         stopCameraFrameDriver()
         screenCapture.stopCapture()
         stopCameraCaptures()
+        audioStopCount &+= 1
         try? await audioRouter.stopAll()
     }
 
@@ -1186,6 +1199,7 @@ public final class RecordingSession: Sendable {
             try? await audioRouter.startAll()
             // A stop that came while the sources were starting stopped only those running then.
             if !_streamingActive.withLock({ $0 }) && !_isRecording && !recordingStarting {
+                audioStopCount &+= 1
                 try? await audioRouter.stopAll()
             }
         }

@@ -387,6 +387,27 @@ struct RecordingSessionStopTests {
         #expect(inputs.microphones.allSatisfy { !$0.isActive })
     }
 
+    @Test("A replacement suspended while the recording stops is not started after it")
+    func replacementSuspendedThroughTheStopIsNotStarted() async throws {
+        let url = Self.outputURL("replace-through-stop")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let inputs = StandInAudioInputs()
+        let session = try Self.avatarSession(audioInputs: inputs.audioInputs)
+        session.enableMicrophone = true
+        let original = SlowStoppingAudioSource(sourceID: "microphone")
+        session.microphoneSourceProvider = { _ in original }
+        try await session.startRecording(outputURL: url, title: "through stop")
+        let replacement = FakeAudioSource(sourceID: "microphone")
+        session.microphoneSourceProvider = { _ in replacement }
+
+        let replace = Task { try await session.replaceMicrophoneSource() }
+        try await Self.waitUntil { original.stopEntered }   // the replacement is suspended there
+        _ = try? await session.stopRecording()
+        try? await replace.value
+
+        #expect(!replacement.started, "the recording stopped while the old microphone did")
+    }
+
     @Test("A replacement that fails to start throws")
     func replacementStartFailureThrows() async throws {
         let url = Self.outputURL("replace-fails")
@@ -936,6 +957,28 @@ private final class StandInAudioInputs {
                 return audio
             }
         )
+    }
+}
+
+/// An audio source whose stop takes 100 ms and reports when it began.
+private final class SlowStoppingAudioSource: AudioSource, @unchecked Sendable {
+    let sourceID: String
+    let sourceName = "Slow stop"
+    let format = AudioFormat(sampleRate: 48000, channels: 2, bitDepth: 16, formatID: kAudioFormatLinearPCM)
+    var onSample: ((CMSampleBuffer) -> Void)?
+    private let state = OSAllocatedUnfairLock(initialState: (active: false, stopEntered: false))
+
+    init(sourceID: String) { self.sourceID = sourceID }
+
+    var isActive: Bool { state.withLock { $0.active } }
+    var stopEntered: Bool { state.withLock { $0.stopEntered } }
+
+    func start() async throws { state.withLock { $0.active = true } }
+
+    func stop() async throws {
+        state.withLock { $0.stopEntered = true }
+        try await Task.sleep(for: .milliseconds(100))
+        state.withLock { $0.active = false }
     }
 }
 
