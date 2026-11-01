@@ -176,9 +176,9 @@ public actor YouTubeClient: ObservableObject {
             // Build auth URL with the dynamic localhost redirect
             let authURL = buildAuthURL(redirectUri: redirectUri, state: state)
 
-            // Open browser for authentication
+            // Open browser for authentication. If it doesn't open, the wait below times out.
             await MainActor.run {
-                NSWorkspace.shared.open(authURL)
+                _ = NSWorkspace.shared.open(authURL)
             }
 
             // Wait for the callback with the authorization code

@@ -303,6 +303,133 @@ struct RecordingSessionStopTests {
         #expect(inputs.microphones.allSatisfy { !$0.isActive })
     }
 
+    @Test("A microphone source provider supplies the session's microphone instead of a capture device")
+    func microphoneSourceProviderSuppliesTheMicrophone() async throws {
+        let url = Self.outputURL("provided-microphone")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let inputs = StandInAudioInputs()
+        let session = try Self.avatarSession(audioInputs: inputs.audioInputs)
+        session.enableMicrophone = true
+        let provided = FakeAudioSource(sourceID: "microphone")
+        var askedFor: [String] = []
+        session.microphoneSourceProvider = { id in askedFor.append(id); return provided }
+
+        try await session.startRecording(outputURL: url, title: "provided")
+
+        #expect(askedFor == ["microphone"])
+        #expect(inputs.microphones.isEmpty, "no capture device is opened")
+        #expect(provided.isActive)
+        #expect(session.registeredAudioSourceIDs.contains("microphone"))
+        _ = try? await session.stopRecording()
+        #expect(!provided.isActive)
+    }
+
+    @Test("Replacing the microphone mid-recording stops the old source and starts the provider's")
+    func replacingTheMicrophoneMidRecordingSwapsTheSource() async throws {
+        let url = Self.outputURL("replaced-microphone")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let inputs = StandInAudioInputs()
+        let session = try Self.avatarSession(audioInputs: inputs.audioInputs)
+        session.enableMicrophone = true
+        try await session.startRecording(outputURL: url, title: "replaced")
+        let original = try #require(inputs.microphones.first)
+        #expect(original.isActive)
+
+        let provided = FakeAudioSource(sourceID: "microphone")
+        session.microphoneSourceProvider = { _ in provided }
+        try await session.replaceMicrophoneSource()
+
+        #expect(!original.isActive)
+        #expect(provided.isActive)
+        #expect(session.registeredAudioSourceIDs.filter { $0 == "microphone" }.count == 1)
+
+        // Back to the built-in microphone: a nil provider result keeps the default.
+        session.microphoneSourceProvider = { _ in nil }
+        try await session.replaceMicrophoneSource()
+        #expect(!provided.isActive)
+        #expect(inputs.microphones.count == 2)
+        #expect(inputs.microphones.last?.isActive == true)
+        _ = try? await session.stopRecording()
+    }
+
+    @Test("A provided microphone with another source ID is ignored for the built-in one")
+    func providedMicrophoneWithAnotherIDIsIgnored() async throws {
+        let url = Self.outputURL("misnamed-microphone")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let inputs = StandInAudioInputs()
+        let session = try Self.avatarSession(audioInputs: inputs.audioInputs)
+        session.enableMicrophone = true
+        let misnamed = FakeAudioSource(sourceID: "mic")
+        session.microphoneSourceProvider = { _ in misnamed }
+        try await session.startRecording(outputURL: url, title: "misnamed")
+        #expect(!misnamed.started)
+        #expect(inputs.microphones.count == 1)
+        #expect(inputs.microphones.first?.isActive == true)
+        _ = try? await session.stopRecording()
+    }
+
+    @Test("A replacement that races the recording's stop is left stopped")
+    func replacementRacingTheStopIsLeftStopped() async throws {
+        let url = Self.outputURL("replace-during-stop")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let inputs = StandInAudioInputs()
+        let session = try Self.avatarSession(audioInputs: inputs.audioInputs)
+        session.enableMicrophone = true
+        try await session.startRecording(outputURL: url, title: "racing")
+        let slow = SlowStartingAudioSource(sourceID: "microphone")
+        session.microphoneSourceProvider = { _ in slow }
+
+        let replace = Task { try await session.replaceMicrophoneSource() }
+        _ = try? await session.stopRecording()
+        try? await replace.value
+
+        #expect(!slow.isActive, "nothing records, so the microphone must not run")
+        #expect(inputs.microphones.allSatisfy { !$0.isActive })
+    }
+
+    @Test("A replacement suspended while the recording stops is not started after it")
+    func replacementSuspendedThroughTheStopIsNotStarted() async throws {
+        let url = Self.outputURL("replace-through-stop")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let inputs = StandInAudioInputs()
+        let session = try Self.avatarSession(audioInputs: inputs.audioInputs)
+        session.enableMicrophone = true
+        let original = SlowStoppingAudioSource(sourceID: "microphone")
+        session.microphoneSourceProvider = { _ in original }
+        try await session.startRecording(outputURL: url, title: "through stop")
+        let replacement = FakeAudioSource(sourceID: "microphone")
+        session.microphoneSourceProvider = { _ in replacement }
+
+        let replace = Task { try await session.replaceMicrophoneSource() }
+        try await Self.waitUntil { original.stopEntered }   // the replacement is suspended there
+        _ = try? await session.stopRecording()
+        try? await replace.value
+
+        #expect(!replacement.started, "the recording stopped while the old microphone did")
+    }
+
+    @Test("A replacement that fails to start throws")
+    func replacementStartFailureThrows() async throws {
+        let url = Self.outputURL("replace-fails")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let inputs = StandInAudioInputs()
+        let session = try Self.avatarSession(audioInputs: inputs.audioInputs)
+        session.enableMicrophone = true
+        try await session.startRecording(outputURL: url, title: "fails")
+        session.microphoneSourceProvider = { _ in FailingAudioSource(sourceID: "microphone") }
+        await #expect(throws: FailingAudioSource.Failure.self) { try await session.replaceMicrophoneSource() }
+        _ = try? await session.stopRecording()
+    }
+
+    @Test("Replacing the microphone does nothing when the session has none")
+    func replacingWithoutAMicrophoneAddsNone() async throws {
+        let inputs = StandInAudioInputs()
+        let session = try Self.avatarSession(audioInputs: inputs.audioInputs)
+        session.microphoneSourceProvider = { _ in FakeAudioSource(sourceID: "microphone") }
+        try await session.replaceMicrophoneSource()
+        #expect(!session.registeredAudioSourceIDs.contains("microphone"))
+    }
+
     @Test("Stopping the stream while a recording is starting leaves that recording its screen and audio")
     func stoppingTheStreamWhileARecordingStartsKeepsItsSources() async throws {
         let url = Self.outputURL("stream-stops-during-start")
@@ -687,14 +814,17 @@ struct RecordingSessionStopTests {
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
         ])
-        reader.add(output)
-        #expect(reader.startReading())
+        let samples = reader.outputProvider(for: output)
+        try reader.start()
         var colors: [(r: UInt8, g: UInt8, b: UInt8, a: UInt8)] = []
-        while let sample = output.copyNextSampleBuffer() {
-            guard let pixel = CMSampleBufferGetImageBuffer(sample) else { continue }
-            let width = CVPixelBufferGetWidth(pixel), height = CVPixelBufferGetHeight(pixel)
-            let center = CGRect(x: width / 2 - 20, y: height / 2 - 20, width: 40, height: 40)
-            if let color = getAverageColor(in: pixel, region: center) { colors.append(color) }
+        while let ready = try await samples.next() {
+            let color = ready.withUnsafeSampleBuffer { sample -> (r: UInt8, g: UInt8, b: UInt8, a: UInt8)? in
+                guard let pixel = CMSampleBufferGetImageBuffer(sample) else { return nil }
+                let width = CVPixelBufferGetWidth(pixel), height = CVPixelBufferGetHeight(pixel)
+                let center = CGRect(x: width / 2 - 20, y: height / 2 - 20, width: 40, height: 40)
+                return getAverageColor(in: pixel, region: center)
+            }
+            if let color { colors.append(color) }
         }
         return colors
     }
@@ -718,16 +848,19 @@ struct RecordingSessionStopTests {
             AVLinearPCMIsBigEndianKey: false,
             AVLinearPCMIsNonInterleaved: false,
         ])
-        reader.add(output)
-        #expect(reader.startReading())
+        let buffers = reader.outputProvider(for: output)
+        try reader.start()
         var peak = 0
-        while let buffer = output.copyNextSampleBuffer() {
-            guard let block = CMSampleBufferGetDataBuffer(buffer) else { continue }
-            var samples = [Int16](repeating: 0, count: CMBlockBufferGetDataLength(block) / 2)
-            _ = samples.withUnsafeMutableBytes {
-                CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: $0.count, destination: $0.baseAddress!)
+        while let ready = try await buffers.next() {
+            let bufferPeak = ready.withUnsafeSampleBuffer { buffer -> Int in
+                guard let block = CMSampleBufferGetDataBuffer(buffer) else { return 0 }
+                var samples = [Int16](repeating: 0, count: CMBlockBufferGetDataLength(block) / 2)
+                _ = samples.withUnsafeMutableBytes {
+                    CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: $0.count, destination: $0.baseAddress!)
+                }
+                return samples.map { abs(Int($0)) }.max() ?? 0
             }
-            peak = max(peak, samples.map { abs(Int($0)) }.max() ?? 0)
+            peak = max(peak, bufferPeak)
         }
         return peak
     }
@@ -831,6 +964,43 @@ private final class StandInAudioInputs {
             }
         )
     }
+}
+
+/// An audio source whose stop takes 100 ms and reports when it began.
+private final class SlowStoppingAudioSource: AudioSource, @unchecked Sendable {
+    let sourceID: String
+    let sourceName = "Slow stop"
+    let format = AudioFormat(sampleRate: 48000, channels: 2, bitDepth: 16, formatID: kAudioFormatLinearPCM)
+    var onSample: ((CMSampleBuffer) -> Void)?
+    private let state = OSAllocatedUnfairLock(initialState: (active: false, stopEntered: false))
+
+    init(sourceID: String) { self.sourceID = sourceID }
+
+    var isActive: Bool { state.withLock { $0.active } }
+    var stopEntered: Bool { state.withLock { $0.stopEntered } }
+
+    func start() async throws { state.withLock { $0.active = true } }
+
+    func stop() async throws {
+        state.withLock { $0.stopEntered = true }
+        try await Task.sleep(for: .milliseconds(100))
+        state.withLock { $0.active = false }
+    }
+}
+
+/// An audio source whose start always fails.
+private final class FailingAudioSource: AudioSource, @unchecked Sendable {
+    struct Failure: Error {}
+    let sourceID: String
+    let sourceName = "Failing"
+    let format = AudioFormat(sampleRate: 48000, channels: 2, bitDepth: 16, formatID: kAudioFormatLinearPCM)
+    var onSample: ((CMSampleBuffer) -> Void)?
+    let isActive = false
+
+    init(sourceID: String) { self.sourceID = sourceID }
+
+    func start() async throws { throw Failure() }
+    func stop() async throws {}
 }
 
 /// An audio source whose start takes 100 ms, as opening a capture device does.

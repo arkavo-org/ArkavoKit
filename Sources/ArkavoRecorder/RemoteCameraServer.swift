@@ -123,7 +123,7 @@ public final class RemoteCameraServer: NSObject, @unchecked Sendable {
             return
         }
         let id = UUID()
-        var state = ConnectionState(id: id, connection: connection)
+        let state = ConnectionState(id: id, connection: connection)
         connections[id] = state
 
         connection.stateUpdateHandler = { [weak self] nwState in

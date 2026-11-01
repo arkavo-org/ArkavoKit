@@ -181,7 +181,9 @@ public final class AgentDiscoveryService: NSObject, ObservableObject {
             )
         }
 
-        return String(cString: hostname)
+        // The name ends at the first NUL; the rest of the buffer is zero fill.
+        let nameBytes = hostname.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+        return String(decoding: nameBytes, as: UTF8.self)
     }
 }
 

@@ -111,13 +111,13 @@ struct FairPlayE2EIntegrationTests {
         // Generate test content key
         let contentKey = Data((0..<16).map { _ in UInt8.random(in: 0...255) })
         let iv = Data((0..<16).map { _ in UInt8.random(in: 0...255) })
-        let assetID = "e2e-test-\(UUID().uuidString)"
 
         // Build manifest (fetches KAS public key and wraps)
-        let manifest = try await builder.buildManifest(
+        let manifest = try builder.buildManifest(
             contentKey: contentKey,
             iv: iv,
-            assetID: assetID
+            policyJSON: FairPlayPolicy.placeholderJSON(),
+            publicKey: try await builder.fetchKASPublicKey()
         )
 
         // Verify manifest structure
@@ -154,10 +154,11 @@ struct FairPlayE2EIntegrationTests {
 
         // 2. Build TDF manifest (wrap key with KAS public key)
         let builder = TDFManifestBuilder(kasURL: serverURL)
-        let manifest = try await builder.buildManifest(
+        let manifest = try builder.buildManifest(
             contentKey: contentKey,
             iv: iv,
-            assetID: assetID
+            policyJSON: FairPlayPolicy.placeholderJSON(),
+            publicKey: try await builder.fetchKASPublicKey()
         )
         let manifestData = try builder.serializeManifest(manifest)
         let manifestBase64 = manifestData.base64EncodedString()
@@ -214,8 +215,7 @@ struct FairPlayE2EIntegrationTests {
         ]
         keyRequest.httpBody = try JSONSerialization.data(withJSONObject: keyBody)
 
-        let (keyData, keyResponse) = try await URLSession.shared.data(for: keyRequest)
-        let keyHttp = keyResponse as? HTTPURLResponse
+        let (keyData, _) = try await URLSession.shared.data(for: keyRequest)
 
         // We expect this to fail because the SPC is invalid
         // But the error should be about SPC validation, not manifest parsing
@@ -254,10 +254,11 @@ struct FairPlayE2EIntegrationTests {
 
         // 2. Build TDF manifest
         let builder = TDFManifestBuilder(kasURL: serverURL)
-        let manifest = try await builder.buildManifest(
+        let manifest = try builder.buildManifest(
             contentKey: contentKey,
             iv: iv,
-            assetID: assetID
+            policyJSON: FairPlayPolicy.placeholderJSON(),
+            publicKey: try await builder.fetchKASPublicKey()
         )
         let manifestData = try builder.serializeManifest(manifest)
         try manifestData.write(to: tempDir.appendingPathComponent("manifest.json"))
@@ -353,7 +354,6 @@ struct FairPlayE2EIntegrationTests {
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
         // Generate encrypted content
-        let contentKey = Data((0..<16).map { _ in UInt8.random(in: 0...255) })
         let iv = Data((0..<16).map { _ in UInt8.random(in: 0...255) })
         let keyID = Data(repeating: 0, count: 16)
         let assetID = "avplayer-test-\(UUID().uuidString)"
@@ -426,6 +426,8 @@ struct FairPlayE2EIntegrationTests {
             }
             try await Task.sleep(nanoseconds: 100_000_000)
         }
+        // An item loads only while a player holds it, so the player lives through the wait.
+        withExtendedLifetime(player) {}
 
         let keyRequests = await keyTracker.requests
         let status = playerItem.status

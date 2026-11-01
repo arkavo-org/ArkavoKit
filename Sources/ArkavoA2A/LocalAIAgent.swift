@@ -202,13 +202,13 @@ public final class LocalAIAgent: NSObject, ObservableObject {
 
         listener?.stateUpdateHandler = { [weak self] state in
             Task { @MainActor [weak self] in
-                await self?.handleListenerState(state)
+                self?.handleListenerState(state)
             }
         }
 
         listener?.newConnectionHandler = { [weak self] connection in
             Task { @MainActor [weak self] in
-                await self?.handleNewConnection(connection)
+                self?.handleNewConnection(connection)
             }
         }
 
@@ -268,7 +268,7 @@ public final class LocalAIAgent: NSObject, ObservableObject {
 
         connection.stateUpdateHandler = { [weak self] state in
             Task { @MainActor [weak self] in
-                await self?.handleConnectionState(connectionId, state: state)
+                self?.handleConnectionState(connectionId, state: state)
             }
         }
 

@@ -31,7 +31,14 @@ jobs:
           xcodebuild -version
 
       - name: Build
-        run: swift build --build-tests
+        run: |
+          set -o pipefail
+          swift build --build-tests 2>&1 | tee build.log
+
+      # Every target treats warnings as errors; this also fails on the warnings the compiler keeps
+      # as warnings regardless, and on any not pinned in scripts/warning-allowlist.txt.
+      - name: No warnings
+        run: python3 scripts/check-warnings.py build.log
 
       - name: Test
         run: swift test

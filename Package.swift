@@ -1,12 +1,16 @@
 // swift-tools-version:6.4
 import PackageDescription
 
-// Shared Swift settings for all targets - enables unused code warnings
+// Every target builds warning-free: warnings are errors. CI's scripts/check-warnings.py also
+// fails on the warnings the compiler keeps as warnings regardless.
 let sharedSwiftSettings: [SwiftSetting] = [
-    .unsafeFlags([
-        "-Xfrontend", "-warn-long-function-bodies=200",
-        "-Xfrontend", "-warn-long-expression-type-checking=100"
-    ], .when(configuration: .debug))
+    .treatAllWarnings(as: .error),
+]
+
+// Targets with deprecated calls kept on purpose (scripts/warning-allowlist.txt): deprecations
+// stay warnings there so the build succeeds, and the allowlist pins each one.
+let pinnedDeprecationSwiftSettings: [SwiftSetting] = sharedSwiftSettings + [
+    .treatWarning("DeprecatedDeclaration", as: .warning),
 ]
 
 let package = Package(
@@ -95,7 +99,7 @@ let package = Package(
                 "ZIPFoundation",
                 .product(name: "ArkavoMediaKit", package: "ArkavoMediaKit"),
             ],
-            swiftSettings: sharedSwiftSettings
+            swiftSettings: pinnedDeprecationSwiftSettings
         ),
         .target(
             name: "ArkavoContent",
@@ -110,12 +114,12 @@ let package = Package(
         .target(
             name: "ArkavoRecorder",
             dependencies: ["ArkavoMedia", "ArkavoStreaming"],
-            swiftSettings: sharedSwiftSettings
+            swiftSettings: pinnedDeprecationSwiftSettings
         ),
         .target(
             name: "ArkavoStreaming",
             dependencies: ["ArkavoMedia", "OpenTDFKit"],
-            swiftSettings: sharedSwiftSettings
+            swiftSettings: pinnedDeprecationSwiftSettings
         ),
         .testTarget(
             name: "ArkavoKitTests",
@@ -161,7 +165,7 @@ let package = Package(
         .executableTarget(
             name: "NTDFTestCLI",
             dependencies: ["ArkavoStreaming", "ArkavoMedia", "OpenTDFKit"],
-            swiftSettings: sharedSwiftSettings
+            swiftSettings: pinnedDeprecationSwiftSettings
         ),
         .executableTarget(
             name: "TDFCreateCLI",

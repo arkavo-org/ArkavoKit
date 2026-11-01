@@ -462,7 +462,12 @@ private final class DelegateCall: @unchecked Sendable {
     }
 }
 
-/// Holds the first thread that calls `hold()` until `release()` (or a five-second safety timeout).
+/// How long a held gate waits for its release before it opens on its own: a minute, longer than
+/// every wait in this file, so on a slow host a gate never opens before its test releases it, while
+/// a test that fails before releasing still frees the held thread.
+private let gateSafetyTimeout: DispatchTimeInterval = .seconds(60)
+
+/// Holds the first thread that calls `hold()` until `release()` (or `gateSafetyTimeout`).
 private final class CallbackGate: Sendable {
     private let state = OSAllocatedUnfairLock(initialState: (armed: true, holding: false))
     private let released = DispatchSemaphore(value: 0)
@@ -477,7 +482,7 @@ private final class CallbackGate: Sendable {
             return true
         }
         guard first else { return }
-        _ = released.wait(timeout: .now() + 5)
+        _ = released.wait(timeout: .now() + gateSafetyTimeout)
     }
 
     func release() { released.signal() }
@@ -565,8 +570,8 @@ private final class SelectiveCaptureSession: AVCaptureSession, @unchecked Sendab
 
 /// Records each `startRunning` / `stopRunning` with the thread it ran on, in completion order,
 /// without capturing the user's screen. Each call takes `latency` seconds; `holdStart()` makes
-/// `startRunning` block, as a real session does while it starts, until `releaseStart()` (or a
-/// five-second safety timeout, longer than any test's deadline). `rejectsInputs` refuses inputs.
+/// `startRunning` block, as a real session does while it starts, until `releaseStart()` (or
+/// `gateSafetyTimeout`, longer than any test's deadline). `rejectsInputs` refuses inputs.
 private final class LifecycleRecordingCaptureSession: AVCaptureSession, @unchecked Sendable {
     enum Kind: Equatable { case start, stop }
     struct Call { let kind: Kind; let onMainThread: Bool }
@@ -602,7 +607,7 @@ private final class LifecycleRecordingCaptureSession: AVCaptureSession, @uncheck
     override func startRunning() {
         state.withLock { $0.startsEntered += 1 }
         if state.withLock({ $0.holdsStart }) {
-            _ = startGate.wait(timeout: .now() + 5)
+            _ = startGate.wait(timeout: .now() + gateSafetyTimeout)
         }
         record(.start, running: true)
     }

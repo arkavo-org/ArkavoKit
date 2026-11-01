@@ -54,7 +54,7 @@ public class VideoClassificationProcessor {
             throw VideoProcessingError.modelLoadError
         }
 
-        let asset = AVAsset(url: videoURL)
+        let asset = AVURLAsset(url: videoURL)
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
 
@@ -63,10 +63,13 @@ public class VideoClassificationProcessor {
 
         let frameDuration = CMTimeMake(value: 1, timescale: Int32(frameInterval))
         var currentTime = CMTime.zero
+        // A video whose duration can't load has none to process (zero, as the synchronous
+        // `duration` reports it).
+        let duration = (try? await asset.load(.duration)) ?? .zero
 
-        while currentTime < asset.duration {
+        while currentTime < duration {
             do {
-                let imageRef = try generator.copyCGImage(at: currentTime, actualTime: nil)
+                let imageRef = try await generator.image(at: currentTime).image
                 let requestHandler = VNImageRequestHandler(cgImage: imageRef)
                 try requestHandler.perform([request])
 

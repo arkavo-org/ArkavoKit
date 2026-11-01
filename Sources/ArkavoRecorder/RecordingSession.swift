@@ -87,6 +87,16 @@ private final class OrderedDelivery: @unchecked Sendable {
     }
 }
 
+/// A buffer from a capture or mixer callback, on its way to the task or actor that uses it.
+///
+/// Unchecked because `CMSampleBuffer` isn't `Sendable`: CoreMedia lets a holder change a buffer's
+/// attachments. Capture and the mixer deliver finished, data-ready buffers, which nothing here
+/// changes: preview, the compositor and the encoder only read them. CoreFoundation retains and
+/// releases atomically, so a delivered buffer can be shared.
+private struct DeliveredBuffer: @unchecked Sendable {
+    let buffer: CMSampleBuffer
+}
+
 /// The system audio inputs a session creates: the microphone, with its permission, and the
 /// screen's audio. Tests substitute stand-ins.
 struct AudioInputs {
@@ -117,12 +127,12 @@ public final class RecordingSession: Sendable {
     private var remoteCameraIdentifiers: Set<String> = []
     public private(set) var remoteCameraServer: RemoteCameraServer?
     nonisolated(unsafe) private let audioRouter: AudioRouter
-    nonisolated(unsafe) private let audioMixer: AudioMixer
+    nonisolated private let audioMixer: AudioMixer
     /// Hands the mix to the encoder in mix order, so stopping can wait until all of it,
     /// the drained tail included, has reached the encoder.
     nonisolated private let mixedAudioDelivery = OrderedDelivery()
-    nonisolated(unsafe) private let compositor: CompositorManager
-    nonisolated(unsafe) private let encoder: VideoEncoder
+    nonisolated private let compositor: CompositorManager
+    nonisolated private let encoder: VideoEncoder
     private let audioInputs: AudioInputs
 
     // Recording state tracked locally for synchronous access
@@ -286,6 +296,48 @@ public final class RecordingSession: Sendable {
     /// Provider for Muse AI avatar texture frames (for dual avatar mode)
     nonisolated(unsafe) public var museTextureProvider: (@Sendable () -> CVPixelBuffer?)?
 
+    /// Supplies the microphone in place of the built-in capture device. Called with the source ID
+    /// the session uses for it (`"microphone"`, which keeps it the mix clock); returning nil keeps
+    /// the built-in `MicrophoneAudioSource`, as does a source with any other ID. An app whose own voice-processing engine already holds
+    /// the device feeds the mix from that engine this way: on some Macs a second capture client of
+    /// a voice-processed microphone receives silence.
+    public var microphoneSourceProvider: (@MainActor (_ sourceID: String) -> (any AudioSource)?)?
+
+    /// Rebuilds the microphone through `microphoneSourceProvider`, for when the right source
+    /// changes mid-session (a voice-processing engine started or stopped). Does nothing when the
+    /// session has no microphone. A running microphone's replacement starts at once and stays
+    /// the mix clock; it is left stopped if the recording and stream stop meanwhile.
+    /// - Throws: the replacement's start error. The replacement stays registered, inactive.
+    public func replaceMicrophoneSource() async throws {
+        let id = Self.microphoneSourceID
+        guard audioRouter.allSourceIDs.contains(id) else { return }
+        let wasActive = audioRouter.activeSourceIDs.contains(id)
+        let stops = audioStopCount
+        await audioRouter.stopAndRemoveSource(id)
+        audioMixer.unregisterSource(id)
+        addMicrophone()
+        syncAudioMixerRouting()
+        // A stop that ran while the old source stopped has already stopped the router's sources.
+        guard wasActive, audioKeepsRunning(since: stops) else { return }
+        try await audioRouter.startSource(id)
+        // A stop that ran while the replacement started missed it.
+        if !audioKeepsRunning(since: stops) { try? await audioRouter.stopSource(id) }
+    }
+
+    /// Bumped as each stop of the audio sources begins, so work that suspended can tell one ran.
+    private var audioStopCount: UInt64 = 0
+    /// From the start of `stopRecording()` until its file is finished; `_isRecording` stays true
+    /// that long.
+    private var recordingStopping = false
+
+    /// The audio sources should be running, and no stop of them began since `stops` was read.
+    private func audioKeepsRunning(since stops: UInt64) -> Bool {
+        guard stops == audioStopCount else { return false }
+        return (_isRecording && !recordingStopping) || _streamingActive.withLock { $0 }
+    }
+
+    nonisolated static let microphoneSourceID = "microphone"
+
     /// Register a Muse TTS audio source for mixing into the stream
     public func addMuseAudioSource(_ source: AudioSource) {
         audioRouter.addSource(source)
@@ -327,7 +379,12 @@ public final class RecordingSession: Sendable {
 
     /// Adds a microphone that reports its level as `audioLevel`.
     private func addMicrophone() {
-        let microphone = audioInputs.makeMicrophone()
+        let id = Self.microphoneSourceID
+        let provided = microphoneSourceProvider?(id)
+        if let provided, provided.sourceID != id {
+            print("⚠️ RecordingSession: ignoring a provided microphone with source ID \(provided.sourceID); it must be \(id)")
+        }
+        let microphone = provided.flatMap { $0.sourceID == id ? $0 : nil } ?? audioInputs.makeMicrophone()
         (microphone as? MicrophoneAudioSource)?.onLevelUpdate = { @Sendable [weak self] level in
             self?.audioLevel = level
         }
@@ -404,10 +461,11 @@ public final class RecordingSession: Sendable {
             // Keep the consumer associated with this frame, even if the source changes
             // while composition is suspended waiting for the main actor.
             let monitorHandler = self.monitorFrameHandler
-            // Process asynchronously to handle encoding
-            // Note: CMSampleBuffer is not Sendable, but we process it immediately without retaining
+            // Process asynchronously to handle encoding. The capture manager hands the same
+            // frame to its other consumers too, hence the `DeliveredBuffer`.
+            let frame = DeliveredBuffer(buffer: screenBuffer)
             Task {
-                await self.processScreenFrame(screenBuffer, captureID: captureID, monitorHandler: monitorHandler)
+                await self.processScreenFrame(frame.buffer, captureID: captureID, monitorHandler: monitorHandler)
             }
         }
 
@@ -419,8 +477,9 @@ public final class RecordingSession: Sendable {
 
         // Wire mixer output to encoder
         audioMixer.onMixedSample = { @Sendable [weak self] mixedSample in
+            let mixed = DeliveredBuffer(buffer: mixedSample)
             self?.mixedAudioDelivery.enqueue { [weak self] in
-                await self?.processAudioSampleSync(mixedSample, sourceID: AudioMixer.outputSourceID)
+                await self?.processAudioSampleSync(mixed.buffer, sourceID: AudioMixer.outputSourceID)
             }
         }
     }
@@ -627,10 +686,11 @@ public final class RecordingSession: Sendable {
         for identifier in toStart {
             let manager = CameraManager()
             manager.onFrame = { [weak self] buffer in
+                let frame = DeliveredBuffer(buffer: buffer)
                 Task { @MainActor [weak self] in
                     guard let self else { return }
-                    self.latestCameraBuffers[identifier] = buffer
-                    self.dispatchPreview(for: identifier, buffer: buffer)
+                    self.latestCameraBuffers[identifier] = frame.buffer
+                    self.dispatchPreview(for: identifier, buffer: frame.buffer)
                 }
             }
             cameraCaptures[identifier] = manager
@@ -658,6 +718,8 @@ public final class RecordingSession: Sendable {
     /// more into the file once finishing has begun. A stream that starts while this stops the
     /// sources, or while the file finishes, gets them back once the recording is over.
     public func stopRecording() async throws -> URL {
+        recordingStopping = true
+        defer { recordingStopping = false }
         let streamKeepsSources = _streamingActive.withLock { $0 }
         // A stream that starts once this has stopped the sources finds the recording still
         // running, so it neither starts them nor its frames: this does once the recording is over.
@@ -740,6 +802,7 @@ public final class RecordingSession: Sendable {
         stopCameraFrameDriver()
         screenCapture.stopCapture()
         stopCameraCaptures()
+        audioStopCount &+= 1
         try? await audioRouter.stopAll()
     }
 
@@ -1022,7 +1085,7 @@ public final class RecordingSession: Sendable {
         cameraFrameTimer = nil
     }
 
-    private nonisolated func processAudioSampleSync(_ audioSample: CMSampleBuffer, sourceID: String) async {
+    private nonisolated func processAudioSampleSync(_ audioSample: sending CMSampleBuffer, sourceID: String) async {
         guard _isRecording || _streamingActive.withLock({ $0 }) else {
             return
         }
@@ -1149,6 +1212,7 @@ public final class RecordingSession: Sendable {
             try? await audioRouter.startAll()
             // A stop that came while the sources were starting stopped only those running then.
             if !_streamingActive.withLock({ $0 }) && !_isRecording && !recordingStarting {
+                audioStopCount &+= 1
                 try? await audioRouter.stopAll()
             }
         }
@@ -1300,10 +1364,11 @@ public final class RecordingSession: Sendable {
         for identifier in toStart {
             let manager = CameraManager()
             manager.onFrame = { [weak self] buffer in
+                let frame = DeliveredBuffer(buffer: buffer)
                 Task { @MainActor [weak self] in
                     guard let self else { return }
-                    self.latestCameraBuffers[identifier] = buffer
-                    self.dispatchPreview(for: identifier, buffer: buffer)
+                    self.latestCameraBuffers[identifier] = frame.buffer
+                    self.dispatchPreview(for: identifier, buffer: frame.buffer)
                 }
             }
             do {

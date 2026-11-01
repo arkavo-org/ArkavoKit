@@ -32,13 +32,20 @@ public enum TDFArchiveError: Error, LocalizedError, Sendable {
 /// - `manifest.json`: Encryption metadata (KAS URL, wrapped key, IV, algorithm)
 /// - `0.payload`: The encrypted content (AES-128-CBC encrypted video/audio)
 public struct TDFArchiveReader: Sendable {
+    /// Opens a TDF ZIP archive for reading. Throws `invalidArchive` whatever ZIPFoundation's reason.
+    private static func openArchive(_ tdfData: Data) throws -> Archive {
+        do {
+            return try Archive(data: tdfData, accessMode: .read)
+        } catch {
+            throw TDFArchiveError.invalidArchive("Failed to open ZIP archive")
+        }
+    }
+
     /// Extract the manifest from a TDF ZIP archive
     /// - Parameter tdfData: The TDF archive data (ZIP format)
     /// - Returns: Parsed TDFManifestLite with encryption metadata
     public static func extractManifest(from tdfData: Data) throws -> TDFManifestLite {
-        guard let archive = Archive(data: tdfData, accessMode: .read) else {
-            throw TDFArchiveError.invalidArchive("Failed to open ZIP archive")
-        }
+        let archive = try openArchive(tdfData)
 
         guard let manifestEntry = archive["manifest.json"] else {
             throw TDFArchiveError.manifestNotFound
@@ -64,9 +71,7 @@ public struct TDFArchiveReader: Sendable {
     /// - Parameter tdfData: The TDF archive data (ZIP format)
     /// - Returns: The encrypted payload data (AES-128-CBC encrypted content)
     public static func extractPayload(from tdfData: Data) throws -> Data {
-        guard let archive = Archive(data: tdfData, accessMode: .read) else {
-            throw TDFArchiveError.invalidArchive("Failed to open ZIP archive")
-        }
+        let archive = try openArchive(tdfData)
 
         guard let payloadEntry = archive["0.payload"] else {
             throw TDFArchiveError.payloadNotFound
@@ -88,9 +93,7 @@ public struct TDFArchiveReader: Sendable {
     /// - Parameter tdfData: The TDF archive data (ZIP format)
     /// - Returns: Tuple containing the parsed manifest and encrypted payload
     public static func extractAll(from tdfData: Data) throws -> (manifest: TDFManifestLite, payload: Data) {
-        guard let archive = Archive(data: tdfData, accessMode: .read) else {
-            throw TDFArchiveError.invalidArchive("Failed to open ZIP archive")
-        }
+        let archive = try openArchive(tdfData)
 
         // Extract manifest
         guard let manifestEntry = archive["manifest.json"] else {

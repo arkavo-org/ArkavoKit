@@ -147,13 +147,13 @@ struct DroppedMediaTests {
         let track = try #require(try await asset.loadTracks(withMediaType: .audio).first)
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: [AVFormatIDKey: kAudioFormatLinearPCM])
-        reader.add(output)
-        #expect(reader.startReading())
+        let buffers = reader.outputProvider(for: output)
+        try reader.start()
         var times: [(pts: CMTime, frames: Int)] = []
-        while let buffer = output.copyNextSampleBuffer() {
-            let frames = CMSampleBufferGetNumSamples(buffer)
+        while let buffer = try await buffers.next() {
+            let frames = buffer.sampleCount
             guard frames > 0 else { continue }
-            times.append((CMSampleBufferGetPresentationTimeStamp(buffer), frames))
+            times.append((buffer.presentationTimeStamp, frames))
         }
         return times
     }
@@ -184,11 +184,11 @@ struct DroppedMediaTests {
         let track = try #require(try await asset.loadTracks(withMediaType: .audio).first)
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: [AVFormatIDKey: kAudioFormatLinearPCM])
-        reader.add(output)
-        #expect(reader.startReading())
+        let buffers = reader.outputProvider(for: output)
+        try reader.start()
         var frames = 0
-        while let buffer = output.copyNextSampleBuffer() {
-            frames += CMSampleBufferGetNumSamples(buffer)
+        while let buffer = try await buffers.next() {
+            frames += buffer.sampleCount
         }
         return frames
     }

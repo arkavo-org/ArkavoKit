@@ -67,7 +67,10 @@ public actor TDFProtectionService {
         }
 
         // Create ZIP archive using ZIPFoundation
-        guard let archive = Archive(url: archivePath, accessMode: .create) else {
+        let archive: Archive
+        do {
+            archive = try Archive(url: archivePath, accessMode: .create)
+        } catch {
             throw TDFProtectionError.archiveCreationFailed
         }
 

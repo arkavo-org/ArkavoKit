@@ -21,6 +21,32 @@ struct LocalHTTPServerPlaybackTests {
 
     // MARK: - Helper Methods
 
+    /// What one request to the local server got back. A status the server sends, an error one
+    /// included, is a response; a request that fails or runs past its time has an error instead.
+    struct Fetched: Sendable {
+        var data: Data?
+        var response: HTTPURLResponse?
+        var error: (any Error)?
+
+        var timedOut: Bool { (error as? URLError)?.code == .timedOut }
+    }
+
+    /// Sends `request` to the local server, allowing it `timeout` seconds.
+    static func fetch(_ request: URLRequest, timeout: TimeInterval = 5) async -> Fetched {
+        var request = request
+        request.timeoutInterval = timeout
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            return Fetched(data: data, response: response as? HTTPURLResponse)
+        } catch {
+            return Fetched(error: error)
+        }
+    }
+
+    static func fetch(_ url: URL, timeout: TimeInterval = 5) async -> Fetched {
+        await fetch(URLRequest(url: url), timeout: timeout)
+    }
+
     func createVideoSample(isIDR: Bool, size: Int = 2000) -> Data {
         var sample = Data()
         let nalType: UInt8 = isIDR ? 0x65 : 0x41
@@ -115,7 +141,7 @@ struct LocalHTTPServerPlaybackTests {
     }
 
     @Test("Server serves clear fMP4/HLS content")
-    func serveClearFMP4Content() throws {
+    func serveClearFMP4Content() async throws {
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -138,19 +164,11 @@ struct LocalHTTPServerPlaybackTests {
         print("Segment URL: \(segment0URL)")
 
         // Fetch playlist via HTTP
-        let semaphore = DispatchSemaphore(value: 0)
-        var playlistData: Data?
-        var fetchError: Error?
+        let fetched = await Self.fetch(playlistURL)
+        let playlistData = fetched.data
+        let fetchError = fetched.error
 
-        let task = URLSession.shared.dataTask(with: playlistURL) { data, response, error in
-            playlistData = data
-            fetchError = error
-            semaphore.signal()
-        }
-        task.resume()
-
-        let result = semaphore.wait(timeout: .now() + 5)
-        #expect(result == .success, "HTTP request timed out")
+        #expect(!fetched.timedOut, "HTTP request timed out")
         #expect(fetchError == nil, "HTTP request failed: \(fetchError?.localizedDescription ?? "")")
         #expect(playlistData != nil, "No data received")
 
@@ -164,7 +182,7 @@ struct LocalHTTPServerPlaybackTests {
     }
 
     @Test("Server serves encrypted fMP4/HLS content with FairPlay signaling")
-    func serveEncryptedFMP4Content() throws {
+    func serveEncryptedFMP4Content() async throws {
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -179,15 +197,7 @@ struct LocalHTTPServerPlaybackTests {
 
         // Fetch playlist via HTTP
         let playlistURL = baseURL.appendingPathComponent("playlist.m3u8")
-        let semaphore = DispatchSemaphore(value: 0)
-        var playlistData: Data?
-
-        URLSession.shared.dataTask(with: playlistURL) { data, _, _ in
-            playlistData = data
-            semaphore.signal()
-        }.resume()
-
-        _ = semaphore.wait(timeout: .now() + 5)
+        let playlistData = await Self.fetch(playlistURL).data
 
         if let data = playlistData, let playlist = String(data: data, encoding: .utf8) {
             print("Encrypted playlist content:\n\(playlist)")
@@ -198,7 +208,7 @@ struct LocalHTTPServerPlaybackTests {
     }
 
     @Test("Server supports Range requests for byte-range fetching")
-    func serverSupportsRangeRequests() throws {
+    func serverSupportsRangeRequests() async throws {
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -215,17 +225,9 @@ struct LocalHTTPServerPlaybackTests {
         var request = URLRequest(url: baseURL.appendingPathComponent("test.bin"))
         request.setValue("bytes=100-199", forHTTPHeaderField: "Range")
 
-        let semaphore = DispatchSemaphore(value: 0)
-        var responseData: Data?
-        var httpResponse: HTTPURLResponse?
-
-        URLSession.shared.dataTask(with: request) { data, response, _ in
-            responseData = data
-            httpResponse = response as? HTTPURLResponse
-            semaphore.signal()
-        }.resume()
-
-        _ = semaphore.wait(timeout: .now() + 5)
+        let fetched = await Self.fetch(request)
+        let responseData = fetched.data
+        let httpResponse = fetched.response
 
         #expect(httpResponse?.statusCode == 206, "Expected 206 Partial Content")
         #expect(responseData?.count == 100, "Expected 100 bytes")
@@ -401,7 +403,7 @@ struct LocalHTTPServerPlaybackTests {
     }
 
     @Test("Server handles multiple concurrent requests")
-    func serverHandlesConcurrentRequests() throws {
+    func serverHandlesConcurrentRequests() async throws {
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -417,30 +419,24 @@ struct LocalHTTPServerPlaybackTests {
         defer { server.stop() }
 
         // Make concurrent requests
-        let group = DispatchGroup()
-        var results: [Int: Bool] = [:]
-        let lock = NSLock()
-
-        for i in 0..<5 {
-            group.enter()
-            let url = baseURL.appendingPathComponent("file\(i).txt")
-            URLSession.shared.dataTask(with: url) { data, response, _ in
-                let success = (response as? HTTPURLResponse)?.statusCode == 200 && data != nil
-                lock.lock()
-                results[i] = success
-                lock.unlock()
-                group.leave()
-            }.resume()
+        let fetches = await withTaskGroup(of: (Int, Fetched).self) { group in
+            for i in 0..<5 {
+                let url = baseURL.appendingPathComponent("file\(i).txt")
+                group.addTask { (i, await Self.fetch(url, timeout: 10)) }
+            }
+            var fetches: [Int: Fetched] = [:]
+            for await (i, fetched) in group { fetches[i] = fetched }
+            return fetches
         }
+        let results = fetches.mapValues { $0.response?.statusCode == 200 && $0.data != nil }
 
-        let waitResult = group.wait(timeout: .now() + 10)
-        #expect(waitResult == .success, "Concurrent requests timed out")
+        #expect(!fetches.values.contains { $0.timedOut }, "Concurrent requests timed out")
         #expect(results.count == 5, "Not all requests completed")
         #expect(results.values.allSatisfy { $0 }, "Some requests failed")
     }
 
     @Test("Server returns correct MIME types")
-    func serverReturnsCorrectMIMETypes() throws {
+    func serverReturnsCorrectMIMETypes() async throws {
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -462,15 +458,8 @@ struct LocalHTTPServerPlaybackTests {
         defer { server.stop() }
 
         for (filename, expectedMIME) in testFiles {
-            let semaphore = DispatchSemaphore(value: 0)
-            var contentType: String?
-
-            URLSession.shared.dataTask(with: baseURL.appendingPathComponent(filename)) { _, response, _ in
-                contentType = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type")
-                semaphore.signal()
-            }.resume()
-
-            _ = semaphore.wait(timeout: .now() + 5)
+            let response = await Self.fetch(baseURL.appendingPathComponent(filename)).response
+            let contentType = response?.value(forHTTPHeaderField: "Content-Type")
             #expect(contentType == expectedMIME, "Expected \(expectedMIME) for \(filename), got \(contentType ?? "nil")")
         }
     }
@@ -478,7 +467,7 @@ struct LocalHTTPServerPlaybackTests {
     // MARK: - Rigorous Box Structure Tests
 
     @Test("Init segment has valid fMP4 box structure")
-    func initSegmentHasValidBoxStructure() throws {
+    func initSegmentHasValidBoxStructure() async throws {
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -491,16 +480,7 @@ struct LocalHTTPServerPlaybackTests {
 
         // Fetch init segment via HTTP
         let initURL = baseURL.appendingPathComponent("init.mp4")
-        let semaphore = DispatchSemaphore(value: 0)
-        var initData: Data?
-
-        URLSession.shared.dataTask(with: initURL) { data, _, _ in
-            initData = data
-            semaphore.signal()
-        }.resume()
-
-        _ = semaphore.wait(timeout: .now() + 5)
-        guard let data = initData else {
+        guard let data = await Self.fetch(initURL).data else {
             Issue.record("Failed to fetch init segment")
             return
         }
@@ -528,7 +508,7 @@ struct LocalHTTPServerPlaybackTests {
     }
 
     @Test("Media segment has valid moof/mdat structure")
-    func mediaSegmentHasValidMoofMdatStructure() throws {
+    func mediaSegmentHasValidMoofMdatStructure() async throws {
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -541,16 +521,7 @@ struct LocalHTTPServerPlaybackTests {
 
         // Fetch segment via HTTP
         let segmentURL = baseURL.appendingPathComponent("segment0.m4s")
-        let semaphore = DispatchSemaphore(value: 0)
-        var segmentData: Data?
-
-        URLSession.shared.dataTask(with: segmentURL) { data, _, _ in
-            segmentData = data
-            semaphore.signal()
-        }.resume()
-
-        _ = semaphore.wait(timeout: .now() + 5)
-        guard let data = segmentData else {
+        guard let data = await Self.fetch(segmentURL).data else {
             Issue.record("Failed to fetch segment")
             return
         }
@@ -590,7 +561,7 @@ struct LocalHTTPServerPlaybackTests {
     }
 
     @Test("Server returns 404 for nonexistent files")
-    func serverReturns404ForMissingFiles() throws {
+    func serverReturns404ForMissingFiles() async throws {
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -602,21 +573,13 @@ struct LocalHTTPServerPlaybackTests {
         defer { server.stop() }
 
         // Request nonexistent file
-        let semaphore = DispatchSemaphore(value: 0)
-        var httpResponse: HTTPURLResponse?
-
-        URLSession.shared.dataTask(with: baseURL.appendingPathComponent("does-not-exist.txt")) { _, response, _ in
-            httpResponse = response as? HTTPURLResponse
-            semaphore.signal()
-        }.resume()
-
-        _ = semaphore.wait(timeout: .now() + 5)
+        let httpResponse = await Self.fetch(baseURL.appendingPathComponent("does-not-exist.txt")).response
 
         #expect(httpResponse?.statusCode == 404, "Expected 404 for missing file, got \(httpResponse?.statusCode ?? -1)")
     }
 
     @Test("Encrypted segment has senc box with valid subsample info")
-    func encryptedSegmentHasSencBox() throws {
+    func encryptedSegmentHasSencBox() async throws {
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -629,16 +592,7 @@ struct LocalHTTPServerPlaybackTests {
 
         // Fetch encrypted segment
         let segmentURL = baseURL.appendingPathComponent("segment0.m4s")
-        let semaphore = DispatchSemaphore(value: 0)
-        var segmentData: Data?
-
-        URLSession.shared.dataTask(with: segmentURL) { data, _, _ in
-            segmentData = data
-            semaphore.signal()
-        }.resume()
-
-        _ = semaphore.wait(timeout: .now() + 5)
-        guard let data = segmentData else {
+        guard let data = await Self.fetch(segmentURL).data else {
             Issue.record("Failed to fetch encrypted segment")
             return
         }
@@ -684,7 +638,7 @@ struct LocalHTTPServerPlaybackTests {
     }
 
     @Test("Server handles path traversal attempt safely")
-    func serverPreventsPathTraversal() throws {
+    func serverPreventsPathTraversal() async throws {
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -702,30 +656,14 @@ struct LocalHTTPServerPlaybackTests {
         guard let traversalURL = components.url else {
             // If URL can't be constructed, try another approach
             let traversalURL2 = baseURL.appendingPathComponent("..").appendingPathComponent("..").appendingPathComponent("etc").appendingPathComponent("passwd")
-            let semaphore = DispatchSemaphore(value: 0)
-            var httpResponse: HTTPURLResponse?
-
-            URLSession.shared.dataTask(with: traversalURL2) { _, response, _ in
-                httpResponse = response as? HTTPURLResponse
-                semaphore.signal()
-            }.resume()
-
-            _ = semaphore.wait(timeout: .now() + 5)
+            let httpResponse = await Self.fetch(traversalURL2).response
 
             let statusCode = httpResponse?.statusCode ?? -1
             #expect(statusCode == 404 || statusCode == 400, "Path traversal should be blocked, got \(statusCode)")
             return
         }
 
-        let semaphore = DispatchSemaphore(value: 0)
-        var httpResponse: HTTPURLResponse?
-
-        URLSession.shared.dataTask(with: traversalURL) { _, response, _ in
-            httpResponse = response as? HTTPURLResponse
-            semaphore.signal()
-        }.resume()
-
-        _ = semaphore.wait(timeout: .now() + 5)
+        let httpResponse = await Self.fetch(traversalURL).response
 
         // Should either 404 or 400, NOT 200
         let statusCode = httpResponse?.statusCode ?? -1
@@ -733,7 +671,7 @@ struct LocalHTTPServerPlaybackTests {
     }
 
     @Test("Playlist segment URIs match served files")
-    func playlistSegmentURIsMatchFiles() throws {
+    func playlistSegmentURIsMatchFiles() async throws {
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -746,16 +684,7 @@ struct LocalHTTPServerPlaybackTests {
 
         // Fetch playlist
         let playlistURL = baseURL.appendingPathComponent("playlist.m3u8")
-        let semaphore = DispatchSemaphore(value: 0)
-        var playlistData: Data?
-
-        URLSession.shared.dataTask(with: playlistURL) { data, _, _ in
-            playlistData = data
-            semaphore.signal()
-        }.resume()
-
-        _ = semaphore.wait(timeout: .now() + 5)
-        guard let data = playlistData, let playlist = String(data: data, encoding: .utf8) else {
+        guard let data = await Self.fetch(playlistURL).data, let playlist = String(data: data, encoding: .utf8) else {
             Issue.record("Failed to fetch playlist")
             return
         }
@@ -784,15 +713,7 @@ struct LocalHTTPServerPlaybackTests {
         // Verify each segment is fetchable with 200
         for uri in segmentURIs {
             let segmentURL = baseURL.appendingPathComponent(uri)
-            let fetchSemaphore = DispatchSemaphore(value: 0)
-            var fetchResponse: HTTPURLResponse?
-
-            URLSession.shared.dataTask(with: segmentURL) { _, response, _ in
-                fetchResponse = response as? HTTPURLResponse
-                fetchSemaphore.signal()
-            }.resume()
-
-            _ = fetchSemaphore.wait(timeout: .now() + 5)
+            let fetchResponse = await Self.fetch(segmentURL).response
             #expect(fetchResponse?.statusCode == 200, "Segment \(uri) should be fetchable, got \(fetchResponse?.statusCode ?? -1)")
         }
     }
@@ -800,7 +721,7 @@ struct LocalHTTPServerPlaybackTests {
     // MARK: - Negative Tests (verify detection of malformed content)
 
     @Test("Detects missing init segment when playlist references it")
-    func detectsMissingInitSegment() throws {
+    func detectsMissingInitSegment() async throws {
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -827,21 +748,13 @@ struct LocalHTTPServerPlaybackTests {
 
         // Verify init.mp4 returns 404
         let initURL = baseURL.appendingPathComponent("init.mp4")
-        let semaphore = DispatchSemaphore(value: 0)
-        var httpResponse: HTTPURLResponse?
-
-        URLSession.shared.dataTask(with: initURL) { _, response, _ in
-            httpResponse = response as? HTTPURLResponse
-            semaphore.signal()
-        }.resume()
-
-        _ = semaphore.wait(timeout: .now() + 5)
+        let httpResponse = await Self.fetch(initURL).response
 
         #expect(httpResponse?.statusCode == 404, "Missing init.mp4 should return 404")
     }
 
     @Test("Server correctly serves incomplete Range request")
-    func serverHandlesIncompleteRangeRequest() throws {
+    func serverHandlesIncompleteRangeRequest() async throws {
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -857,15 +770,7 @@ struct LocalHTTPServerPlaybackTests {
         var request = URLRequest(url: baseURL.appendingPathComponent("test.bin"))
         request.setValue("bytes=200-299", forHTTPHeaderField: "Range")
 
-        let semaphore = DispatchSemaphore(value: 0)
-        var httpResponse: HTTPURLResponse?
-
-        URLSession.shared.dataTask(with: request) { _, response, _ in
-            httpResponse = response as? HTTPURLResponse
-            semaphore.signal()
-        }.resume()
-
-        _ = semaphore.wait(timeout: .now() + 5)
+        let httpResponse = await Self.fetch(request).response
 
         // Should return 416 Range Not Satisfiable or 200 with full content
         let statusCode = httpResponse?.statusCode ?? -1

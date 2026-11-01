@@ -16,7 +16,12 @@ public final class CompositorManager: Sendable {
     /// Output resolution for the composited frames (must match encoder resolution)
     public nonisolated(unsafe) var outputSize: CGSize = CGSize(width: 1920, height: 1080)
 
-    public struct CameraLayer {
+    /// A camera frame to composite. It's read on the main actor and composited off it.
+    ///
+    /// Unchecked because `CMSampleBuffer` isn't `Sendable`: CoreMedia lets a holder change a
+    /// buffer's attachments. A layer's buffer is a delivered camera frame, which the compositor
+    /// only reads and nothing else changes, and CoreFoundation retains and releases atomically.
+    public struct CameraLayer: @unchecked Sendable {
         public let id: String
         public let buffer: CMSampleBuffer
         public let position: PiPPosition?
@@ -132,7 +137,7 @@ public final class CompositorManager: Sendable {
         cameraLayers: [CameraLayer],
         avatarTexture: CVPixelBuffer? = nil,
         museTexture: CVPixelBuffer? = nil
-    ) -> CVPixelBuffer? {
+    ) -> sending CVPixelBuffer? {
         // Get screen image buffer
         guard let screenPixelBuffer = CMSampleBufferGetImageBuffer(screenBuffer) else {
             return nil
@@ -164,7 +169,7 @@ public final class CompositorManager: Sendable {
         cameraLayers: [CameraLayer],
         canvasSize: CGSize,
         museTexture: CVPixelBuffer? = nil
-    ) -> CVPixelBuffer? {
+    ) -> sending CVPixelBuffer? {
         guard !cameraLayers.isEmpty else { return nil }
 
         // Use first camera as the base layer
@@ -190,7 +195,7 @@ public final class CompositorManager: Sendable {
         avatarTexture: CVPixelBuffer,
         cameraLayers: [CameraLayer] = [],
         museTexture: CVPixelBuffer? = nil
-    ) -> CVPixelBuffer? {
+    ) -> sending CVPixelBuffer? {
         let avatarImage = CIImage(cvPixelBuffer: avatarTexture)
         let screenSize = avatarImage.extent.size
 
@@ -213,7 +218,7 @@ public final class CompositorManager: Sendable {
         cameraLayers: [CameraLayer],
         avatarTexture: CVPixelBuffer? = nil,
         museTexture: CVPixelBuffer? = nil
-    ) -> CVPixelBuffer? {
+    ) -> sending CVPixelBuffer? {
         // Read once: the whole frame is composed against one output size.
         let outputSize = self.outputSize
         let outputRect = CGRect(origin: .zero, size: outputSize)
@@ -435,7 +440,9 @@ public final class CompositorManager: Sendable {
         return maskedImage
     }
 
-    private func renderToPixelBuffer(image: CIImage, size: CGSize) -> CVPixelBuffer? {
+    /// Renders into a new buffer the compositor keeps no reference to, so every composite's caller
+    /// owns its frame and can send it on (to the encoder).
+    private func renderToPixelBuffer(image: CIImage, size: CGSize) -> sending CVPixelBuffer? {
         var pixelBuffer: CVPixelBuffer?
 
         let attributes: [String: Any] = [
