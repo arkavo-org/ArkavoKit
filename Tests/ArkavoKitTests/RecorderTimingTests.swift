@@ -37,11 +37,11 @@ struct RecorderTimingTests {
         let track = try #require(try await asset.loadTracks(withMediaType: .video).first)
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
-        reader.add(output)
-        #expect(reader.startReading())
+        let buffers = reader.outputProvider(for: output)
+        try reader.start()
         var written = 0
-        while let buffer = output.copyNextSampleBuffer() {
-            written += CMSampleBufferGetNumSamples(buffer)
+        while let buffer = try await buffers.next() {
+            written += buffer.sampleCount
         }
         #expect(written + dropped.total == frames, "wrote \(written), dropped \(dropped)")
         #expect(dropped.outOfOrder == 0, "\(dropped)")

@@ -121,7 +121,8 @@ struct PasskeyCredentialAttestationTests {
         var unprotectedArray = golden
         unprotectedArray[74] = 0x80
         let untagged = golden.dropFirst()
-        return [
+        // In three statements, so the type checker takes each list on its own.
+        let framing: [Case] = [
             .init("the CWT tag 61 over the untagged bytes", Data([0xD8, 0x3D]) + untagged),
             .init("the CWT tag 61 over the tagged bytes", Data([0xD8, 0x3D]) + golden),
             .init("tag 98", Data([0xD8, 0x62]) + untagged),
@@ -141,6 +142,8 @@ struct PasskeyCredentialAttestationTests {
             .init("a map, not an array", TestCBOR.map([]).data),
             .init("empty input", Data()),
             .init("a truncated envelope", golden.prefix(399)),
+        ]
+        let headerParameters: [Case] = [
             .init("no content type", Fixture.mintAttestation(contentType: nil)),
             .init("content type application/cwt", Fixture.mintAttestation(contentType: .text("application/cwt"))),
             .init("content type as the CoAP number 61", Fixture.mintAttestation(contentType: .uint(61))),
@@ -155,6 +158,8 @@ struct PasskeyCredentialAttestationTests {
             .init("no kid", Fixture.mintAttestation(kid: nil)),
             .init("an empty kid", Fixture.mintAttestation(kid: .bytes([]))),
             .init("a text kid", Fixture.mintAttestation(kid: .text("arkavo-fixture-kid-1"))),
+        ]
+        let protectedHeaders: [Case] = [
             .init("a protected map that repeats label 1", signed(protected: [(.uint(1), .nint(6))] + Fixture.goldenProtected)),
             .init("a protected map that repeats label 4", signed(protected: Fixture.goldenProtected + [(.uint(4), .bytes([1]))])),
             .init("a protected map that repeats a text label",
@@ -174,6 +179,7 @@ struct PasskeyCredentialAttestationTests {
             .init("a protected header nested 17 levels deep",
                   signed(protected: Fixture.goldenProtected + [(.uint(99), nested(16))])),
         ]
+        return framing + headerParameters + protectedHeaders
     }()
 
     /// `levels` arrays around a uint. As a protected label's value, the uint sits `levels + 1` levels below the header map,

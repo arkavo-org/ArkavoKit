@@ -45,24 +45,38 @@ struct AudioSourceReconcileTests {
     }
 }
 
-final class FakeAudioSource: AudioSource {
+/// A source that delivers only what a test hands its `onSample`. Like a capture source, it is used
+/// from several threads at once, so its state is behind a lock.
+final class FakeAudioSource: AudioSource, @unchecked Sendable {
     let sourceID: String
     let sourceName = "Fake"
     let format = AudioFormat(sampleRate: 48000, channels: 2, bitDepth: 16, formatID: kAudioFormatLinearPCM)
-    var isActive = false
-    var onSample: ((CMSampleBuffer) -> Void)?
-    private(set) var started = false
+
+    private let lock = NSLock()
+    private var _isActive = false
+    private var _onSample: ((CMSampleBuffer) -> Void)?
+    private var _started = false
+
+    var isActive: Bool { lock.withLock { _isActive } }
+    var started: Bool { lock.withLock { _started } }
+
+    var onSample: ((CMSampleBuffer) -> Void)? {
+        get { lock.withLock { _onSample } }
+        set { lock.withLock { _onSample = newValue } }
+    }
 
     init(sourceID: String) {
         self.sourceID = sourceID
     }
 
     func start() async throws {
-        started = true
-        isActive = true
+        lock.withLock {
+            _started = true
+            _isActive = true
+        }
     }
 
     func stop() async throws {
-        isActive = false
+        lock.withLock { _isActive = false }
     }
 }

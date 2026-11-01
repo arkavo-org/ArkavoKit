@@ -87,6 +87,9 @@ final class NTDFStreamingTests: XCTestCase {
 
     // MARK: - NanoTDF Collection Tests
 
+    /// Deprecated itself so that calling the deprecated builder does not warn: NTDFStreamingManager
+    /// still streams with it.
+    @available(*, deprecated)
     func testCollectionCreation() async throws {
         let kasService = KASPublicKeyService(kasURL: kasURL)
         let kasMetadata = try await kasService.createKasMetadata()
@@ -104,6 +107,8 @@ final class NTDFStreamingTests: XCTestCase {
         print("✅ NanoTDF Collection created, header: \(headerBytes.count) bytes")
     }
 
+    /// Deprecated itself so that calling the deprecated builder does not warn.
+    @available(*, deprecated)
     func testCollectionEncryption() async throws {
         let kasService = KASPublicKeyService(kasURL: kasURL)
         let kasMetadata = try await kasService.createKasMetadata()
@@ -216,11 +221,6 @@ final class NTDFStreamingTests: XCTestCase {
             customFields: ["ntdf_header": "dGVzdA==", "custom_key": "custom_value"]
         )
 
-        // Metadata should contain our custom fields
-        // Convert to string to check (AMF0 strings are preceded by length)
-        let metadataString = String(data: metadata, encoding: .utf8) ?? ""
-
-        // The custom field names should appear in the metadata
         XCTAssertTrue(metadata.count > 100, "Metadata should contain substantial data")
 
         print("✅ Metadata with custom fields: \(metadata.count) bytes")

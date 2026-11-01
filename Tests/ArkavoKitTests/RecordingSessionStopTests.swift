@@ -814,14 +814,17 @@ struct RecordingSessionStopTests {
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
         ])
-        reader.add(output)
-        #expect(reader.startReading())
+        let samples = reader.outputProvider(for: output)
+        try reader.start()
         var colors: [(r: UInt8, g: UInt8, b: UInt8, a: UInt8)] = []
-        while let sample = output.copyNextSampleBuffer() {
-            guard let pixel = CMSampleBufferGetImageBuffer(sample) else { continue }
-            let width = CVPixelBufferGetWidth(pixel), height = CVPixelBufferGetHeight(pixel)
-            let center = CGRect(x: width / 2 - 20, y: height / 2 - 20, width: 40, height: 40)
-            if let color = getAverageColor(in: pixel, region: center) { colors.append(color) }
+        while let ready = try await samples.next() {
+            let color = ready.withUnsafeSampleBuffer { sample -> (r: UInt8, g: UInt8, b: UInt8, a: UInt8)? in
+                guard let pixel = CMSampleBufferGetImageBuffer(sample) else { return nil }
+                let width = CVPixelBufferGetWidth(pixel), height = CVPixelBufferGetHeight(pixel)
+                let center = CGRect(x: width / 2 - 20, y: height / 2 - 20, width: 40, height: 40)
+                return getAverageColor(in: pixel, region: center)
+            }
+            if let color { colors.append(color) }
         }
         return colors
     }
@@ -845,16 +848,19 @@ struct RecordingSessionStopTests {
             AVLinearPCMIsBigEndianKey: false,
             AVLinearPCMIsNonInterleaved: false,
         ])
-        reader.add(output)
-        #expect(reader.startReading())
+        let buffers = reader.outputProvider(for: output)
+        try reader.start()
         var peak = 0
-        while let buffer = output.copyNextSampleBuffer() {
-            guard let block = CMSampleBufferGetDataBuffer(buffer) else { continue }
-            var samples = [Int16](repeating: 0, count: CMBlockBufferGetDataLength(block) / 2)
-            _ = samples.withUnsafeMutableBytes {
-                CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: $0.count, destination: $0.baseAddress!)
+        while let ready = try await buffers.next() {
+            let bufferPeak = ready.withUnsafeSampleBuffer { buffer -> Int in
+                guard let block = CMSampleBufferGetDataBuffer(buffer) else { return 0 }
+                var samples = [Int16](repeating: 0, count: CMBlockBufferGetDataLength(block) / 2)
+                _ = samples.withUnsafeMutableBytes {
+                    CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: $0.count, destination: $0.baseAddress!)
+                }
+                return samples.map { abs(Int($0)) }.max() ?? 0
             }
-            peak = max(peak, samples.map { abs(Int($0)) }.max() ?? 0)
+            peak = max(peak, bufferPeak)
         }
         return peak
     }

@@ -101,7 +101,7 @@ struct RemoteCameraServerLimitsTests {
     /// Whether the server ends the connection (end of stream or an error) within `limit`
     private static func isClosedByServer(_ connection: NWConnection, within limit: Duration) async -> Bool {
         let closed = Flag()
-        func receive() {
+        @Sendable func receive() {
             connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { _, _, isComplete, error in
                 if isComplete || error != nil { closed.set() } else { receive() }
             }
