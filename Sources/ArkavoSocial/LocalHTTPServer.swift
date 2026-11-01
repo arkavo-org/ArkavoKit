@@ -162,7 +162,7 @@ public final class LocalHTTPServer: @unchecked Sendable {
         connection.stateUpdateHandler = { [weak self] state in
             switch state {
             case .failed, .cancelled:
-                self?.queue.async {
+                self?.queue.async { [weak self] in
                     self?.connections.removeValue(forKey: connectionID)
                 }
             default:
@@ -365,7 +365,7 @@ public final class LocalHTTPServer: @unchecked Sendable {
             responseData.append(body)
         }
 
-        connection.send(content: responseData, completion: .contentProcessed { [weak self] error in
+        connection.send(content: responseData, completion: .contentProcessed { error in
             if let error = error {
                 print("🌐 Send error: \(error.localizedDescription)")
             }

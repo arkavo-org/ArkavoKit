@@ -329,7 +329,7 @@ public extension KeychainManager {
 
     // MARK: - DID Key Management
 
-    public enum DIDKeyError: Error {
+    enum DIDKeyError: Error {
         case accessControlCreationFailed
         case keyGenerationFailed(OSStatus)
         case invalidPublicKey
@@ -337,7 +337,7 @@ public extension KeychainManager {
         case keyNotFound
     }
 
-    public static func generateAndSaveDIDKey() throws -> String {
+    static func generateAndSaveDIDKey() throws -> String {
         // First check if key already exists
         if let (_, _, did) = try? getDIDKey() {
             return did
@@ -390,7 +390,7 @@ public extension KeychainManager {
         return "did:key:z" + publicKeyData.base58String
     }
 
-    public static func getDIDKey() throws -> (privateKey: SecKey, publicKey: SecKey, did: String) {
+    static func getDIDKey() throws -> (privateKey: SecKey, publicKey: SecKey, did: String) {
         let query: [String: Any] = [
             kSecClass as String: kSecClassKey,
             kSecAttrApplicationTag as String: didKeyTag.data(using: .utf8)!,
@@ -422,7 +422,7 @@ public extension KeychainManager {
         return (privateKey, publicKey, did)
     }
 
-    public static func signWithDIDKey(message: Data) throws -> Data {
+    static func signWithDIDKey(message: Data) throws -> Data {
         let (privateKey, _, _) = try getDIDKey()
 
         var error: Unmanaged<CFError>?
@@ -495,7 +495,7 @@ public extension KeychainManager {
         }
     }
 
-    public static func deleteArkavoHandle() {
+    static func deleteArkavoHandle() {
         try? delete(service: "com.arkavo.handle",
                     account: "arkavo",
                     accessGroup: sharedAccessGroup)
@@ -546,7 +546,7 @@ public extension KeychainManager {
     // MARK: - Stream Key Management
 
     /// Saves a stream key for a specific platform
-    public static func saveStreamKey(_ streamKey: String, for platform: String) throws {
+    static func saveStreamKey(_ streamKey: String, for platform: String) throws {
         let service = "com.arkavo.ArkavoCreator.\(platform.lowercased()).streamKey"
         try save(streamKey.data(using: .utf8)!,
                  service: service,
@@ -554,31 +554,31 @@ public extension KeychainManager {
     }
 
     /// Retrieves a stream key for a specific platform
-    public static func getStreamKey(for platform: String) -> String? {
+    static func getStreamKey(for platform: String) -> String? {
         let service = "com.arkavo.ArkavoCreator.\(platform.lowercased()).streamKey"
         return getValue(service: service, account: "streamKey")
     }
 
     /// Deletes a stream key for a specific platform
-    public static func deleteStreamKey(for platform: String) {
+    static func deleteStreamKey(for platform: String) {
         let service = "com.arkavo.ArkavoCreator.\(platform.lowercased()).streamKey"
         try? delete(service: service, account: "streamKey")
     }
 
     /// Saves a custom RTMP URL
-    public static func saveCustomRTMPURL(_ url: String) throws {
+    static func saveCustomRTMPURL(_ url: String) throws {
         try save(url.data(using: .utf8)!,
                  service: "com.arkavo.ArkavoCreator.custom.rtmpURL",
                  account: "rtmpURL")
     }
 
     /// Retrieves the custom RTMP URL
-    public static func getCustomRTMPURL() -> String? {
+    static func getCustomRTMPURL() -> String? {
         return getValue(service: "com.arkavo.ArkavoCreator.custom.rtmpURL", account: "rtmpURL")
     }
 
     /// Deletes the custom RTMP URL
-    public static func deleteCustomRTMPURL() {
+    static func deleteCustomRTMPURL() {
         try? delete(service: "com.arkavo.ArkavoCreator.custom.rtmpURL", account: "rtmpURL")
     }
 }

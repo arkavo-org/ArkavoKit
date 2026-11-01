@@ -87,6 +87,16 @@ private final class OrderedDelivery: @unchecked Sendable {
     }
 }
 
+/// A buffer from a capture or mixer callback, on its way to the task or actor that uses it.
+///
+/// Unchecked because `CMSampleBuffer` isn't `Sendable`: CoreMedia lets a holder change a buffer's
+/// attachments. Capture and the mixer deliver finished, data-ready buffers, which nothing here
+/// changes: preview, the compositor and the encoder only read them. CoreFoundation retains and
+/// releases atomically, so a delivered buffer can be shared.
+private struct DeliveredBuffer: @unchecked Sendable {
+    let buffer: CMSampleBuffer
+}
+
 /// The system audio inputs a session creates: the microphone, with its permission, and the
 /// screen's audio. Tests substitute stand-ins.
 struct AudioInputs {
@@ -117,12 +127,12 @@ public final class RecordingSession: Sendable {
     private var remoteCameraIdentifiers: Set<String> = []
     public private(set) var remoteCameraServer: RemoteCameraServer?
     nonisolated(unsafe) private let audioRouter: AudioRouter
-    nonisolated(unsafe) private let audioMixer: AudioMixer
+    nonisolated private let audioMixer: AudioMixer
     /// Hands the mix to the encoder in mix order, so stopping can wait until all of it,
     /// the drained tail included, has reached the encoder.
     nonisolated private let mixedAudioDelivery = OrderedDelivery()
-    nonisolated(unsafe) private let compositor: CompositorManager
-    nonisolated(unsafe) private let encoder: VideoEncoder
+    nonisolated private let compositor: CompositorManager
+    nonisolated private let encoder: VideoEncoder
     private let audioInputs: AudioInputs
 
     // Recording state tracked locally for synchronous access
@@ -451,10 +461,11 @@ public final class RecordingSession: Sendable {
             // Keep the consumer associated with this frame, even if the source changes
             // while composition is suspended waiting for the main actor.
             let monitorHandler = self.monitorFrameHandler
-            // Process asynchronously to handle encoding
-            // Note: CMSampleBuffer is not Sendable, but we process it immediately without retaining
+            // Process asynchronously to handle encoding. The capture manager hands the same
+            // frame to its other consumers too, hence the `DeliveredBuffer`.
+            let frame = DeliveredBuffer(buffer: screenBuffer)
             Task {
-                await self.processScreenFrame(screenBuffer, captureID: captureID, monitorHandler: monitorHandler)
+                await self.processScreenFrame(frame.buffer, captureID: captureID, monitorHandler: monitorHandler)
             }
         }
 
@@ -466,8 +477,9 @@ public final class RecordingSession: Sendable {
 
         // Wire mixer output to encoder
         audioMixer.onMixedSample = { @Sendable [weak self] mixedSample in
+            let mixed = DeliveredBuffer(buffer: mixedSample)
             self?.mixedAudioDelivery.enqueue { [weak self] in
-                await self?.processAudioSampleSync(mixedSample, sourceID: AudioMixer.outputSourceID)
+                await self?.processAudioSampleSync(mixed.buffer, sourceID: AudioMixer.outputSourceID)
             }
         }
     }
@@ -674,10 +686,11 @@ public final class RecordingSession: Sendable {
         for identifier in toStart {
             let manager = CameraManager()
             manager.onFrame = { [weak self] buffer in
+                let frame = DeliveredBuffer(buffer: buffer)
                 Task { @MainActor [weak self] in
                     guard let self else { return }
-                    self.latestCameraBuffers[identifier] = buffer
-                    self.dispatchPreview(for: identifier, buffer: buffer)
+                    self.latestCameraBuffers[identifier] = frame.buffer
+                    self.dispatchPreview(for: identifier, buffer: frame.buffer)
                 }
             }
             cameraCaptures[identifier] = manager
@@ -1072,7 +1085,7 @@ public final class RecordingSession: Sendable {
         cameraFrameTimer = nil
     }
 
-    private nonisolated func processAudioSampleSync(_ audioSample: CMSampleBuffer, sourceID: String) async {
+    private nonisolated func processAudioSampleSync(_ audioSample: sending CMSampleBuffer, sourceID: String) async {
         guard _isRecording || _streamingActive.withLock({ $0 }) else {
             return
         }
@@ -1351,10 +1364,11 @@ public final class RecordingSession: Sendable {
         for identifier in toStart {
             let manager = CameraManager()
             manager.onFrame = { [weak self] buffer in
+                let frame = DeliveredBuffer(buffer: buffer)
                 Task { @MainActor [weak self] in
                     guard let self else { return }
-                    self.latestCameraBuffers[identifier] = buffer
-                    self.dispatchPreview(for: identifier, buffer: buffer)
+                    self.latestCameraBuffers[identifier] = frame.buffer
+                    self.dispatchPreview(for: identifier, buffer: frame.buffer)
                 }
             }
             do {

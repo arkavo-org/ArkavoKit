@@ -226,6 +226,11 @@ extension AppleSignInService: ASAuthorizationControllerDelegate {
                 case .matchedExcludedCredential:
                     self.error = .matchedExcludedCredential
                     self.continuation?.resume(throwing: AppleSignInError.matchedExcludedCredential)
+                // Codes from credential import/export and passkey flows, which this service doesn't run.
+                case .credentialImport, .credentialExport, .preferSignInWithApple,
+                     .deviceNotConfiguredForPasskeyCreation:
+                    self.error = .unknown(error)
+                    self.continuation?.resume(throwing: AppleSignInError.unknown(error))
                 @unknown default:
                     self.error = .unknown(error)
                     self.continuation?.resume(throwing: AppleSignInError.unknown(error))
@@ -241,20 +246,18 @@ extension AppleSignInService: ASAuthorizationControllerDelegate {
 
 extension AppleSignInService: ASAuthorizationControllerPresentationContextProviding {
     public nonisolated func presentationAnchor(for controller: ASAuthorizationController) -> ASPresentationAnchor {
+        // The fallback window is created on the main queue too: AppKit and UIKit windows are
+        // main-actor only.
         #if os(macOS)
-        var window: NSWindow?
-        DispatchQueue.main.sync {
-            window = NSApplication.shared.windows.first { $0.isKeyWindow } ?? NSApplication.shared.windows.first
+        return DispatchQueue.main.sync {
+            NSApplication.shared.windows.first { $0.isKeyWindow } ?? NSApplication.shared.windows.first ?? NSWindow()
         }
-        return window ?? NSWindow()
         #else
-        var window: UIWindow?
-        DispatchQueue.main.sync {
+        return DispatchQueue.main.sync {
             let scenes = UIApplication.shared.connectedScenes
             let windowScene = scenes.first as? UIWindowScene
-            window = windowScene?.windows.first { $0.isKeyWindow }
+            return windowScene?.windows.first { $0.isKeyWindow } ?? UIWindow()
         }
-        return window ?? UIWindow()
         #endif
     }
 }

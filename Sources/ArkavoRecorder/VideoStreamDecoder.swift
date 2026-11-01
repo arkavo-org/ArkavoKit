@@ -9,9 +9,9 @@ public final class VideoStreamDecoder {
 
     /// Callback invoked when decoded frame is ready
     /// - Parameters:
-    ///   - pixelBuffer: Decoded video frame
+    ///   - pixelBuffer: Decoded video frame, which the decoder keeps no reference to
     ///   - timestamp: Presentation timestamp
-    public typealias OutputHandler = (CVPixelBuffer, CMTime) -> Void
+    public typealias OutputHandler = (sending CVPixelBuffer, CMTime) -> Void
 
     // MARK: - Properties
 
@@ -243,9 +243,21 @@ public final class VideoStreamDecoder {
     }
 
     private func handleDecodedFrame(_ pixelBuffer: CVPixelBuffer, timestamp: CMTime) {
-        outputQueue.async { [weak self] in
-            self?.outputHandler(pixelBuffer, timestamp)
+        let frame = DecodedFrame(decoder: self, pixelBuffer: pixelBuffer)
+        outputQueue.async {
+            frame.decoder?.outputHandler(frame.pixelBuffer, timestamp)
         }
+    }
+
+    /// A decoded frame on its way from VideoToolbox's callback to `outputQueue`.
+    ///
+    /// Unchecked because neither the decoder nor `CVPixelBuffer` is `Sendable`. On `outputQueue`
+    /// the decoder is only read for `outputHandler`, a constant, and the handler only ever runs
+    /// there. VideoToolbox hands over a finished frame, which nothing writes to afterwards, and
+    /// CoreFoundation retains and releases atomically.
+    private struct DecodedFrame: @unchecked Sendable {
+        weak var decoder: VideoStreamDecoder?
+        let pixelBuffer: CVPixelBuffer
     }
 
     // MARK: - Errors
@@ -270,8 +282,6 @@ extension VideoStreamDecoder {
     ///   - pps: Picture Parameter Set NAL unit
     /// - Returns: CMFormatDescription for H.264 video
     public static func createFormatDescription(sps: Data, pps: Data) throws -> CMFormatDescription {
-        let parameterSets = [sps, pps]
-
         var formatDescription: CMFormatDescription?
 
         // Use withUnsafeBytes to get proper pointers

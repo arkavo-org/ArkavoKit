@@ -317,7 +317,13 @@ public final class SensorBridge: NSObject, ObservableObject {
 
     private func scheduleDataDeletion(taskId: String, after duration: TimeInterval) {
         Task {
-            try await Task.sleep(for: .seconds(duration))
+            // The sleep throws only if the task is cancelled, and then the retention timer is gone,
+            // so there's nothing to report.
+            do {
+                try await Task.sleep(for: .seconds(duration))
+            } catch {
+                return
+            }
             print("[SensorBridge] Data retention expired for task: \(taskId)")
         }
     }
@@ -325,15 +331,7 @@ public final class SensorBridge: NSObject, ObservableObject {
 
 extension SensorBridge: @preconcurrency CLLocationManagerDelegate {
     public func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
-        guard let location = locations.last else { return }
-
-        let data: [String: Any] = [
-            "latitude": location.coordinate.latitude,
-            "longitude": location.coordinate.longitude,
-            "altitude": location.altitude,
-            "horizontalAccuracy": location.horizontalAccuracy,
-            "verticalAccuracy": location.verticalAccuracy,
-        ]
+        guard !locations.isEmpty else { return }
 
         if let handler = permissionHandlers[.location] {
             permissionHandlers.removeValue(forKey: .location)

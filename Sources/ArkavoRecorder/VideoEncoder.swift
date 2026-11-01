@@ -1038,7 +1038,7 @@ public actor VideoEncoder {
 
     /// Stop streaming to a single destination (others continue)
     public func stopStreaming(id: String) async {
-        guard var dest = streamDestinations.removeValue(forKey: id) else { return }
+        guard let dest = streamDestinations.removeValue(forKey: id) else { return }
 
         dest.videoContinuation?.finish()
         dest.audioContinuation?.finish()
