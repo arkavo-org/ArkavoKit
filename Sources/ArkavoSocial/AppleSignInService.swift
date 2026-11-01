@@ -246,18 +246,21 @@ extension AppleSignInService: ASAuthorizationControllerDelegate {
 
 extension AppleSignInService: ASAuthorizationControllerPresentationContextProviding {
     public nonisolated func presentationAnchor(for controller: ASAuthorizationController) -> ASPresentationAnchor {
-        // The fallback window is created on the main queue too: AppKit and UIKit windows are
-        // main-actor only.
+        // AppKit and UIKit windows are main-actor only, the fallback window too. On the main
+        // thread already, read them directly: `DispatchQueue.main.sync` there would trap.
+        if Thread.isMainThread {
+            return MainActor.assumeIsolated { Self.currentAnchor() }
+        }
+        return DispatchQueue.main.sync { MainActor.assumeIsolated { Self.currentAnchor() } }
+    }
+
+    @MainActor
+    private static func currentAnchor() -> ASPresentationAnchor {
         #if os(macOS)
-        return DispatchQueue.main.sync {
-            NSApplication.shared.windows.first { $0.isKeyWindow } ?? NSApplication.shared.windows.first ?? NSWindow()
-        }
+        NSApplication.shared.windows.first { $0.isKeyWindow } ?? NSApplication.shared.windows.first ?? NSWindow()
         #else
-        return DispatchQueue.main.sync {
-            let scenes = UIApplication.shared.connectedScenes
-            let windowScene = scenes.first as? UIWindowScene
-            return windowScene?.windows.first { $0.isKeyWindow } ?? UIWindow()
-        }
+        let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene
+        return windowScene?.windows.first { $0.isKeyWindow } ?? UIWindow()
         #endif
     }
 }
