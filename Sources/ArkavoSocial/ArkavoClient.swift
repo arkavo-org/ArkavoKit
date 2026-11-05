@@ -24,6 +24,28 @@ public enum ArkavoError: Error {
     /// The report is best effort: it needs iOS / macOS 26.2, and a failed report is
     /// only logged.
     case unknownPasskey
+    /// The username breaks identity's rule: 1 to 63 characters of `[a-z0-9-]`, with no hyphen
+    /// at either end. `registerUser` checks it before the App Attest preflight; identity's 400
+    /// maps here too.
+    case invalidUsername
+    /// The username can't be registered: identity issued its handle before (409), an account
+    /// holds it (401), or it is reserved for federated identities (403). Pick another.
+    case usernameUnavailable
+}
+
+/// Readable text for the errors a person can act on. The other cases keep the system's
+/// default description, so nothing that shows them changes.
+extension ArkavoError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .invalidUsername:
+            "Usernames use 1 to 63 lowercase letters, numbers and hyphens, with no hyphen at the start or end."
+        case .usernameUnavailable:
+            "That username isn't available. Try another."
+        default:
+            nil
+        }
+    }
 }
 
 /// Represents the current state of the ArkavoClient
@@ -1361,6 +1383,10 @@ public final class ArkavoClient: NSObject {
     /// Register a new user with WebAuthn
     public func registerUser(handle: String, did: String) async throws -> String {
         guard !isDeletingAccount else { throw ArkavoError.invalidState }
+        // identity refuses these names before it looks for a ticket, so checking them here,
+        // ahead of the preflight, spends no App Attest key on a name it would refuse (#65).
+        guard Self.isValidUsername(handle) else { throw ArkavoError.invalidUsername }
+        guard !Self.isReservedUsername(handle) else { throw ArkavoError.usernameUnavailable }
         print("Initiating user registration with handle: \(handle)")
 
         // Admission control: the server refuses registration without a
@@ -1483,11 +1509,12 @@ public final class ArkavoClient: NSObject {
 
         let (data, response) = try await Self.http3Data(from: url)
 
-        guard let httpResponse = response as? HTTPURLResponse,
-              (200 ... 299).contains(httpResponse.statusCode)
-        else {
-            print("fetchRegistrationOptions.invalidResponse \(String(decoding: data, as: UTF8.self))")
+        guard let httpResponse = response as? HTTPURLResponse else {
             throw ArkavoError.invalidResponse
+        }
+        if let error = Self.registrationOptionsError(status: httpResponse.statusCode, body: data) {
+            print("fetchRegistrationOptions \(httpResponse.statusCode): \(String(decoding: data, as: UTF8.self))")
+            throw error
         }
 
         let decoder = JSONDecoder()
@@ -1726,6 +1753,51 @@ public final class ArkavoClient: NSObject {
     /// — the contract states it may change, so nothing branches on it.
     nonisolated static func errorDescription(from data: Data) -> String? {
         (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error_description"] as? String
+    }
+
+    /// identity's `is_valid_username` (authnz-rs `src/authn.rs`): 1 to 63 characters of
+    /// `[a-z0-9-]`, no hyphen at either end. Exact bytes: no trimming, no case folding.
+    public nonisolated static func isValidUsername(_ username: String) -> Bool {
+        let bytes = Array(username.utf8)
+        guard (1 ... 63).contains(bytes.count),
+              bytes.first != UInt8(ascii: "-"), bytes.last != UInt8(ascii: "-")
+        else { return false }
+        return bytes.allSatisfy { byte in
+            (UInt8(ascii: "a") ... UInt8(ascii: "z")).contains(byte)
+                || (UInt8(ascii: "0") ... UInt8(ascii: "9")).contains(byte)
+                || byte == UInt8(ascii: "-")
+        }
+    }
+
+    /// identity's `RESERVED_USERNAME_PREFIXES` (authnz-rs `src/constants.rs`): the namespaces of
+    /// federated sign-ins, which a passkey registration may not take.
+    public nonisolated static let reservedUsernamePrefixes = ["apple-", "google-"]
+
+    /// Whether `username` falls in a namespace identity reserves for federated identities.
+    public nonisolated static func isReservedUsername(_ username: String) -> Bool {
+        reservedUsernamePrefixes.contains { username.hasPrefix($0) }
+    }
+
+    /// What a `GET /register/:username` answer means, or nil for success. identity answers 400
+    /// for a malformed username, 403 for a reserved one (or a missing App Attest ticket), 409 for
+    /// a handle issued before, and 401 when an account already holds the name and no token was
+    /// sent. Anything else stays `invalidResponse`. The 403 reason is told apart by identity's
+    /// fixed text, since both reasons share the status. The 401 reading holds only because
+    /// `fetchRegistrationOptions` sends no `X-Auth-Token`: with one, identity also answers 401
+    /// for a bad or stale token.
+    nonisolated static func registrationOptionsError(status: Int, body: Data) -> ArkavoError? {
+        switch status {
+        case 200 ... 299:
+            return nil
+        case 400:
+            return .invalidUsername
+        case 401, 409:
+            return .usernameUnavailable
+        case 403 where String(decoding: body, as: UTF8.self).localizedCaseInsensitiveContains("reserved"):
+            return .usernameUnavailable
+        default:
+            return .invalidResponse
+        }
     }
 
     /// Whether a refusal is the permanent one. Exact-match on the contract's
