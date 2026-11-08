@@ -1015,6 +1015,8 @@ public final class ArkavoClient: NSObject {
     /// offers only its passkeys instead of every Arkavo passkey on the device. With no
     /// listed credentials (the name-free sign-in) the request stays open: any passkey
     /// for the relying party. An id that is not base64url is skipped.
+    ///
+    /// User verification is always `required` (see `passkeyUserVerification`).
     nonisolated static func passkeyAssertionRequest(
         provider: ASAuthorizationPlatformPublicKeyCredentialProvider,
         challenge: Data,
@@ -1024,7 +1026,35 @@ public final class ArkavoClient: NSObject {
         request.allowedCredentials = allowCredentialIDs
             .compactMap { Data(base64Encoded: $0.base64URLToBase64()) }
             .map { ASAuthorizationPlatformPublicKeyCredentialDescriptor(credentialID: $0) }
+        request.userVerificationPreference = passkeyUserVerification
         return request
+    }
+
+    /// The passkey registration request. User verification is always `required`
+    /// (see `passkeyUserVerification`).
+    nonisolated static func passkeyRegistrationRequest(
+        provider: ASAuthorizationPlatformPublicKeyCredentialProvider,
+        challenge: Data,
+        name: String,
+        userID: Data
+    ) -> ASAuthorizationPlatformPublicKeyCredentialRegistrationRequest {
+        let request = provider.createCredentialRegistrationRequest(
+            challenge: challenge,
+            name: name,
+            userID: userID
+        )
+        request.userVerificationPreference = passkeyUserVerification
+        return request
+    }
+
+    /// Both passkey requests ask for user verification, whatever the server's
+    /// options say (ArkavoKit#70). Apple's default is `preferred`, and a Mac
+    /// without Touch ID answers `preferred` without asking for the login password
+    /// (UV=0), which identity.arkavo.net refuses with `UserNotVerified`. The
+    /// client is the floor: if the server's options are ever relaxed, ArkavoKit
+    /// still asks for verification, and identity keeps enforcing its own policy.
+    nonisolated static var passkeyUserVerification: ASAuthorizationPublicKeyCredentialUserVerificationPreference {
+        .required
     }
 
     /// The passkey ceremony: `GET /authenticate`, the system sheet, then
@@ -1437,7 +1467,8 @@ public final class ArkavoClient: NSObject {
         print("Registration request prepared: \(userIDData.count) bytes userID, \(challengeData.count) bytes challenge")
         print("Creating credential registration request for handle: \(handle)")
 
-        let credentialRequest = provider.createCredentialRegistrationRequest(
+        let credentialRequest = Self.passkeyRegistrationRequest(
+            provider: provider,
             challenge: challengeData,
             name: handle,
             userID: userIDData

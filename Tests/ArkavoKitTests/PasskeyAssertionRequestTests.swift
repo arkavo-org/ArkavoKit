@@ -59,4 +59,31 @@ final class PasskeyAssertionRequestTests: XCTestCase {
         )
         XCTAssertEqual(none.publicKey.publicKeyCredentialIDs, [])
     }
+
+    // MARK: - User verification (ArkavoKit#70)
+
+    /// Apple's default is "preferred", which a Mac without Touch ID answers with UV=0,
+    /// and identity refuses that (UserNotVerified). Both requests always ask for UV.
+    func testAssertionRequestRequiresUserVerification() {
+        let open = ArkavoClient.passkeyAssertionRequest(
+            provider: provider, challenge: challenge, allowCredentialIDs: []
+        )
+        XCTAssertEqual(open.userVerificationPreference, .required)
+
+        let scoped = ArkavoClient.passkeyAssertionRequest(
+            provider: provider, challenge: challenge, allowCredentialIDs: ["AQI"]
+        )
+        XCTAssertEqual(scoped.userVerificationPreference, .required)
+    }
+
+    func testRegistrationRequestRequiresUserVerification() {
+        let userID = Data("uid".utf8)
+        let request = ArkavoClient.passkeyRegistrationRequest(
+            provider: provider, challenge: challenge, name: "alice", userID: userID
+        )
+        XCTAssertEqual(request.userVerificationPreference, .required)
+        XCTAssertEqual(request.challenge, challenge)
+        XCTAssertEqual(request.name, "alice")
+        XCTAssertEqual(request.userID, userID)
+    }
 }

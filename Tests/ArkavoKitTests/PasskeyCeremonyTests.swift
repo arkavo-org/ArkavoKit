@@ -110,6 +110,26 @@ final class PasskeyCeremonyTests: XCTestCase {
         XCTAssertEqual(request.allowedCredentials.map(\.credentialID), [Data([0x01, 0x02])])
     }
 
+    /// ArkavoKit#70: the client is the floor. Options that ask for less, or say
+    /// nothing, still put a `required` request in front of the sheet.
+    func testSheetRequiresUserVerificationWhateverTheOptionsSay() async throws {
+        let options = [
+            Self.nameFreeOptions, // "required"
+            Self.nameFreeOptions.replacingOccurrences(of: #""required""#, with: #""preferred""#),
+            Self.nameFreeOptions.replacingOccurrences(of: #""required""#, with: #""discouraged""#),
+            Self.scopedOptions, // no userVerification
+        ]
+        for start in options {
+            stubSheet(.success(Self.assertion))
+            stubHTTP([.status(200, start), .status(200, Self.reply)])
+
+            _ = try await client.passkeyCeremony(account: nil)
+
+            let request = try XCTUnwrap(sheet.requests.first, start)
+            XCTAssertEqual(request.userVerificationPreference, .required, start)
+        }
+    }
+
     func testUserNotFoundOnTheStartIsSurfaced() async {
         let http = stubHTTP([.status(500, "User Not Found")])
 
