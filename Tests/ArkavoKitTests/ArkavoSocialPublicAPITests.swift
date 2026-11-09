@@ -107,6 +107,36 @@ final class ArkavoSocialPublicAPITests: XCTestCase {
             try await c.connect()
         }
     }
+
+    /// arkavo-ios's `OwnerKASVaultUnlocking` seam: seal at setup, unlock, and tell cancelled from unsupported.
+    @MainActor
+    func testTheOwnerKASVaultIsPublic() throws {
+        let binding = OwnerKASVaultBinding(vaultID: "v", ownerSubject: "s", kasKeyID: "k", algorithm: "ec:secp256r1")
+        XCTAssertEqual(binding.vaultID, "v")
+
+        // Compile-time shape checks only; the closures are never executed.
+        let _: (ArkavoClient) async throws -> OwnerKASVault = { c in
+            try await c.sealOwnerKASVault(Data(), binding: binding, allowedCredentialIDs: [])
+        }
+        let _: (ArkavoClient, OwnerKASVault) async throws -> Data = { c, vault in
+            try await c.openOwnerKASVault(vault, binding: binding)
+        }
+        let _: (ArkavoClient, OwnerKASVault) async throws -> (PasskeyPRFOutput, Data) = { c, vault in
+            let prf = try await c.passkeyPRF(for: vault)
+            let resealed = try OwnerKASVault.seal(Data(), with: prf, binding: binding)
+            return try (prf, resealed.open(with: prf, binding: binding))
+        }
+        let _: (ArkavoClient) async throws -> PasskeyPRFOutput = { c in
+            try await c.passkeyPRF(input: OwnerKASVault.newPRFInput(), allowedCredentialIDs: [])
+        }
+        let _: (OwnerKASVault) throws -> OwnerKASVault = { try OwnerKASVault(encoded: $0.encoded()) }
+
+        let errors: [any Error] = [PasskeyPRFError.cancelled, PasskeyPRFError.unsupported, PasskeyPRFError.wrongCredential]
+        XCTAssertEqual(errors.compactMap { $0 as? PasskeyPRFError }.count, 3)
+        for error in [OwnerKASVaultError.wrongPasskey, .cannotOpen, .unsupportedVersion(2), .malformed] {
+            XCTAssertNotNil(error as any Error)
+        }
+    }
 }
 
 /// The shape Creator's `ArkavoAuthState` declares (design sub-project C).
