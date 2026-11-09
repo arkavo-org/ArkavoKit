@@ -84,7 +84,7 @@ public protocol ArkavoClientDelegate: AnyObject {
 public final class ArkavoClient: NSObject {
     private let authURL: URL // for WebAuthn
     private let websocketURL: URL // for WebSocket
-    private let relyingPartyID: String
+    let relyingPartyID: String
     private let curve: KeyExchangeCurve
     private var keyPair: CurveKeyPair?
     private var sharedSecret: SharedSecret?
@@ -126,6 +126,18 @@ public final class ArkavoClient: NSObject {
             rawAuthenticatorData: assertion.rawAuthenticatorData,
             signature: assertion.signature,
             userID: assertion.userID
+        )
+    }
+
+    /// The system passkey sheet for a PRF assertion (`passkeyPRF(input:allowedCredentialIDs:)`): the
+    /// request → the picked passkey and its first PRF output, nil when it gave none. A cancelled sheet
+    /// throws `ASAuthorizationError` (`.canceled`) unchanged.
+    lazy var prfAssertionProvider: @MainActor (ASAuthorizationPlatformPublicKeyCredentialAssertionRequest) async throws -> PRFAssertionResult = { [unowned self] request in
+        let assertion = try await self.performAuthentication(request: request)
+        return PRFAssertionResult(
+            credentialID: assertion.credentialID,
+            userID: assertion.userID,
+            prf: assertion.prf?.first
         )
     }
 
