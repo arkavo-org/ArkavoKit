@@ -1,5 +1,5 @@
 {
-  "originHash" : "6bda0f536edcf0a45bfb5ab052f568f436d499d180ac3b834e8e84b1ab3baf16",
+  "originHash" : "d07e20979bff8ec1cd2da80d0205abf8554a59a99318899361d295bf307eab10",
   "pins" : [
     {
       "identity" : "arkavomediakit",
@@ -24,8 +24,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/arkavo-org/iroh-swift",
       "state" : {
-        "revision" : "74f5c99de3fd62770318241d4e4586d7282ea374",
-        "version" : "0.7.0"
+        "revision" : "af813bd402dfa607072255eb2f5e3aab254a1719",
+        "version" : "0.8.0"
       }
     },
     {
