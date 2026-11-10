@@ -344,6 +344,26 @@ final class GameTokenTests: XCTestCase {
         XCTAssertEqual(token.expiresAt.timeIntervalSince(clock.now), 900)
     }
 
+    /// identity's numbers are not trusted to be sane: none may trap, and an absurd clock is not kept.
+    func testAbsurdTimesFromIdentityNeitherCrashNorMoveTheClock() async throws {
+        installSession()
+        for absurd in ["-9223372036854775808", "9223372036854775807"] {
+            let http = ScriptedHTTP([
+                .status(400, #"{"error":"invalid_issued_at","serverTime":\#(absurd)}"#),
+                .status(200, #"{"token":"t","expiresAt":9223372036854775807,"onlinePlay":false,"serverTime":\#(absurd)}"#),
+            ])
+
+            let token = try await sessions.gameToken(audience: Self.audience, via: endpoint(http))
+
+            XCTAssertEqual(Self.body(of: http.requests[1])["issuedAt"] as? Int64, Self.now, "the clock is not moved")
+            XCTAssertGreaterThan(token.expiresAt, clock.now)
+            let proof = try await sessions.gameRequestProof(
+                for: token, method: "GET", url: URL(string: "https://game.example/v1/war")!, body: nil
+            )
+            XCTAssertEqual(proof.timestamp, Self.now)
+        }
+    }
+
     func testAClockRefusedTwiceIsReported() async {
         installSession()
         let before = store.record
@@ -373,6 +393,17 @@ final class GameTokenTests: XCTestCase {
 
     func testARecentlyRenewedSessionIsNotRenewedBeforeTheMint() async throws {
         installSession(renewedAgo: 1979)
+        let http = ScriptedHTTP([.status(200, Self.minted)])
+
+        _ = try await sessions.gameToken(audience: Self.audience, via: endpoint(http))
+
+        XCTAssertEqual(http.requests.map(\.url?.path), ["/game/token"])
+    }
+
+    /// An idle limit of zero would otherwise renew before every mint.
+    func testAnIdleLimitThatIsNotPositiveIsNotBelieved() async throws {
+        installSession(renewedAgo: 60)
+        store.record?.idleTimeoutSeconds = 0
         let http = ScriptedHTTP([.status(200, Self.minted)])
 
         _ = try await sessions.gameToken(audience: Self.audience, via: endpoint(http))
@@ -437,6 +468,35 @@ final class GameTokenTests: XCTestCase {
         XCTAssertEqual(store.record?.idleTimeoutSeconds, 3960)
     }
 
+    // MARK: - While a sign-in is in flight
+
+    /// Opening a session forgets the old one before identity answers. A mint or a proof made meanwhile
+    /// waits for the sign-in instead of reporting no session.
+    func testAMintAndAProofWaitForASignInInFlight() async throws {
+        let opening = GatedHTTP(answer: (201,
+            #"{"sessionId":"0f0e0d0c-0b0a-8908-8706-050403020100","credential":"1.Zmlyc3Q","sessionExpiresAt":1794355200,"idleTimeoutSeconds":3960}"#))
+        let openingEndpoint = PasskeySessionEndpoint(identity: Self.identity, send: opening.perform)
+        let open = Task { await sessions.open(token: TestCWT.token(sub: Self.sub, cti: [1, 2, 3]), via: openingEndpoint) }
+        await opening.gate.waitUntilHolding()
+        XCTAssertNil(store.record, "the open has not been answered")
+
+        let http = ScriptedHTTP([.status(200, Self.minted)])
+        let mint = Task { try await sessions.gameToken(audience: Self.audience, via: endpoint(http)) }
+        let held = GameToken(token: "abc", audience: Self.audience, expiresAt: clock.now, onlinePlay: false)
+        let proof = Task {
+            try await sessions.gameRequestProof(for: held, method: "GET", url: URL(string: "https://game.example/v1/war")!, body: nil)
+        }
+        await Task.yield()
+        opening.gate.open()
+
+        let didOpen = await open.value
+        XCTAssertTrue(didOpen)
+        let token = try await mint.value
+        XCTAssertEqual(token.token, "Z2FtZS10b2tlbg")
+        XCTAssertEqual(Self.body(of: http.requests[0])["sessionId"] as? String, Self.sessionID)
+        _ = try await proof.value
+    }
+
     // MARK: - Client
 
     func testTheClientMintsAtItsIdentityAndSignsWithItsSession() async throws {
@@ -489,6 +549,20 @@ final class GameTokenTests: XCTestCase {
         await assertProof(throws: .invalidRequest, method: "GET /")
         await assertProof(throws: .invalidRequest, audience: "https://game.example\nPOST")
         await assertProof(throws: .invalidRequest, audience: "")
+        // Not ASCII letters, though uppercasing it would give "SS".
+        await assertProof(throws: .invalidRequest, method: "ß")
+    }
+
+    /// A URL with no host has no absolute path: its target would not start with a slash.
+    func testAProofRefusesAURLWithoutAnAbsolutePath() async {
+        installSession()
+        let token = GameToken(token: "abc", audience: Self.audience, expiresAt: clock.now, onlinePlay: true)
+        do {
+            _ = try await sessions.gameRequestProof(for: token, method: "GET", url: URL(string: "v1/runs?x=1")!, body: nil)
+            XCTFail("expected invalidRequest")
+        } catch {
+            XCTAssertEqual(error as? GameTokenError, .invalidRequest)
+        }
     }
 
     /// This is a game: a Secure Enclave signature must not hold the main thread.

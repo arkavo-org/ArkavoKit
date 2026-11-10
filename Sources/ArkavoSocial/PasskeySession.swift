@@ -247,6 +247,12 @@ final class PasskeySessions {
         return await task.value
     }
 
+    /// Returns once every operation queued so far has finished. A caller that only reads the session
+    /// waits here, so it never reads between an open's forgetting the old session and keeping the new one.
+    func settled() async {
+        await last?.value
+    }
+
     // MARK: Open
 
     /// Opens a session with `token`, a passkey auth CWT that `POST /authenticate`

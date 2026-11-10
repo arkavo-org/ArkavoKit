@@ -91,11 +91,13 @@ extension ArkavoClient {
     /// Call it when the app is about to call the game server and holds no token, or one that expires
     /// within a minute; after the game server refuses an expired token; and after a purchase, every
     /// 20 s for about a minute and a half until `onlinePlay` is true. Only while the person is playing,
-    /// never on a background timer. A mint can be repeated: a lost answer costs nothing.
+    /// never on a background timer. A mint can be repeated: a lost mint answer costs nothing.
     ///
     /// The mint does not keep the session alive, so this renews the session first when it has not been
-    /// renewed for half its idle limit, and once more when identity answers 401. Either renewal's auth
-    /// token comes back in `renewedSession`.
+    /// renewed for half its idle limit, and once more when identity answers 401. A renewal keeps its own
+    /// rule: one whose answer is lost ends the session (`.sessionEnded(.responseLost)`). Its auth token
+    /// comes back in `renewedSession`; when the mint throws after a renewal that token is not returned,
+    /// and `renewSession()` gives another when one is needed.
     ///
     /// No token is kept here. Near the session's deadline a new token can expire in under a minute: do
     /// not mint again when the token just received expires no later than the one before it.
@@ -108,8 +110,10 @@ extension ArkavoClient {
 
     /// Signs one request to the game server with the session's device key.
     ///
-    /// `url` is the URL the request is sent to: its path and query are signed as they go on the wire.
-    /// `body` is the request's body bytes, nil for none. The proof is good for 60 seconds, for this
+    /// `url` is the absolute URL the request is sent to: its path and query are signed as they go on the
+    /// wire. `method` is signed in uppercase, so set the request's `httpMethod` in uppercase too:
+    /// URLSession sends a method such as `patch` as it is written. `body` is the request's body bytes,
+    /// nil for none. The proof is good for 60 seconds, for this
     /// method, target, body and token only. For a long-lived connection, sign its handshake.
     ///
     /// The key signs only while the device is unlocked. There is no call that signs other bytes with it.
@@ -151,6 +155,8 @@ enum GameTokenMessage {
 extension PasskeySessions {
     /// The idle limit assumed for a session whose open did not state one (identity's 66 minutes).
     private static let defaultIdleTimeout: TimeInterval = 3960
+    /// The largest clock difference believed, in seconds (a hundred years).
+    private static let maxClockOffset: UInt64 = 100 * 365 * 86400
 
     /// One answer to a mint that the caller acts on; every other answer is thrown.
     private enum MintAnswer {
@@ -170,6 +176,8 @@ extension PasskeySessions {
     /// Mints a game token for `audience`. Logs carry statuses only: never a token, signature or session id.
     func gameToken(audience: String, via endpoint: PasskeySessionEndpoint) async throws -> GameToken {
         guard GameTokenMessage.isOneLine(audience) else { throw GameTokenError.invalidRequest }
+        // A sign-in in flight has forgotten the old session and not yet kept the new one.
+        await settled()
         guard let record = store.load() else { throw GameTokenError.noSession }
 
         var renewed: RenewedSession?
@@ -207,11 +215,12 @@ extension PasskeySessions {
 
     /// Signs the proof for one request to the game server.
     func gameRequestProof(for token: GameToken, method: String, url: URL, body: Data?) async throws -> GameRequestProof {
-        let method = method.uppercased()
         guard GameTokenMessage.isOneLine(token.audience),
               !method.isEmpty, method.allSatisfy({ $0.isASCII && $0.isLetter }),
-              let target = GameTokenMessage.target(of: url), GameTokenMessage.isOneLine(target)
+              let target = GameTokenMessage.target(of: url), target.hasPrefix("/"), GameTokenMessage.isOneLine(target)
         else { throw GameTokenError.invalidRequest }
+        let method = method.uppercased()
+        await settled()
         guard let record = store.load(), let key = try? keys.restore(record.deviceKey) else {
             throw GameTokenError.noSession
         }
@@ -227,7 +236,8 @@ extension PasskeySessions {
     /// was last renewed (kept by an earlier release) is not renewed early.
     private func isDueForRenewal(_ record: PasskeySessionRecord) -> Bool {
         guard let renewedAt = record.renewedAt else { return false }
-        let idleTimeout = record.idleTimeoutSeconds.map(TimeInterval.init) ?? Self.defaultIdleTimeout
+        let stated = record.idleTimeoutSeconds.map(TimeInterval.init) ?? Self.defaultIdleTimeout
+        let idleTimeout = stated > 0 ? stated : Self.defaultIdleTimeout
         return now().timeIntervalSince(renewedAt) >= idleTimeout / 2
     }
 
@@ -264,7 +274,7 @@ extension PasskeySessions {
             }
             if let serverTime = reply?.serverTime { keepIdentityClock(serverTime) }
             // identity's `expiresAt` is on its own clock; the app compares the expiry with this device's.
-            let expiry = Date(timeIntervalSince1970: TimeInterval(expiresAt - identityClockOffset))
+            let expiry = Date(timeIntervalSince1970: TimeInterval(expiresAt) - TimeInterval(identityClockOffset))
             return .minted(token: token, expiresAt: expiry, onlinePlay: onlinePlay)
         case 400:
             switch reply?.error {
@@ -300,8 +310,12 @@ extension PasskeySessions {
         Int64(now().timeIntervalSince1970.rounded(.down))
     }
 
+    /// Keeps the offset to identity's clock. A time further from this device's than any real clock error
+    /// is not believed, so no number identity sends can overflow the arithmetic here.
     private func keepIdentityClock(_ serverTime: Int64) {
-        identityClockOffset = serverTime - deviceTime()
+        let (offset, overflow) = serverTime.subtractingReportingOverflow(deviceTime())
+        guard !overflow, offset.magnitude <= Self.maxClockOffset else { return }
+        identityClockOffset = offset
     }
 
     private static func gameTokenError(_ error: PasskeySessionError) -> GameTokenError {
