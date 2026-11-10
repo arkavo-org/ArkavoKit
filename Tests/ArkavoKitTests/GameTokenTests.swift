@@ -439,12 +439,130 @@ final class GameTokenTests: XCTestCase {
         XCTAssertNil(token.renewedSession)
     }
 
+    // MARK: - An early renewal whose answer cannot be read
+
+    /// The mint did not need that renewal. Its credential may have rotated at identity, so it is marked
+    /// spent and the session is kept: the mint and the proofs need only the session id and the device key.
+    func testAnEarlyRenewalWhoseAnswerIsLostKeepsTheSessionAndStillMints() async throws {
+        let unread: [ScriptedHTTP.Outcome] = [
+            .failure(URLError(.timedOut)),
+            .status(418, ""),
+            .status(200, "not json"),
+            .status(401, #"{"error":"something_else"}"#),
+        ]
+        for outcome in unread {
+            let key = installSession(renewedAgo: 3000)
+            let http = ScriptedHTTP([outcome, .status(200, Self.minted)])
+
+            let token = try await sessions.gameToken(audience: Self.audience, via: endpoint(http))
+
+            XCTAssertEqual(http.requests.map(\.url?.path), ["/session/refresh", "/game/token"])
+            XCTAssertEqual(token.token, "Z2FtZS10b2tlbg")
+            XCTAssertNil(token.renewedSession)
+            XCTAssertEqual(store.record?.credential, "1.Zmlyc3Q")
+            XCTAssertEqual(store.record?.credentialSpent, true)
+            // The session still signs.
+            let proof = try await sessions.gameRequestProof(
+                for: token, method: "GET", url: URL(string: "https://game.example/v1/war")!, body: nil
+            )
+            XCTAssertTrue(Self.verifies(proof.signature, by: key.publicKey, over: GameTokenMessage.request(
+                audience: Self.audience, method: "GET", target: "/v1/war", t: proof.timestamp, body: Data(), token: token.token
+            )))
+        }
+    }
+
+    /// An early renewal that never left the device spent nothing.
+    func testAnEarlyRenewalThatWasNotSentSpendsNothing() async throws {
+        installSession(renewedAgo: 3000)
+        let before = store.record
+        let http = ScriptedHTTP([.failure(URLError(.notConnectedToInternet)), .status(200, Self.minted)])
+
+        _ = try await sessions.gameToken(audience: Self.audience, via: endpoint(http))
+
+        XCTAssertEqual(store.record, before)
+    }
+
+    /// identity may have rotated a spent credential: presenting it again would read as a stolen one.
+    func testASpentCredentialIsNotPresentedByALaterMint() async throws {
+        installSession(renewedAgo: 3000)
+        store.record?.credentialSpent = true
+        let http = ScriptedHTTP([.status(200, Self.minted)])
+
+        _ = try await sessions.gameToken(audience: Self.audience, via: endpoint(http))
+
+        XCTAssertEqual(http.requests.map(\.url?.path), ["/game/token"], "no early renewal")
+        XCTAssertNotNil(store.record)
+    }
+
+    /// The session ends when identity refuses the mint, and without the spent credential being sent.
+    func testWithASpentCredentialA401EndsTheSessionWithoutARenewalRequest() async {
+        installSession()
+        store.record?.credentialSpent = true
+        let http = ScriptedHTTP([.status(401, #"{"error":"unauthorized"}"#)])
+
+        await assertMint(throws: .sessionEnded(.responseLost), via: http)
+
+        XCTAssertEqual(http.requests.map(\.url?.path), ["/game/token"])
+        XCTAssertNil(store.record)
+    }
+
+    func testRenewingWithASpentCredentialEndsTheSessionAndSendsNothing() async {
+        installSession()
+        store.record?.credentialSpent = true
+        let http = ScriptedHTTP([.status(200, Self.renewed)])
+
+        do {
+            _ = try await sessions.renew(via: endpoint(http))
+            XCTFail("expected sessionEnded(responseLost)")
+        } catch {
+            XCTAssertEqual(error as? PasskeySessionError, .sessionEnded(.responseLost))
+        }
+
+        XCTAssertTrue(http.requests.isEmpty)
+        XCTAssertNil(store.record)
+    }
+
+    /// What identity says ends the session ends it, early renewal or not.
+    func testAnEarlyRenewalIdentityRefusesWithAnUnknownReasonEndsTheSession() async {
+        installSession(renewedAgo: 3000)
+        let http = ScriptedHTTP([.status(401, #"{"error":"session_ended","reason":"a_new_reason"}"#)])
+
+        await assertMint(throws: .sessionEnded(.unexpectedResponse), via: http)
+
+        XCTAssertNil(store.record)
+    }
+
+    /// A renewal the app asks for while an early one is in flight does not share it: it runs after,
+    /// with the credential the early one left, so no credential is ever sent twice.
+    func testARenewalTheAppAsksForRunsAfterAnEarlyOneInFlight() async throws {
+        installSession()
+        let early = GatedHTTP(answer: (200, Self.renewed))
+        let earlyEndpoint = PasskeySessionEndpoint(identity: Self.identity, send: early.perform)
+        let first = Task { try await sessions.renew(via: earlyEndpoint, keepingSessionOnUnreadAnswer: true) }
+        await early.gate.waitUntilHolding()
+
+        let http = ScriptedHTTP([.status(200,
+            #"{"token":"third-token","expiresAt":1794269700,"credential":"3.dGhpcmQ","sessionExpiresAt":1794355200}"#)])
+        let second = Task { try await sessions.renew(via: endpoint(http)) }
+        await Task.yield()
+        XCTAssertTrue(http.requests.isEmpty, "queued behind the early renewal")
+        early.gate.open()
+
+        let firstRenewal = try await first.value
+        let secondRenewal = try await second.value
+        XCTAssertEqual(firstRenewal.token, "renewed-token")
+        XCTAssertEqual(secondRenewal.token, "third-token")
+        XCTAssertEqual(Self.body(of: http.requests[0])["credential"] as? String, "2.c2Vjb25k")
+        XCTAssertEqual(store.record?.credential, "3.dGhpcmQ")
+    }
+
     /// A record kept by an earlier release says nothing of its last renewal: no early renewal.
     func testARecordFromBeforeThisReleaseDecodesAndMints() async throws {
         let stored = #"{"sessionId":"0f0e0d0c-0b0a-8908-8706-050403020100","credential":"1.Zmlyc3Q","deviceKey":"AAEC","account":"a"}"#
         let record = try JSONDecoder().decode(PasskeySessionRecord.self, from: Data(stored.utf8))
         XCTAssertNil(record.renewedAt)
         XCTAssertNil(record.idleTimeoutSeconds)
+        XCTAssertNil(record.credentialSpent)
 
         installSession(renewedAgo: nil)
         let http = ScriptedHTTP([.status(200, Self.minted)])

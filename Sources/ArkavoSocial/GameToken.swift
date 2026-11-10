@@ -94,10 +94,14 @@ extension ArkavoClient {
     /// never on a background timer. A mint can be repeated: a lost mint answer costs nothing.
     ///
     /// The mint does not keep the session alive, so this renews the session first when it has not been
-    /// renewed for half its idle limit, and once more when identity answers 401. A renewal keeps its own
-    /// rule: one whose answer is lost ends the session (`.sessionEnded(.responseLost)`). Its auth token
+    /// renewed for half its idle limit, and once more when identity answers 401. A renewal's auth token
     /// comes back in `renewedSession`; when the mint throws after a renewal that token is not returned,
     /// and `renewSession()` gives another when one is needed.
+    ///
+    /// The early renewal never costs the session by itself. When its answer is lost the session is kept
+    /// and goes on signing, but its credential is spent: it is not presented again, so the session ends
+    /// (`.sessionEnded(.responseLost)`) when identity next answers a mint with 401, or at the app's next
+    /// `renewSession()`. The renewal a 401 asks for keeps the renewal's rule: a lost answer ends the session.
     ///
     /// No token is kept here. Near the session's deadline a new token can expire in under a minute: do
     /// not mint again when the token just received expires no later than the one before it.
@@ -183,12 +187,14 @@ extension PasskeySessions {
         var renewed: RenewedSession?
         if isDueForRenewal(record) {
             do {
-                renewed = try await renew(via: endpoint)
+                // Nothing asked for this renewal yet, so an answer that cannot be read must not cost the
+                // session: it is kept, with its credential spent, and the mint goes on.
+                renewed = try await renew(via: endpoint, keepingSessionOnUnreadAnswer: true)
             } catch let error as PasskeySessionError {
                 // identity failing leaves the session as it was: the mint may still succeed.
                 if error != .serverFailure { throw Self.gameTokenError(error) }
             } catch {
-                // Not sent, or not signed: the mint below meets the same and reports it.
+                // Not sent, not signed, or answered unreadably: the session is kept and the mint goes on.
             }
         }
 
@@ -235,7 +241,8 @@ extension PasskeySessions {
     /// Whether the session has gone unused for half its idle limit. A record that does not say when it
     /// was last renewed (kept by an earlier release) is not renewed early.
     private func isDueForRenewal(_ record: PasskeySessionRecord) -> Bool {
-        guard let renewedAt = record.renewedAt else { return false }
+        // A spent credential is never presented: renewing would only end the session.
+        guard record.credentialSpent != true, let renewedAt = record.renewedAt else { return false }
         let stated = record.idleTimeoutSeconds.map(TimeInterval.init) ?? Self.defaultIdleTimeout
         let idleTimeout = stated > 0 ? stated : Self.defaultIdleTimeout
         return now().timeIntervalSince(renewedAt) >= idleTimeout / 2

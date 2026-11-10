@@ -130,7 +130,13 @@ struct PasskeySessionRecord: Codable, Equatable, Sendable {
     var renewedAt: Date? = nil
     /// identity's idle limit for the session, as its open stated it.
     var idleTimeoutSeconds: Int? = nil
+    /// true once a renewal carrying `credential` was sent and its answer could not be read. identity may
+    /// have rotated it, so it is never presented again: the next renewal ends the session without sending.
+    var credentialSpent: Bool? = nil
 }
+
+/// An early renewal's answer could not be read. The session is kept, with its credential marked spent.
+struct UnreadRenewalAnswer: Error {}
 
 @MainActor
 protocol PasskeySessionStore {
@@ -225,7 +231,8 @@ final class PasskeySessions {
     /// The last operation queued; the next one starts after it.
     private var last: Task<Void, Never>?
     /// The renewal queued or running, which later callers share.
-    private var renewal: Task<RenewedSession, Error>?
+    private var renewal: (id: Int, task: Task<RenewedSession, Error>, keepsSession: Bool)?
+    private var renewalCount = 0
 
     /// Open and sign-out answers bound how long a sign-in or sign-out waits.
     private static let shortTimeout: TimeInterval = 15
@@ -319,24 +326,38 @@ final class PasskeySessions {
     /// Trades the session's credential for a fresh token, and keeps the next
     /// credential before returning. Writes no token.
     ///
+    /// An answer that cannot be read (lost, or one the contract does not describe) ends the session,
+    /// because the credential may have rotated. With `keepingSessionOnUnreadAnswer`, for a renewal nothing
+    /// asked for yet (a game-token mint's early one), the session is kept instead with its credential
+    /// marked spent, and `UnreadRenewalAnswer` is thrown: the session still signs, and the next renewal
+    /// ends it without presenting that credential.
+    ///
     /// - Throws: `PasskeySessionError`; or, with the session unchanged, the
     ///   `URLError` of a request that never left the device, or the device
     ///   key's signing error.
-    func renew(via endpoint: PasskeySessionEndpoint) async throws -> RenewedSession {
-        if let renewal { return try await renewal.value }
+    func renew(via endpoint: PasskeySessionEndpoint, keepingSessionOnUnreadAnswer keepsSession: Bool = false) async throws -> RenewedSession {
+        // A renewal that must end the session on an unread answer never shares one that would keep it:
+        // it runs after, with whatever credential that one left.
+        if let renewal, keepsSession || !renewal.keepsSession { return try await renewal.task.value }
         let previous = last
+        renewalCount += 1
+        let id = renewalCount
         let task = Task { @MainActor in
             await previous?.value
-            defer { self.renewal = nil }
-            return try await self.performRenewal(via: endpoint)
+            defer { if self.renewal?.id == id { self.renewal = nil } }
+            return try await self.performRenewal(via: endpoint, keepsSession: keepsSession)
         }
-        renewal = task
+        renewal = (id, task, keepsSession)
         last = Task { _ = try? await task.value }
         return try await task.value
     }
 
-    private func performRenewal(via endpoint: PasskeySessionEndpoint) async throws -> RenewedSession {
+    private func performRenewal(via endpoint: PasskeySessionEndpoint, keepsSession: Bool) async throws -> RenewedSession {
         guard var record = store.load() else { throw PasskeySessionError.noSession }
+        if record.credentialSpent == true {
+            // An earlier renewal's answer was never read: this credential is not presented again.
+            throw ended(.responseLost)
+        }
         guard let key = try? keys.restore(record.deviceKey) else {
             print("PasskeySessions.renew: the device key no longer loads; session forgotten")
             store.delete()
@@ -358,13 +379,13 @@ final class PasskeySessions {
             print("PasskeySessions.renew: not sent (\(error.code.rawValue)); session kept")
             throw error
         } catch {
-            throw ended(.responseLost)
+            throw unread(.responseLost, record, keepsSession: keepsSession)
         }
 
         switch status {
         case 200:
             guard let reply = try? JSONDecoder().decode(RefreshReply.self, from: data) else {
-                throw ended(.unexpectedResponse)
+                throw unread(.unexpectedResponse, record, keepsSession: keepsSession)
             }
             record.credential = reply.credential
             record.renewedAt = now()
@@ -384,7 +405,7 @@ final class PasskeySessions {
         case 401:
             let refusal = try? JSONDecoder().decode(Refusal.self, from: data)
             guard refusal?.error == "session_ended", let wire = refusal?.reason else {
-                throw ended(.unexpectedResponse)
+                throw unread(.unexpectedResponse, record, keepsSession: keepsSession)
             }
             throw ended(SessionEndReason(rawValue: wire).flatMap(Self.serverReason) ?? .unexpectedResponse)
         case 500, 503:
@@ -392,8 +413,23 @@ final class PasskeySessions {
             throw PasskeySessionError.serverFailure
         default:
             print("PasskeySessions.renew: status=\(status)")
-            throw ended(.unexpectedResponse)
+            throw unread(.unexpectedResponse, record, keepsSession: keepsSession)
         }
+    }
+
+    /// A renewal was sent and its answer could not be read. Ends the session, or for a renewal that keeps
+    /// it, marks the credential spent; when that cannot be saved the session ends after all.
+    private func unread(_ reason: SessionEndReason, _ record: PasskeySessionRecord, keepsSession: Bool) -> Error {
+        guard keepsSession else { return ended(reason) }
+        var spent = record
+        spent.credentialSpent = true
+        do {
+            try store.save(spent)
+        } catch {
+            return ended(reason)
+        }
+        print("PasskeySessions.renew: answer unread (\(reason.rawValue)); session kept, credential spent")
+        return UnreadRenewalAnswer()
     }
 
     /// Forgets the session and returns the error that says why.
