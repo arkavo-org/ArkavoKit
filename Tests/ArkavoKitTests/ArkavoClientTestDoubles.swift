@@ -43,6 +43,7 @@ final class FakeCredentialStore: AccountCredentialStore {
 final class ScriptedHTTP {
     enum Outcome {
         case status(Int, String)
+        case answer(Int, String, headers: [String: String])
         case failure(Error)
     }
 
@@ -61,6 +62,9 @@ final class ScriptedHTTP {
         switch outcomes.removeFirst() {
         case let .status(code, body):
             let response = HTTPURLResponse(url: request.url!, statusCode: code, httpVersion: "HTTP/1.1", headerFields: nil)!
+            return (Data(body.utf8), response)
+        case let .answer(code, body, headers):
+            let response = HTTPURLResponse(url: request.url!, statusCode: code, httpVersion: "HTTP/1.1", headerFields: headers)!
             return (Data(body.utf8), response)
         case let .failure(error):
             throw error

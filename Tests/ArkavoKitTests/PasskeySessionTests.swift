@@ -21,11 +21,12 @@ final class PasskeySessionTests: XCTestCase {
     private var store: InMemorySessionStore!
     private var keys: SoftwareSessionKeys!
     private var sessions: PasskeySessions!
+    private let clock = TestClock(Date(timeIntervalSince1970: 1_790_000_000))
 
     override func setUp() async throws {
         store = InMemorySessionStore()
         keys = SoftwareSessionKeys()
-        sessions = PasskeySessions(store: store, keys: keys)
+        sessions = PasskeySessions(store: store, keys: keys, now: clock.read)
     }
 
     private func endpoint(_ http: ScriptedHTTP) -> PasskeySessionEndpoint {
@@ -163,7 +164,9 @@ final class PasskeySessionTests: XCTestCase {
             sessionId: Self.sessionID,
             credential: "1.Zmlyc3Q",
             deviceKey: deviceKey.rawRepresentation,
-            account: Self.sub
+            account: Self.sub,
+            renewedAt: clock.now,
+            idleTimeoutSeconds: 3960
         ))
     }
 
