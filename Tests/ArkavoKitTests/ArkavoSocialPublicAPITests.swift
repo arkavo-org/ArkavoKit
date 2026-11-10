@@ -138,6 +138,34 @@ final class ArkavoSocialPublicAPITests: XCTestCase {
         }
     }
 
+    /// The purchase path: the account StoreKit's appAccountToken names, and the transaction's submit.
+    @MainActor
+    func testThePurchaseCallsArePublicAndFakeable() async throws {
+        // Compile-time shape checks: ArkavoClient is the real provider of both.
+        let _: any AppStoreTransactionSubmitting.Type = ArkavoClient.self
+        let _: any SessionAccountProviding.Type = ArkavoClient.self
+        let _: (String) -> UUID? = ArkavoClient.account(ofAuthToken:)
+
+        let fake = FakePurchases()
+        let submitter: any AppStoreTransactionSubmitting = fake
+        let accounts: any SessionAccountProviding = fake
+        let offMain: @Sendable () async throws -> AppStoreTransactionStatus = { try await submitter.submitAppStoreTransaction("jws") }
+        _ = offMain
+        let status = try await submitter.submitAppStoreTransaction("jws")
+        XCTAssertTrue(status.active)
+        XCTAssertEqual(status.expiresAt, Date(timeIntervalSince1970: 9))
+        XCTAssertEqual([status.environment, status.entitlement], ["Sandbox", "e"])
+        XCTAssertFalse(status.tokenCanPublish)
+        let account = await accounts.sessionAccount()
+        XCTAssertNotNil(account)
+
+        let errors: [AppStoreTransactionError] = [
+            .unauthorized, .anotherAccount, .subscriptionElsewhere, .invalidTransaction, .unavailable, .serverFailure,
+            .unexpectedResponse(status: 418),
+        ]
+        XCTAssertEqual(Set(errors.map { "\($0)" }).count, errors.count)
+    }
+
     /// A game keeps one file that imports ArkavoSocial and fakes the rest behind `GameTokenProviding`.
     @MainActor
     func testGameTokenIsPublicAndFakeable() async throws {
@@ -175,6 +203,17 @@ final class ArkavoSocialPublicAPITests: XCTestCase {
         guard case .rateLimited(let retryAfter) = errors[5] else { return XCTFail("rateLimited carries its wait") }
         XCTAssertEqual(retryAfter, 7)
     }
+}
+
+/// What a game's tests put in place of `ArkavoClient` for a purchase.
+@MainActor
+private struct FakePurchases: AppStoreTransactionSubmitting, SessionAccountProviding {
+    func submitAppStoreTransaction(_: String) async throws -> AppStoreTransactionStatus {
+        AppStoreTransactionStatus(active: true, expiresAt: Date(timeIntervalSince1970: 9), environment: "Sandbox",
+                                  entitlement: "e", tokenCanPublish: false)
+    }
+
+    func sessionAccount() async -> UUID? { UUID(uuidString: "3F2504E0-4F89-41D3-9A0C-0305E82C3301") }
 }
 
 /// What a game's tests put in place of `ArkavoClient`.
