@@ -126,6 +126,10 @@ struct PasskeySessionRecord: Codable, Equatable, Sendable {
     var deviceKey: Data
     /// The `sub` of the token that opened the session.
     var account: String
+    /// When the session was opened or last renewed, by this device's clock. nil in a record an earlier release kept.
+    var renewedAt: Date? = nil
+    /// identity's idle limit for the session, as its open stated it.
+    var idleTimeoutSeconds: Int? = nil
 }
 
 @MainActor
@@ -212,8 +216,12 @@ struct KeychainPasskeySessionStore: PasskeySessionStore {
 final class PasskeySessions {
     static let shared = PasskeySessions(store: KeychainPasskeySessionStore(), keys: SecureEnclaveSessionKeys())
 
-    private let store: any PasskeySessionStore
-    private let keys: any SessionKeyFactory
+    let store: any PasskeySessionStore
+    let keys: any SessionKeyFactory
+    /// This device's clock.
+    let now: @MainActor () -> Date
+    /// identity's clock minus this device's, in seconds, from the last game-token answer that told it.
+    var identityClockOffset: Int64 = 0
     /// The last operation queued; the next one starts after it.
     private var last: Task<Void, Never>?
     /// The renewal queued or running, which later callers share.
@@ -222,9 +230,10 @@ final class PasskeySessions {
     /// Open and sign-out answers bound how long a sign-in or sign-out waits.
     private static let shortTimeout: TimeInterval = 15
 
-    init(store: any PasskeySessionStore, keys: any SessionKeyFactory) {
+    init(store: any PasskeySessionStore, keys: any SessionKeyFactory, now: @escaping @MainActor () -> Date = { Date() }) {
         self.store = store
         self.keys = keys
+        self.now = now
     }
 
     /// Runs `operation` after every operation queued before it.
@@ -287,7 +296,9 @@ final class PasskeySessions {
                 sessionId: sessionId,
                 credential: opened.credential,
                 deviceKey: key.persistentForm,
-                account: claims.sub
+                account: claims.sub,
+                renewedAt: now(),
+                idleTimeoutSeconds: opened.idleTimeoutSeconds
             ))
         } catch {
             print("PasskeySessions.open: the session could not be kept: \(Self.describe(error))")
@@ -350,6 +361,7 @@ final class PasskeySessions {
                 throw ended(.unexpectedResponse)
             }
             record.credential = reply.credential
+            record.renewedAt = now()
             do {
                 try store.save(record)
             } catch {
@@ -457,6 +469,7 @@ final class PasskeySessions {
     private struct OpenReply: Decodable {
         let sessionId: String
         let credential: String
+        let idleTimeoutSeconds: Int?
     }
 
     private struct RefreshReply: Decodable {

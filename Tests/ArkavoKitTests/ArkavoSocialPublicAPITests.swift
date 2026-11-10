@@ -137,6 +137,56 @@ final class ArkavoSocialPublicAPITests: XCTestCase {
             XCTAssertNotNil(error as any Error)
         }
     }
+
+    /// A game keeps one file that imports ArkavoSocial and fakes the rest behind `GameTokenProviding`.
+    @MainActor
+    func testGameTokenIsPublicAndFakeable() async throws {
+        // Compile-time shape check: ArkavoClient is the real provider.
+        let _: any GameTokenProviding.Type = ArkavoClient.self
+
+        let provider: any GameTokenProviding = FakeGameTokens()
+        // A game's networking is not on the main actor: the provider crosses to it.
+        let offMain: @Sendable () async throws -> GameToken = { try await provider.gameToken(audience: "a") }
+        _ = offMain
+        let token = try await provider.gameToken(audience: "https://game.example")
+        XCTAssertEqual(token.token, "fake")
+        XCTAssertEqual(token.audience, "https://game.example")
+        XCTAssertEqual(token.expiresAt, Date(timeIntervalSince1970: 900))
+        XCTAssertTrue(token.onlinePlay)
+        XCTAssertNil(token.renewedSession)
+
+        let proof = try await provider.gameRequestProof(
+            for: token, method: "GET", url: URL(string: "https://game.example/v1/war")!, body: nil
+        )
+        XCTAssertEqual(proof, GameRequestProof(token: "fake", timestamp: 1, signature: "sig"))
+        XCTAssertEqual([proof.token, proof.signature], ["fake", "sig"])
+        XCTAssertEqual(proof.timestamp, 1)
+
+        let renewed = RenewedSession(token: "t", expiresAt: Date(timeIntervalSince1970: 1), sessionExpiresAt: Date(timeIntervalSince1970: 2))
+        let withRenewal = GameToken(token: "g", audience: "a", expiresAt: Date(timeIntervalSince1970: 3), onlinePlay: false, renewedSession: renewed)
+        XCTAssertEqual(withRenewal.renewedSession, renewed)
+
+        // An app tells "sign in again" from "try later" without @testable access.
+        let errors: [GameTokenError] = [
+            .noSession, .sessionEnded(.idle), .unauthorized, .invalidAudience, .clockRejected,
+            .rateLimited(retryAfter: 7), .unavailable, .serverFailure, .unexpectedResponse(status: 418), .invalidRequest,
+        ]
+        XCTAssertEqual(Set(errors.map { "\($0)" }).count, errors.count)
+        guard case .rateLimited(let retryAfter) = errors[5] else { return XCTFail("rateLimited carries its wait") }
+        XCTAssertEqual(retryAfter, 7)
+    }
+}
+
+/// What a game's tests put in place of `ArkavoClient`.
+@MainActor
+private struct FakeGameTokens: GameTokenProviding {
+    func gameToken(audience: String) async throws -> GameToken {
+        GameToken(token: "fake", audience: audience, expiresAt: Date(timeIntervalSince1970: 900), onlinePlay: true)
+    }
+
+    func gameRequestProof(for token: GameToken, method _: String, url _: URL, body _: Data?) async throws -> GameRequestProof {
+        GameRequestProof(token: token.token, timestamp: 1, signature: "sig")
+    }
 }
 
 /// The shape Creator's `ArkavoAuthState` declares (design sub-project C).

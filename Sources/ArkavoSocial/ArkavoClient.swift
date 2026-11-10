@@ -2051,6 +2051,9 @@ extension ArkavoClient: ASAuthorizationControllerPresentationContextProviding {
     }
 }
 
+/// The game-token calls are in GameToken.swift.
+extension ArkavoClient: GameTokenProviding {}
+
 // MARK: - DID Key Management Extension
 
 public extension ArkavoClient {
