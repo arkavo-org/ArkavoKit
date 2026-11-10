@@ -2054,6 +2054,9 @@ extension ArkavoClient: ASAuthorizationControllerPresentationContextProviding {
 /// The game-token calls are in GameToken.swift.
 extension ArkavoClient: GameTokenProviding {}
 
+/// The purchase calls are in AppStoreTransaction.swift.
+extension ArkavoClient: AppStoreTransactionSubmitting, SessionAccountProviding {}
+
 // MARK: - DID Key Management Extension
 
 public extension ArkavoClient {
