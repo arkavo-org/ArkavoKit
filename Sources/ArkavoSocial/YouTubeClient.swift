@@ -699,6 +699,18 @@ public actor YouTubeClient: ObservableObject {
 
     /// Fetches live chat messages using OAuth token (not API key)
     public func fetchLiveChatMessages(liveChatId: String, pageToken: String?) async throws -> YouTubeLiveChatResult {
+        let data = try await fetchLiveChatData(liveChatId: liveChatId, pageToken: pageToken)
+        let chatResponse = try JSONDecoder().decode(YouTubeLiveChatResponse.self, from: data)
+        return YouTubeLiveChatResult(
+            messages: chatResponse.items,
+            nextPageToken: chatResponse.nextPageToken,
+            pollingIntervalMs: chatResponse.pollingIntervalMillis
+        )
+    }
+
+    /// Fetches the unmodified live-chat page, including moderation events without display content.
+    /// Consumers can decode optional service fields while preserving the client's OAuth refresh.
+    public func fetchLiveChatData(liveChatId: String, pageToken: String?) async throws -> Data {
         var urlComponents = URLComponents(string: "https://www.googleapis.com/youtube/v3/liveChat/messages")!
         urlComponents.queryItems = [
             URLQueryItem(name: "liveChatId", value: liveChatId),
@@ -715,12 +727,7 @@ public actor YouTubeClient: ObservableObject {
             throw YouTubeError.httpError(statusCode: (response as? HTTPURLResponse)?.statusCode ?? 0)
         }
 
-        let chatResponse = try JSONDecoder().decode(YouTubeLiveChatResponse.self, from: data)
-        return YouTubeLiveChatResult(
-            messages: chatResponse.items,
-            nextPageToken: chatResponse.nextPageToken,
-            pollingIntervalMs: chatResponse.pollingIntervalMillis
-        )
+        return data
     }
 
     /// Creates a live stream and returns its ID (not just the stream key)
