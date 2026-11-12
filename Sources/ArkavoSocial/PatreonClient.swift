@@ -124,6 +124,36 @@ public struct PatreonClient: Sendable {
         }
     }
 
+    // MARK: Unlink
+
+    /// Removes identity's link between the signed-in Arkavo account and its
+    /// Patreon account, and the Patreon tokens identity holds for it
+    /// (`DELETE /oauth/patreon/link`). Returning means nothing is linked any
+    /// more, including when nothing was.
+    ///
+    /// The session token held now still carries the membership: renew it or
+    /// sign in again to see the change. Patreon has no revocation endpoint, so
+    /// the authorization listed at Patreon stays until the person removes it there.
+    ///
+    /// - Throws: `PatreonUnlinkError`, chosen by status alone; or the transport's error.
+    public func unlink() async throws {
+        guard let token = token(), !token.isEmpty else { throw PatreonUnlinkError.signInRequired }
+        var request = URLRequest(url: identity.appendingPathComponent("oauth/patreon/link"))
+        request.httpMethod = "DELETE"
+        request.httpShouldHandleCookies = false
+        request.setValue(token, forHTTPHeaderField: "X-Auth-Token")
+
+        let (_, response) = try await send(request)
+        switch (response as? HTTPURLResponse)?.statusCode ?? 0 {
+        case 204: return
+        case 401: throw PatreonUnlinkError.signInRequired
+        case 404, 405: throw PatreonUnlinkError.unavailable
+        case 500: throw PatreonUnlinkError.serverFailure
+        case 503: throw PatreonUnlinkError.notConfigured
+        default: throw PatreonUnlinkError.unexpectedResponse
+        }
+    }
+
     private struct LinkReply: Decodable {
         let patreonUserID: String
         let role: String
@@ -223,6 +253,20 @@ public enum PatreonLinkError: Error, Sendable, Equatable {
     /// 500: identity failed.
     case serverFailure
     /// Any other status, or a 200 that is not a link.
+    case unexpectedResponse
+}
+
+/// Why identity did not unlink, by status.
+public enum PatreonUnlinkError: Error, Sendable, Equatable {
+    /// 401, or no session token: sign in again.
+    case signInRequired
+    /// 503: this deployment has no Patreon.
+    case notConfigured
+    /// 500: identity failed partway. The link still counts; trying again finishes it.
+    case serverFailure
+    /// 404 or 405: this identity has no unlink route.
+    case unavailable
+    /// Any other status.
     case unexpectedResponse
 }
 

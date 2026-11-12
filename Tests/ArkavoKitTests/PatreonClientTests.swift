@@ -194,6 +194,59 @@ final class PatreonClientTests: XCTestCase {
         }
     }
 
+    // MARK: - Unlink
+
+    func testUnlinkSendsABodilessDeleteToIdentityWithTheSessionToken() async throws {
+        let transport = Transport([.success((204, ""))])
+        try await client(transport).unlink()
+
+        let request = try XCTUnwrap(transport.requests.first)
+        XCTAssertEqual(transport.requests.count, 1)
+        XCTAssertEqual(request.httpMethod, "DELETE")
+        XCTAssertEqual(request.url?.absoluteString, "https://identity.example.test/oauth/patreon/link")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "X-Auth-Token"), Self.token)
+        XCTAssertNil(request.httpBody)
+        XCTAssertFalse(request.httpShouldHandleCookies)
+    }
+
+    func testUnlinkWithoutASessionTokenSendsNothing() async {
+        for token in [nil, ""] as [String?] {
+            let transport = Transport([.success((204, ""))])
+            do {
+                try await client(transport, token: token).unlink()
+                XCTFail("expected signInRequired")
+            } catch {
+                XCTAssertEqual(error as? PatreonUnlinkError, .signInRequired)
+            }
+            XCTAssertTrue(transport.requests.isEmpty)
+        }
+    }
+
+    func testEachUnlinkRefusalIsMappedByStatus() async {
+        let expected: [(Int, PatreonUnlinkError)] = [
+            (401, .signInRequired), (500, .serverFailure), (503, .notConfigured),
+            (404, .unavailable), (405, .unavailable), (200, .unexpectedResponse), (418, .unexpectedResponse),
+        ]
+        for (status, expectedError) in expected {
+            do {
+                // Identity's error bodies are plain text; only the status decides.
+                try await client(Transport([.success((status, "internal error"))])).unlink()
+                XCTFail("expected \(expectedError) for \(status)")
+            } catch {
+                XCTAssertEqual(error as? PatreonUnlinkError, expectedError, "\(status)")
+            }
+        }
+    }
+
+    func testAnUnlinkTransportErrorIsRethrown() async {
+        do {
+            try await client(Transport([.failure(URLError(.notConnectedToInternet))])).unlink()
+            XCTFail("expected the URLError")
+        } catch {
+            XCTAssertEqual((error as? URLError)?.code, .notConnectedToInternet)
+        }
+    }
+
     // MARK: - Membership from the token
 
     private func token(patreon: TestCBOR?) -> String {

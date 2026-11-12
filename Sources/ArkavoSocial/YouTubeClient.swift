@@ -118,6 +118,64 @@ public actor YouTubeClient: ObservableObject {
         }
     }
 
+    /// Signs out and withdraws the app's access at Google.
+    ///
+    /// The stored tokens and channel are removed first, so the sign-out holds
+    /// on this Mac whatever Google answers, online or not. The grant is then
+    /// revoked with the refresh token, or the access token when there is none.
+    ///
+    /// - Returns: what happened to the grant at Google. On `.failed` it may
+    ///   still stand there; the person can remove it in their Google Account.
+    @MainActor
+    @discardableResult
+    public func signOut() async -> YouTubeRevocation {
+        let stored = [KeychainKey.refreshToken, KeychainKey.accessToken]
+            .compactMap { KeychainManager.getValue(service: keychainServiceBase, account: $0) }
+            .first { !$0.isEmpty }
+
+        try? KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.accessToken)
+        try? KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.refreshToken)
+        try? KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.tokenExpiration)
+        try? KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.channelId)
+        isAuthenticated = false
+        channelInfo = nil
+
+        return await Self.revoke(token: stored) { try await URLSession.shared.data(for: $0) }
+    }
+
+    /// Google's OAuth 2.0 revocation request for one token. The token goes in
+    /// the form body, never in the URL.
+    static func revocationRequest(token: String) -> URLRequest {
+        var request = URLRequest(url: URL(string: "https://oauth2.googleapis.com/revoke")!)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        // Unreserved characters only: `+`, `/` and `=` occur in tokens and mean something in a form body.
+        let unreserved = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+        let encoded = token.addingPercentEncoding(withAllowedCharacters: unreserved) ?? ""
+        request.httpBody = Data("token=\(encoded)".utf8)
+        return request
+    }
+
+    /// Revokes `token` at Google. Revoking either token of a grant ends the grant.
+    static func revoke(
+        token: String?,
+        send: @Sendable (URLRequest) async throws -> (Data, URLResponse)
+    ) async -> YouTubeRevocation {
+        guard let token, !token.isEmpty else { return .nothingToRevoke }
+        guard let (data, response) = try? await send(revocationRequest(token: token)),
+              let status = (response as? HTTPURLResponse)?.statusCode
+        else { return .failed }
+        if status == 200 { return .revoked }
+        // A token Google no longer honors: expired, or the grant was already removed.
+        if status == 400,
+           let reply = try? JSONDecoder().decode(GoogleErrorResponse.self, from: data),
+           reply.error == "invalid_token"
+        {
+            return .nothingToRevoke
+        }
+        return .failed
+    }
+
     // MARK: - Authentication
 
     private func buildAuthURL(redirectUri: String, state: String) -> URL {
@@ -1204,6 +1262,16 @@ struct YouTubeChannelResponse: Codable {
 struct GoogleErrorResponse: Codable {
     let error: String
     let error_description: String?
+}
+
+/// What `YouTubeClient.signOut()` did about the grant at Google.
+public enum YouTubeRevocation: Sendable, Equatable {
+    /// Google revoked the grant.
+    case revoked
+    /// No token was stored, or Google no longer honors the stored one.
+    case nothingToRevoke
+    /// Google could not be reached or refused; the grant may still stand.
+    case failed
 }
 
 // Update YouTubeError to include Google-specific errors

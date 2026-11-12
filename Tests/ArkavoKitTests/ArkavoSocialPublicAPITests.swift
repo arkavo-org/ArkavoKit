@@ -80,6 +80,8 @@ final class ArkavoSocialPublicAPITests: XCTestCase {
         XCTAssertFalse(authorization.state.isEmpty)
         let _: (PatreonAuthorization, URL) throws -> String = { try $0.code(from: $1) }
         let _: (PatreonClient) async throws -> PatreonLink = { try await $0.link(code: "c", redirectURI: "r") }
+        let _: (PatreonClient) async throws -> Void = { try await $0.unlink() }
+        XCTAssertEqual(PatreonUnlinkError.unavailable, .unavailable)
         let _: () -> Void = { PatreonClient.removeLegacyTokens() }
 
         let source: any PatreonAccountSource = TokenPatreonAccountSource(token: { nil })
