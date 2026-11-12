@@ -123,15 +123,18 @@ public actor YouTubeClient: ObservableObject {
     /// The stored tokens and channel are removed first, so the sign-out holds
     /// on this Mac whatever Google answers, online or not. The grant is then
     /// revoked with the refresh token, or the access token when there is none.
+    /// Google revokes the grant for the whole project, so other devices signed
+    /// in to the same Google account with this app lose access too.
     ///
     /// - Returns: what happened to the grant at Google. On `.failed` it may
     ///   still stand there; the person can remove it in their Google Account.
     @MainActor
     @discardableResult
     public func signOut() async -> YouTubeRevocation {
-        let stored = [KeychainKey.refreshToken, KeychainKey.accessToken]
-            .compactMap { KeychainManager.getValue(service: keychainServiceBase, account: $0) }
-            .first { !$0.isEmpty }
+        // A sign-in Google answered without a refresh token stores an empty one.
+        let refreshToken = KeychainManager.getValue(service: keychainServiceBase, account: KeychainKey.refreshToken)
+            .flatMap { $0.isEmpty ? nil : $0 }
+        let accessToken = KeychainManager.getValue(service: keychainServiceBase, account: KeychainKey.accessToken)
 
         try? KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.accessToken)
         try? KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.refreshToken)
@@ -140,7 +143,9 @@ public actor YouTubeClient: ObservableObject {
         isAuthenticated = false
         channelInfo = nil
 
-        return await Self.revoke(token: stored) { try await URLSession.shared.data(for: $0) }
+        return await Self.revoke(token: refreshToken ?? accessToken, isRefreshToken: refreshToken != nil) {
+            try await URLSession.shared.data(for: $0)
+        }
     }
 
     /// Google's OAuth 2.0 revocation request for one token. The token goes in
@@ -157,8 +162,13 @@ public actor YouTubeClient: ObservableObject {
     }
 
     /// Revokes `token` at Google. Revoking either token of a grant ends the grant.
+    ///
+    /// - Parameter isRefreshToken: a refresh token Google calls invalid means the grant is
+    ///   gone. An access token it calls invalid may only have expired, with the grant still
+    ///   standing, so that is `.failed`.
     static func revoke(
         token: String?,
+        isRefreshToken: Bool,
         send: @Sendable (URLRequest) async throws -> (Data, URLResponse)
     ) async -> YouTubeRevocation {
         guard let token, !token.isEmpty else { return .nothingToRevoke }
@@ -166,8 +176,7 @@ public actor YouTubeClient: ObservableObject {
               let status = (response as? HTTPURLResponse)?.statusCode
         else { return .failed }
         if status == 200 { return .revoked }
-        // A token Google no longer honors: expired, or the grant was already removed.
-        if status == 400,
+        if status == 400, isRefreshToken,
            let reply = try? JSONDecoder().decode(GoogleErrorResponse.self, from: data),
            reply.error == "invalid_token"
         {
@@ -1268,9 +1277,10 @@ struct GoogleErrorResponse: Codable {
 public enum YouTubeRevocation: Sendable, Equatable {
     /// Google revoked the grant.
     case revoked
-    /// No token was stored, or Google no longer honors the stored one.
+    /// No token was stored, or Google no longer honors the stored refresh token.
     case nothingToRevoke
-    /// Google could not be reached or refused; the grant may still stand.
+    /// Google could not be reached or refused, or only an expired access token was
+    /// stored; the grant may still stand.
     case failed
 }
 

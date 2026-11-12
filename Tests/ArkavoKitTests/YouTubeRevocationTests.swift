@@ -26,13 +26,13 @@ final class YouTubeRevocationTests: XCTestCase {
     }
 
     func testA200IsRevoked() async {
-        let result = await YouTubeClient.revoke(token: "t", send: answer(200))
+        let result = await YouTubeClient.revoke(token: "t", isRefreshToken: true, send: answer(200))
         XCTAssertEqual(result, .revoked)
     }
 
     func testNoTokenSendsNothing() async {
         for token in [nil, ""] as [String?] {
-            let result = await YouTubeClient.revoke(token: token) { _ in
+            let result = await YouTubeClient.revoke(token: token, isRefreshToken: true) { _ in
                 XCTFail("nothing should be sent")
                 throw URLError(.badURL)
             }
@@ -40,17 +40,27 @@ final class YouTubeRevocationTests: XCTestCase {
         }
     }
 
-    func testATokenGoogleNoLongerHonorsIsNothingToRevoke() async {
-        let result = await YouTubeClient.revoke(token: "t", send: answer(400, #"{"error":"invalid_token"}"#))
+    func testARefreshTokenGoogleNoLongerHonorsIsNothingToRevoke() async {
+        let result = await YouTubeClient.revoke(
+            token: "t", isRefreshToken: true, send: answer(400, #"{"error":"invalid_token"}"#))
         XCTAssertEqual(result, .nothingToRevoke)
+    }
+
+    /// An access token can be invalid only because it expired; the grant may still stand.
+    func testAnInvalidAccessTokenIsFailedNotGone() async {
+        let result = await YouTubeClient.revoke(
+            token: "t", isRefreshToken: false, send: answer(400, #"{"error":"invalid_token"}"#))
+        XCTAssertEqual(result, .failed)
+        let revoked = await YouTubeClient.revoke(token: "t", isRefreshToken: false, send: answer(200))
+        XCTAssertEqual(revoked, .revoked)
     }
 
     func testAnyOtherAnswerOrATransportErrorIsFailed() async {
         for (status, body) in [(400, #"{"error":"invalid_request"}"#), (400, "not json"), (500, ""), (503, "")] {
-            let result = await YouTubeClient.revoke(token: "t", send: answer(status, body))
+            let result = await YouTubeClient.revoke(token: "t", isRefreshToken: true, send: answer(status, body))
             XCTAssertEqual(result, .failed, "\(status) \(body)")
         }
-        let offline = await YouTubeClient.revoke(token: "t") { _ in throw URLError(.notConnectedToInternet) }
+        let offline = await YouTubeClient.revoke(token: "t", isRefreshToken: true) { _ in throw URLError(.notConnectedToInternet) }
         XCTAssertEqual(offline, .failed)
     }
 }
