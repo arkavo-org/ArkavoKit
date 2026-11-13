@@ -196,8 +196,9 @@ public final class ArkavoClient: NSObject {
 
     public weak var delegate: ArkavoClientDelegate?
 
-    /// True while `deleteAccount(accountName:)` runs. `connect`, `registerUser`
-    /// and `linkAppleIdentity` refuse with `ArkavoError.invalidState` meanwhile.
+    /// True while `deleteAccount(accountName:)` runs. `connect`, `registerUser`,
+    /// `linkAppleIdentity` and `unlinkAppleIdentity` refuse with
+    /// `ArkavoError.invalidState` meanwhile.
     private(set) var isDeletingAccount = false
     private let presentationProvider: ASAuthorizationControllerPresentationContextProviding
     public var currentToken: String? {
@@ -2023,6 +2024,46 @@ public final class ArkavoClient: NSObject {
             throw AppleLinkError.conflict
         default:
             throw AppleLinkError.serverError(http.statusCode, body)
+        }
+    }
+
+    /// Removes every Apple ID linked to the signed-in Arkavo account
+    /// (`DELETE /oauth/apple/link`); identity first revokes with Apple any
+    /// token it holds for one. Returning means no Apple ID is linked any more,
+    /// including when none was. Only a 204 counts.
+    ///
+    /// Server side only: the Apple user ID stored on this device stays.
+    /// `AppleSignInService.unlinkAppleAccount(with:)` calls this, then removes it.
+    ///
+    /// - Throws: `ArkavoError.invalidState` while an account deletion runs;
+    ///   `AppleUnlinkError`, chosen by status alone; or the transport's error, unchanged.
+    public func unlinkAppleIdentity() async throws {
+        guard !isDeletingAccount else { throw ArkavoError.invalidState }
+        guard let cwt = credentialStore.authenticationToken(), !cwt.isEmpty else {
+            throw AppleUnlinkError.signInRequired
+        }
+
+        var request = URLRequest(url: authURL.appendingPathComponent("oauth/apple/link"))
+        request.httpMethod = "DELETE"
+        request.httpShouldHandleCookies = false
+        request.setValue(cwt, forHTTPHeaderField: "X-Auth-Token")
+
+        let (_, response) = try await httpData(request)
+        let http = response as? HTTPURLResponse
+        switch http?.statusCode ?? 0 {
+        case 204:
+            return
+        case 401:
+            throw AppleUnlinkError.signInRequired
+        case 429:
+            let seconds = http?.value(forHTTPHeaderField: "Retry-After").flatMap { Int($0) }
+            throw AppleUnlinkError.rateLimited(retryAfterSeconds: seconds.flatMap { $0 >= 0 ? $0 : nil } ?? 60)
+        case 500, 502:
+            throw AppleUnlinkError.serverFailure
+        case 404, 405:
+            throw AppleUnlinkError.unavailable
+        default:
+            throw AppleUnlinkError.unexpectedResponse
         }
     }
 }
