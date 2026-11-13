@@ -68,8 +68,8 @@ struct DroppedMediaTests {
         _ = try? await encoder.finishRecording()
 
         let dropped = await encoder.droppedMedia.video
-        // The repeated 3200 and the 1600 after it. A frame the writer wasn't ready for never
-        // reaches the order check, so the count is exact only when none were.
+        // The repeated 3200 and the 1600 after it. A frame the writer wasn't ready for isn't
+        // the previous frame for the order check, so the count is exact only when none were.
         #expect(dropped.notReady > 0 || dropped.outOfOrder == 2, "\(dropped)")
     }
 

@@ -22,7 +22,9 @@ struct DroppedMedia: Equatable, Sendable, CustomStringConvertible {
         var noInput = 0
         /// Audio whose timing couldn't be rewritten onto the file's timeline
         var retimeFailed = 0
-        /// The input wasn't ready for more: a real-time input that fell behind
+        /// The input wasn't ready for more: a real-time input that fell behind. Known only when
+        /// the append is tried, after the other checks, so a buffer dropped for one of those is
+        /// counted there instead
         var notReady = 0
         /// The input refused the buffer
         var rejected = 0
@@ -52,9 +54,9 @@ public actor VideoEncoder {
     // MARK: - Properties
 
     private var assetWriter: AVAssetWriter?
-    private var videoInput: AVAssetWriterInput?
-    private var audioInputs: [String: AVAssetWriterInput] = [:]  // sourceID -> audio input
-    private var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
+    /// The file's video track; nil for an audio-only recording
+    private var videoReceiver: AVAssetWriterInput.PixelBufferReceiver?
+    private var audioReceivers: [String: AVAssetWriterInput.SampleBufferReceiver] = [:]  // sourceID -> audio track
 
     // ArkavoMedia encoders for streaming
     private var streamVideoEncoder: ArkavoMedia.VideoEncoder?
@@ -73,6 +75,9 @@ public actor VideoEncoder {
     /// Each audio input's latest appended buffer, on the file's timeline. Forgotten at a resume,
     /// which moves the rest of the recording back to close the pause.
     private var lastAudioAppended: [String: (start: CMTime, end: CMTime)] = [:]
+    /// Whether the writer's session has started. It starts once per recording, so this stays true
+    /// even when the buffer that started it isn't taken; `startTime == nil` means the file's
+    /// timeline has no zero point yet.
     private var sessionStarted: Bool = false
     /// Whether the file got at least one video frame or audio sample
     private var appendedMedia: Bool = false
@@ -105,6 +110,8 @@ public actor VideoEncoder {
     private var streamsWithoutDestinationForTesting = false
     /// Tests: awaited once `finishRecording()` has begun, before the file is finished
     private var finishingHookForTesting: (@Sendable () async -> Void)?
+    /// Tests: what the next appends to the file get instead of the writer's answer, in order
+    private var refusalsForTesting: [RefusalForTesting] = []
 
     /// Whether any streaming (regular RTMP or NTDF) is active
     private var isStreaming: Bool { !streamDestinations.isEmpty || streamsWithoutDestinationForTesting }
@@ -247,35 +254,28 @@ public actor VideoEncoder {
                 ]
             ]
 
-            videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
-            videoInput?.expectsMediaDataInRealTime = true
-
-            // Setup pixel buffer adaptor
-            let pixelBufferAttributes: [String: Any] = [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-                kCVPixelBufferWidthKey as String: videoWidth,
-                kCVPixelBufferHeightKey as String: videoHeight,
-                kCVPixelBufferMetalCompatibilityKey as String: true
-            ]
-
-            pixelBufferAdaptor = AVAssetWriterInputPixelBufferAdaptor(
-                assetWriterInput: videoInput!,
-                sourcePixelBufferAttributes: pixelBufferAttributes
+            let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+            // Deprecated, with no receiver equivalent: appendImmediately alone leaves the input
+            // offline, and the writer then refuses video to interleave it with audio (after a
+            // pause, most of the next second; PauseResumeTests)
+            videoInput.expectsMediaDataInRealTime = true
+            // The receiver adds the input to the writer. Frames go in with appendImmediately,
+            // which never waits for the input.
+            let pixelBufferAttributes = CVPixelBufferCreationAttributes(
+                pixelFormatType: CVPixelFormatType(rawValue: kCVPixelFormatType_32BGRA),
+                size: CVImageSize(width: videoWidth, height: videoHeight),
+                compatibility: [.metalTexture]
             )
-
-            if let videoInput = videoInput {
-                assetWriter.add(videoInput)
-            }
+            videoReceiver = assetWriter.inputPixelBufferReceiver(for: videoInput, pixelBufferAttributes: pixelBufferAttributes)
         } else {
-            // Audio-only mode: no video input
-            videoInput = nil
-            pixelBufferAdaptor = nil
+            // Audio-only mode: no video track
+            videoReceiver = nil
             print("🎵 VideoEncoder: Audio-only mode enabled (no video track)")
         }
 
         // Pre-create audio inputs for known sources
-        // This must be done BEFORE startWriting() because you cannot add inputs after the session starts
-        audioInputs = [:]
+        // This must be done BEFORE start() because you cannot add inputs after writing starts
+        audioReceivers = [:]
         print("🎵 VideoEncoder: Pre-creating audio inputs for \(audioSourceIDs.count) source(s): \(audioSourceIDs)")
         for sourceID in audioSourceIDs {
             print("🎵 VideoEncoder: Creating audio input for: \(sourceID)")
@@ -289,7 +289,7 @@ public actor VideoEncoder {
             ]
 
             let newInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
-            newInput.expectsMediaDataInRealTime = true
+            newInput.expectsMediaDataInRealTime = true  // See the video input
 
             // Add metadata to identify the source
             let sourceMetadata = AVMutableMetadataItem()
@@ -297,21 +297,20 @@ public actor VideoEncoder {
             sourceMetadata.value = sourceID as NSString
             newInput.metadata = [sourceMetadata]
 
-            assetWriter.add(newInput)
-            audioInputs[sourceID] = newInput
+            audioReceivers[sourceID] = assetWriter.inputReceiver(for: newInput)
             print("✅ VideoEncoder: Pre-created AAC audio track for source: \(sourceID)")
         }
-        print("🎵 VideoEncoder: Total audio inputs created: \(audioInputs.count)")
+        print("🎵 VideoEncoder: Total audio inputs created: \(audioReceivers.count)")
 
         // Add metadata
         assetWriter.metadata = createMetadata(title: title)
 
         // Start writing
-        guard assetWriter.startWriting() else {
+        do {
+            try assetWriter.start()
+        } catch {
             print("❌ VideoEncoder: Failed to start asset writer")
-            if let error = assetWriter.error {
-                print("   Error: \(error.localizedDescription)")
-            }
+            print("   Error: \(error.localizedDescription)")
             throw RecorderError.encodingFailed
         }
 
@@ -370,16 +369,14 @@ public actor VideoEncoder {
         } else if assetWriter.status == .writing {
             print("📝 Marking inputs as finished...")
 
-            // Always mark inputs as finished before finishWriting()
-            // Don't check isReadyForMoreMediaData - just mark them finished
-            if let videoInput = videoInput {
-                videoInput.markAsFinished()
+            // Always finish the inputs before finishWriting()
+            if let videoReceiver {
+                videoReceiver.finish()
                 print("  ✓ Video input marked as finished")
             }
 
-            // Mark all audio inputs as finished
-            for (sourceID, audioInput) in audioInputs {
-                audioInput.markAsFinished()
+            for (sourceID, audioReceiver) in audioReceivers {
+                audioReceiver.finish()
                 print("  ✓ Audio input [\(sourceID)] marked as finished")
             }
 
@@ -403,11 +400,9 @@ public actor VideoEncoder {
             print("⚠️ Asset writer in unexpected state: \(assetWriter.status.rawValue), attempting to finish anyway")
             // Try to finish if possible - better than leaving file corrupted
             if assetWriter.status != .cancelled && assetWriter.status != .completed {
-                if let videoInput = videoInput {
-                    videoInput.markAsFinished()
-                }
-                for (_, audioInput) in audioInputs {
-                    audioInput.markAsFinished()
+                videoReceiver?.finish()
+                for (_, audioReceiver) in audioReceivers {
+                    audioReceiver.finish()
                 }
                 await assetWriter.finishWriting()
                 print("  Finish attempt completed with status: \(assetWriter.status.rawValue)")
@@ -427,9 +422,8 @@ public actor VideoEncoder {
 
         // Clean up
         self.assetWriter = nil
-        self.videoInput = nil
-        self.audioInputs = [:]
-        self.pixelBufferAdaptor = nil
+        self.videoReceiver = nil
+        self.audioReceivers = [:]
 
         // An empty file is removed even when the writer failed; the writer's error
         // says more than "empty", so it wins
@@ -510,7 +504,9 @@ public actor VideoEncoder {
 
     /// Encodes a video frame: into the file while recording, unless paused, and into the stream
     /// while streaming. A pause holds back the file only; a live stream goes on through it.
-    public func encodeVideoFrame(_ pixelBuffer: CVPixelBuffer, timestamp: CMTime) {
+    /// The caller hands the frame over and doesn't change it afterwards: the file writer and the
+    /// stream encoder may still be reading it.
+    public func encodeVideoFrame(_ pixelBuffer: sending CVPixelBuffer, timestamp: CMTime) {
         let toFile = isRecording && !isPaused
         let toStream = isStreaming || isNTDFStreaming
         guard toFile || toStream else { return }
@@ -521,14 +517,15 @@ public actor VideoEncoder {
             return
         }
 
-        if toFile { appendVideoToFile(pixelBuffer, timestamp: timestamp) }
-        if toStream { streamVideo(pixelBuffer, timestamp: timestamp) }
+        let frame = CVReadOnlyPixelBuffer(unsafeBuffer: pixelBuffer)
+        if toFile { appendVideoToFile(frame, timestamp: timestamp) }
+        if toStream { streamVideo(frame, timestamp: timestamp) }
     }
 
     /// Appends a frame to the file, on the file's timeline: time since its first frame, less pauses.
-    private func appendVideoToFile(_ pixelBuffer: CVPixelBuffer, timestamp: CMTime) {
+    private func appendVideoToFile(_ frame: CVReadOnlyPixelBuffer, timestamp: CMTime) {
         var adjustedTimestamp = timestamp
-        guard let videoInput = videoInput, let adaptor = pixelBufferAdaptor else { return }
+        guard let videoReceiver else { return }
         guard let assetWriter = assetWriter else { return }
 
         // Check if asset writer is ready for writing
@@ -540,20 +537,21 @@ public actor VideoEncoder {
             return
         }
 
-        // Wait if input is not ready. Checked before the session starts, so a frame dropped
-        // here can't set the timeline's start, as on the audio-only path (#44)
-        if !videoInput.isReadyForMoreMediaData {
-            droppedMedia.video.notReady += 1
-            return
-        }
+        // Whether the file takes the frame is known only once it's appended, so the timeline it
+        // sets (the file's start, a pause's gap) is undone if it isn't (#44)
+        let timeline = (startTime, resumePending, totalPausedDuration)
+        var appended = false
+        defer { if !appended { (startTime, resumePending, totalPausedDuration) = timeline } }
 
-        // Initialize session on the first frame the input can take
-        if !sessionStarted {
-            sessionStarted = true
+        // The first frame sets the file's start
+        if startTime == nil {
             startTime = timestamp
-            // Start session at time zero - we'll normalize all timestamps
-            assetWriter.startSession(atSourceTime: .zero)
             lastVideoTimestamp = nil
+            if !sessionStarted {
+                sessionStarted = true
+                // Start session at time zero - we'll normalize all timestamps
+                assetWriter.startSession(atSourceTime: .zero)
+            }
             print("📹 VideoEncoder: Session started, base timestamp \(timestamp.seconds)")
         }
 
@@ -594,10 +592,15 @@ public actor VideoEncoder {
             return
         }
 
-        // Append pixel buffer to file
-        if !adaptor.append(pixelBuffer, withPresentationTime: adjustedTimestamp) {
+        // Append pixel buffer to file. False: a real-time input that fell behind; a throw: it failed.
+        do {
+            guard try refusalForTesting() ?? videoReceiver.appendImmediately(frame, with: adjustedTimestamp) else {
+                droppedMedia.video.notReady += 1
+                return
+            }
+        } catch {
             droppedMedia.video.rejected += 1
-            print("❌ Failed to append video frame at timestamp \(adjustedTimestamp.seconds)")
+            print("❌ Failed to append video frame at timestamp \(adjustedTimestamp.seconds): \(error.localizedDescription)")
             if assetWriter.status == .failed {
                 let errorMessage = assetWriter.error?.localizedDescription ?? "Unknown error"
                 let underlyingError = (assetWriter.error as NSError?)?.userInfo[NSUnderlyingErrorKey] as? NSError
@@ -608,6 +611,7 @@ public actor VideoEncoder {
             }
             return
         }
+        appended = true
         appendedMedia = true
         lastVideoTimestamp = adjustedTimestamp
         appendedMediaEnd = CMTimeMaximum(appendedMediaEnd, CMTimeAdd(adjustedTimestamp, CMTime(value: 1, timescale: frameRate)))
@@ -615,7 +619,7 @@ public actor VideoEncoder {
 
     /// Sends a frame to the stream on the stream's own timeline: time since the stream's first
     /// frame. A recording's start, pause, resume or finish doesn't move it, so it never goes back.
-    private func streamVideo(_ pixelBuffer: CVPixelBuffer, timestamp: CMTime) {
+    private func streamVideo(_ frame: CVReadOnlyPixelBuffer, timestamp: CMTime) {
         guard let encoder = streamVideoEncoder else { return }
         let base = streamVideoBase ?? timestamp
         let streamTime = CMTimeSubtract(timestamp, base)
@@ -624,7 +628,7 @@ public actor VideoEncoder {
         streamVideoBase = base
         lastStreamVideoTime = streamTime
         do {
-            try encoder.encode(pixelBuffer, timestamp: streamTime)
+            try frame.withUnsafeBuffer { try encoder.encode($0, timestamp: streamTime) }
             streamFrameCount += 1
         } catch {
             print("❌ Stream video encoder failed: \(error)")
@@ -665,32 +669,32 @@ public actor VideoEncoder {
         }
 
         // With video, the first video frame starts the session
-        let isAudioOnly = videoInput == nil
+        let isAudioOnly = videoReceiver == nil
         guard isAudioOnly || startTime != nil else {
             droppedMedia.audio.beforeSession += 1
             return
         }
 
         // Get audio input for this source (must have been pre-created during startRecording)
-        guard let audioInput = audioInputs[sourceID] else {
+        guard let audioReceiver = audioReceivers[sourceID] else {
             print("⚠️ No audio input exists for source: \(sourceID). Audio inputs must be pre-created before recording starts.")
             droppedMedia.audio.noInput += 1
             return
         }
 
-        // Wait if input is not ready
-        if !audioInput.isReadyForMoreMediaData {
-            droppedMedia.audio.notReady += 1
-            return
-        }
+        // As for video: the timeline this sample sets is undone unless the file takes it (#44)
+        let timeline = (startTime, resumePending, totalPausedDuration)
+        var appended = false
+        defer { if !appended { (startTime, resumePending, totalPausedDuration) = timeline } }
 
-        // Audio-only: start the session with the first sample that can be appended,
-        // so a dropped sample can't set the start time
-        if isAudioOnly && !sessionStarted {
+        // Audio-only: the first sample sets the file's start
+        if isAudioOnly && startTime == nil {
             let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-            sessionStarted = true
             startTime = timestamp
-            writer.startSession(atSourceTime: .zero)
+            if !sessionStarted {
+                sessionStarted = true
+                writer.startSession(atSourceTime: .zero)
+            }
             print("🎵 VideoEncoder: Audio-only session started, base timestamp \(timestamp.seconds)")
         }
 
@@ -736,13 +740,22 @@ public actor VideoEncoder {
             return
         }
 
-        // Append audio sample to file
-        // AVAssetWriterInput will automatically encode PCM to AAC
-        if !audioInput.append(finalBuffer) {
+        // Append audio sample to file; the input encodes PCM to AAC. False: a real-time input
+        // that fell behind; a throw: it failed.
+        // The retimed copy is a new sample buffer. It shares only the captured samples, which
+        // nobody writes to, so the writer can read them while the stream encoder does too.
+        nonisolated(unsafe) let handedOver = finalBuffer
+        do {
+            guard try refusalForTesting() ?? audioReceiver.appendImmediately(CMReadySampleBuffer(unsafeBuffer: handedOver)) else {
+                droppedMedia.audio.notReady += 1
+                return
+            }
+        } catch {
             droppedMedia.audio.rejected += 1
-            print("⚠️ Audio input [\(sourceID)] rejected sample buffer; dropping frame")
+            print("⚠️ Audio input [\(sourceID)] rejected sample buffer; dropping frame: \(error.localizedDescription)")
             return
         }
+        appended = true
         appendedMedia = true
         let end = duration.isValid ? CMTimeAdd(adjustedTimestamp, duration) : adjustedTimestamp
         lastAudioAppended[sourceID] = (adjustedTimestamp, end)
@@ -1034,6 +1047,25 @@ public actor VideoEncoder {
     /// file is being finished.
     func setFinishingHookForTesting(_ hook: (@Sendable () async -> Void)?) {
         finishingHookForTesting = hook
+    }
+
+    /// Tests: how the writer refuses a buffer. `notReady`: `appendImmediately` returns false,
+    /// as for a real-time input that fell behind. `failed`: it throws, as for a failed writer.
+    enum RefusalForTesting: Sendable { case notReady, failed }
+
+    /// Tests: the next appends to the file, video or audio, get `refusals` in order instead of
+    /// reaching the writer.
+    func refuseAppendsForTesting(_ refusals: [RefusalForTesting]) {
+        refusalsForTesting = refusals
+    }
+
+    /// The next scripted refusal: false for not ready, a throw for failed; nil when none is left
+    private func refusalForTesting() throws -> Bool? {
+        guard !refusalsForTesting.isEmpty else { return nil }
+        switch refusalsForTesting.removeFirst() {
+        case .notReady: return false
+        case .failed: throw RecorderError.encodingFailed
+        }
     }
 
     /// Stop streaming to a single destination (others continue)

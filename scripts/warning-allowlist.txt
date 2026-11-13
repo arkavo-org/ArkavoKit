@@ -1,19 +1,11 @@
 # Deprecated calls kept on purpose. Every other warning in Sources/ and Tests/ fails CI
 # (scripts/check-warnings.py), and an entry that no longer occurs fails too, so this only shrinks.
 #
-# VideoEncoder: macOS 27's AVAssetWriter receiver API can't report input readiness, which the
-# encoder needs to drop an unready frame before it starts the session.
+# VideoEncoder: the receiver API has no real-time switch. Without expectsMediaDataInRealTime the
+# writer holds video back to interleave it with audio, and drops it after a pause (PauseResumeTests).
 # NanoTDF: the NTDF stream's wire format; moving off it changes the bytes the receivers read.
-Sources/ArkavoRecorder/VideoEncoder.swift: 'add' was deprecated in macOS 27.0: Use the appropriate AVAssetWriter.inputReceiver(for:...) overload for your input and optional adaptor instead
-Sources/ArkavoRecorder/VideoEncoder.swift: 'add' was deprecated in macOS 27.0: Use the appropriate AVAssetWriter.inputReceiver(for:...) overload for your input and optional adaptor instead
-Sources/ArkavoRecorder/VideoEncoder.swift: 'append' was deprecated in macOS 27.0: Use SampleBufferReceiver.append(_:) instead
-Sources/ArkavoRecorder/VideoEncoder.swift: 'AVAssetWriterInputPixelBufferAdaptor' was deprecated in macOS 27.0: Use AVAssetWriter.inputPixelBufferReceiver(for:pixelBufferAttributes:) instead
-Sources/ArkavoRecorder/VideoEncoder.swift: 'AVAssetWriterInputPixelBufferAdaptor' was deprecated in macOS 27.0: Use AVAssetWriter.inputPixelBufferReceiver(for:pixelBufferAttributes:) instead
 Sources/ArkavoRecorder/VideoEncoder.swift: 'expectsMediaDataInRealTime' was deprecated in macOS 27.0: Use the input receiver's appendImmediately(...) method instead
 Sources/ArkavoRecorder/VideoEncoder.swift: 'expectsMediaDataInRealTime' was deprecated in macOS 27.0: Use the input receiver's appendImmediately(...) method instead
-Sources/ArkavoRecorder/VideoEncoder.swift: 'isReadyForMoreMediaData' was deprecated in macOS 27.0: Use the input receiver's async append(...) method instead
-Sources/ArkavoRecorder/VideoEncoder.swift: 'isReadyForMoreMediaData' was deprecated in macOS 27.0: Use the input receiver's async append(...) method instead
-Sources/ArkavoRecorder/VideoEncoder.swift: 'startWriting()' was deprecated in macOS 27.0: Use start() instead
 Sources/ArkavoSocial/ArkavoClient.swift: 'NanoTDF' is deprecated: NanoTDF is deprecated. Use TDFCBORBuilder instead. See docs/NANOTDF_MIGRATION.md
 Sources/ArkavoStreaming/NTDFTokenBuilder.swift: 'createNanoTDFv12(kas:policy:plaintext:)' is deprecated: NanoTDF is deprecated. Use TDFCBORBuilder instead. See docs/NANOTDF_MIGRATION.md
 Sources/ArkavoStreaming/RTMP/NTDFStreamingManager.swift: 'NanoTDFCollectionBuilder' is deprecated: NanoTDF is deprecated. Use TDFCBORBuilder instead. See docs/NANOTDF_MIGRATION.md
