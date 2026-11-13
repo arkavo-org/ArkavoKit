@@ -147,6 +147,25 @@ final class YouTubeSessionTests: XCTestCase {
         XCTAssertEqual(store.value(for: "refresh_token"), "r1")
     }
 
+    /// A sign-in Google answered without a refresh token stores an empty one. A refused token
+    /// then has nothing to check the grant with, and nothing is sent to Google.
+    func testAnEmptyRefreshTokenIsNeverSentToGoogle() async {
+        let store = MemorySessionStore()
+        signIn(store, refresh: "")
+        let google = FakeGoogle { request, _ in
+            if request.isChannels { return (401, "") }
+            return unexpected(request)
+        }
+        let client = client(store, google)
+
+        await client.fetchChannelInfo()
+
+        guard case .httpError(statusCode: 401)? = client.error else {
+            return XCTFail("expected the 401, got \(String(describing: client.error))")
+        }
+        XCTAssertEqual(google.requests.filter(\.isRefresh).count, 0)
+    }
+
     /// Any authorized call, not only the channel fetch, notices a grant withdrawn at Google.
     func testAStreamKeyRequestRefusedForAWithdrawnGrantEndsTheSession() async {
         let store = MemorySessionStore()
