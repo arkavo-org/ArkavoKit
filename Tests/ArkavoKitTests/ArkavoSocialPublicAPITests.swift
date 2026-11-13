@@ -73,6 +73,21 @@ final class ArkavoSocialPublicAPITests: XCTestCase {
         XCTAssertEqual(SessionEndReason(rawValue: "account_deleted"), .accountDeleted)
     }
 
+    /// Creator's "Unlink Apple": identity's unlink, then the device's Apple account.
+    @MainActor
+    func testAppleUnlinkIsPublic() {
+        let _: (ArkavoClient) -> () async throws -> Void = ArkavoClient.unlinkAppleIdentity
+        let _: (AppleSignInService) -> (ArkavoClient) async throws -> Void = AppleSignInService.unlinkAppleAccount(with:)
+        let error: any Error = AppleUnlinkError.rateLimited(retryAfterSeconds: 30)
+        guard case .rateLimited(let seconds)? = error as? AppleUnlinkError else {
+            return XCTFail("AppleUnlinkError must be matchable by consumers")
+        }
+        XCTAssertEqual(seconds, 30)
+        let _: any Sendable = AppleUnlinkError.serverFailure
+        XCTAssertNotEqual(AppleUnlinkError.signInRequired, .unavailable)
+        XCTAssertNotEqual(AppleUnlinkError.unexpectedResponse, .serverFailure)
+    }
+
     /// Creator signs out of YouTube with revocation, and notices access withdrawn at Google.
     func testYouTubeSessionEndingsArePublic() {
         let _: @MainActor (YouTubeClient) async -> YouTubeRevocation = { await $0.signOut() }

@@ -481,6 +481,7 @@ final class ArkavoClientDeletionTests: XCTestCase {
         await assertRefused { try await self.client.connect() }
         await assertRefused { _ = try await self.client.registerUser(handle: "alice", did: "did:key:z1") }
         await assertRefused { try await self.client.linkAppleIdentity(idToken: "t", authorizationCode: "c") }
+        await assertRefused { try await self.client.unlinkAppleIdentity() }
 
         gate.open()
         let result = try await first.value

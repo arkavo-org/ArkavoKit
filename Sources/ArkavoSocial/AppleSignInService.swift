@@ -21,16 +21,24 @@ public class AppleSignInService: NSObject, ObservableObject {
 
     private var authorizationController: ASAuthorizationController?
     private var continuation: CheckedContinuation<ASAuthorizationAppleIDCredential, Error>?
+    /// The Apple account items kept on this device.
+    private let store: any AppleAccountStore
 
-    public override init() {
+    public convenience override init() {
+        self.init(store: KeychainAppleAccountStore())
+    }
+
+    /// A service over `store`: the Keychain in the app, a fake in tests.
+    init(store: any AppleAccountStore) {
+        self.store = store
         super.init()
         refreshLinkState()
     }
 
     public func refreshLinkState() {
-        isLinked = KeychainManager.isAppleAccountLinked()
-        linkedEmail = KeychainManager.getAppleEmail()
-        linkedName = KeychainManager.getAppleFullName()
+        isLinked = store.appleUserID() != nil
+        linkedEmail = store.appleEmail()
+        linkedName = store.appleFullName()
     }
 
     /// **Legacy local-only link.** Runs Sign in with Apple with `.fullName` and
@@ -47,17 +55,17 @@ public class AppleSignInService: NSObject, ObservableObject {
 
         let credential = try await performAppleSignIn(nonce: nil, requestPII: true)
 
-        try KeychainManager.saveAppleUserID(credential.user)
+        try store.saveAppleUserID(credential.user)
 
         if let email = credential.email {
-            try KeychainManager.saveAppleEmail(email)
+            try store.saveAppleEmail(email)
             self.linkedEmail = email
         }
 
         if let fullName = credential.fullName {
             let name = PersonNameComponentsFormatter().string(from: fullName)
             if !name.isEmpty {
-                try KeychainManager.saveAppleFullName(name)
+                try store.saveAppleFullName(name)
                 self.linkedName = name
             }
         }
@@ -116,8 +124,29 @@ public class AppleSignInService: NSObject, ObservableObject {
         //    "linked" state across launches. Email/name are deliberately
         //    not written, even if Apple slipped them through on a stale
         //    credential.
-        try? KeychainManager.saveAppleUserID(credential.user)
+        try? store.saveAppleUserID(credential.user)
         self.isLinked = true
+    }
+
+    /// Unlinks every Apple ID from the signed-in Arkavo account at identity
+    /// (`ArkavoClient.unlinkAppleIdentity()`), then forgets the Apple account
+    /// on this device as `unlinkAppleAccount()` does. Nothing on this device
+    /// changes unless identity confirms the unlink.
+    ///
+    /// The stored Apple user ID must go with the server link:
+    /// `verifyCredentialState()` reports linked whenever Apple still
+    /// authorizes it, and Apple keeps authorizing it after an unlink (no
+    /// Apple token is stored on the device to revoke), so a user ID left
+    /// behind shows the account as linked again on the next launch.
+    ///
+    /// - Throws: what `ArkavoClient.unlinkAppleIdentity()` throws.
+    public func unlinkAppleAccount(with client: ArkavoClient) async throws {
+        isProcessing = true
+        error = nil
+        defer { isProcessing = false }
+
+        try await client.unlinkAppleIdentity()
+        unlinkAppleAccount()
     }
 
     private func performAppleSignIn(
@@ -145,15 +174,19 @@ public class AppleSignInService: NSObject, ObservableObject {
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
+    /// **Device only.** Forgets the Apple user ID, email and name stored on
+    /// this device and marks the service unlinked. identity is not told: the
+    /// Apple ID stays linked to the Arkavo account and can still sign in. To
+    /// unlink it there too, use `unlinkAppleAccount(with:)`.
     public func unlinkAppleAccount() {
-        KeychainManager.deleteAppleAccount()
+        store.deleteAppleAccount()
         isLinked = false
         linkedEmail = nil
         linkedName = nil
     }
 
     public func verifyCredentialState() async {
-        guard let userID = KeychainManager.getAppleUserID() else {
+        guard let userID = store.appleUserID() else {
             isLinked = false
             return
         }
@@ -263,6 +296,56 @@ extension AppleSignInService: ASAuthorizationControllerPresentationContextProvid
         return windowScene?.windows.first { $0.isKeyWindow } ?? UIWindow()
         #endif
     }
+}
+
+/// The Apple account items `AppleSignInService` keeps on this device.
+///
+/// Internal, and a test seam only: `swift test` has no keychain entitlement,
+/// so tests inject an in-memory store. The app always uses `KeychainAppleAccountStore`.
+@MainActor
+protocol AppleAccountStore {
+    func appleUserID() -> String?
+    func appleEmail() -> String?
+    func appleFullName() -> String?
+    func saveAppleUserID(_ userID: String) throws
+    func saveAppleEmail(_ email: String) throws
+    func saveAppleFullName(_ fullName: String) throws
+    /// The user ID, email and name.
+    func deleteAppleAccount()
+}
+
+/// `AppleAccountStore` over `KeychainManager`.
+struct KeychainAppleAccountStore: AppleAccountStore {
+    func appleUserID() -> String? { KeychainManager.getAppleUserID() }
+    func appleEmail() -> String? { KeychainManager.getAppleEmail() }
+    func appleFullName() -> String? { KeychainManager.getAppleFullName() }
+    func saveAppleUserID(_ userID: String) throws { try KeychainManager.saveAppleUserID(userID) }
+    func saveAppleEmail(_ email: String) throws { try KeychainManager.saveAppleEmail(email) }
+    func saveAppleFullName(_ fullName: String) throws { try KeychainManager.saveAppleFullName(fullName) }
+    func deleteAppleAccount() { KeychainManager.deleteAppleAccount() }
+}
+
+/// Why `ArkavoClient.unlinkAppleIdentity()` did not unlink
+/// (`DELETE /oauth/apple/link`). Chosen by status alone: identity's bodies
+/// are plain text for logs.
+public enum AppleUnlinkError: Error, Sendable, Equatable {
+    /// 401, or no session token: sign in again. identity also answers 401
+    /// for an account that has been deleted.
+    case signInRequired
+    /// 429: more than 5 unlinks for this account in a minute. Try again after
+    /// this many seconds: identity's `Retry-After`, or 60 when that is missing
+    /// or not a number of seconds.
+    case rateLimited(retryAfterSeconds: Int)
+    /// 502: Apple did not revoke a token identity holds for an Apple ID, or
+    /// could not be reached; that Apple ID stays linked, any other is gone.
+    /// 500: identity failed (storage, a stored token it cannot read, or
+    /// revocation not configured). Either way, trying again finishes the
+    /// unlink, though a 500 from configuration lasts until identity is fixed.
+    case serverFailure
+    /// 404 or 405: this identity has no unlink route.
+    case unavailable
+    /// Any other status, including a success other than 204.
+    case unexpectedResponse
 }
 
 /// Errors specific to the server-verified Apple identity link path
