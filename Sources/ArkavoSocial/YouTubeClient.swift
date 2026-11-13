@@ -13,6 +13,9 @@ public actor YouTubeClient: ObservableObject {
     @MainActor @Published public private(set) var isLoading = false
     @MainActor @Published public private(set) var error: YouTubeError?
     @MainActor @Published public private(set) var channelInfo: YouTubeChannelInfo?
+    /// True once Google has reported the grant gone (removed in the Google Account, or
+    /// expired) and the stored session was cleared for it. A new sign-in or sign-out resets it.
+    @MainActor @Published public private(set) var accessWithdrawn = false
 
     // MARK: - Private Properties
 
@@ -114,6 +117,7 @@ public actor YouTubeClient: ObservableObject {
             try? KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.channelId)
 
             isAuthenticated = false
+            accessWithdrawn = false
             channelInfo = nil
         }
     }
@@ -141,6 +145,7 @@ public actor YouTubeClient: ObservableObject {
         try? KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.tokenExpiration)
         try? KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.channelId)
         isAuthenticated = false
+        accessWithdrawn = false
         channelInfo = nil
 
         return await Self.revoke(token: refreshToken ?? accessToken, isRefreshToken: refreshToken != nil) {
@@ -257,6 +262,7 @@ public actor YouTubeClient: ObservableObject {
 
             await MainActor.run {
                 isAuthenticated = true
+                accessWithdrawn = false
                 isLoading = false
             }
 
@@ -314,6 +320,7 @@ public actor YouTubeClient: ObservableObject {
             await fetchChannelInfo()
             await MainActor.run {
                 isAuthenticated = true
+                accessWithdrawn = false
             }
         } catch {
             await MainActor.run {
@@ -410,8 +417,55 @@ public actor YouTubeClient: ObservableObject {
                 refreshToken: refreshToken, // Keep existing refresh token
                 expiresIn: tokenResponse.expires_in,
             )
+        } else if Self.grantWithdrawn(status: httpResponse.statusCode, data: data) {
+            await endWithdrawnSession()
+            throw YouTubeError.accessWithdrawn
         } else {
             throw YouTubeError.httpError(statusCode: httpResponse.statusCode)
+        }
+    }
+
+    /// Whether a token-refresh answer says the grant is gone: Google's 400 `invalid_grant`,
+    /// which it sends when the person removed the app's access or the refresh token expired.
+    /// Any other answer may be a passing failure and ends nothing.
+    static func grantWithdrawn(status: Int, data: Data) -> Bool {
+        guard status == 400,
+              let reply = try? JSONDecoder().decode(GoogleErrorResponse.self, from: data)
+        else { return false }
+        return reply.error == "invalid_grant"
+    }
+
+    /// Removes everything stored for a grant Google no longer honors.
+    private func endWithdrawnSession() async {
+        try? KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.accessToken)
+        try? KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.refreshToken)
+        try? KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.tokenExpiration)
+        try? KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.channelId)
+        await MainActor.run {
+            isAuthenticated = false
+            channelInfo = nil
+            accessWithdrawn = true
+        }
+    }
+
+    /// Checks with Google that the stored grant still stands, by refreshing the access token.
+    /// Call it from time to time while signed in (for example when the app becomes active),
+    /// so access removed in the Google Account is noticed without waiting for the next request.
+    ///
+    /// - Returns: false when Google reported the grant gone; the stored tokens and channel are
+    ///   then already removed and `accessWithdrawn` is true. True otherwise, including when
+    ///   nothing is stored, no refresh token is stored, or Google could not be reached.
+    @discardableResult
+    public func verifyAccess() async -> Bool {
+        let refreshToken = KeychainManager.getValue(service: keychainServiceBase, account: KeychainKey.refreshToken)
+        guard let refreshToken, !refreshToken.isEmpty else { return true }
+        do {
+            try await refreshAccessToken()
+            return true
+        } catch YouTubeError.accessWithdrawn {
+            return false
+        } catch {
+            return true
         }
     }
 
@@ -488,6 +542,11 @@ public actor YouTubeClient: ObservableObject {
                         self.channelInfo = info
                     }
                 }
+            } else if httpResponse.statusCode == 401 {
+                // The access token is refused before its expiry: ask Google whether the grant
+                // still stands. A withdrawn grant ends the stored session here.
+                try await refreshAccessToken()
+                throw YouTubeError.httpError(statusCode: httpResponse.statusCode)
             } else {
                 throw YouTubeError.httpError(statusCode: httpResponse.statusCode)
             }
@@ -1294,6 +1353,8 @@ public enum YouTubeError: LocalizedError {
     case googleError(String)
     case userCancelled
     case authSessionFailed
+    /// Google reported the grant gone; the stored session has been cleared.
+    case accessWithdrawn
     case unknown(Error)
 
     public var errorDescription: String? {
@@ -1314,6 +1375,8 @@ public enum YouTubeError: LocalizedError {
             "User cancelled the login"
         case .authSessionFailed:
             "Failed to start authentication session"
+        case .accessWithdrawn:
+            "YouTube access was removed in your Google Account. Sign in again to reconnect."
         case let .unknown(error):
             "Unknown error: \(error.localizedDescription)"
         }
