@@ -29,6 +29,7 @@ jobs:
         run: |
           swift --version
           xcodebuild -version
+          echo "CPUs: $(sysctl -n hw.ncpu), active $(sysctl -n hw.activecpu)"
 
       - name: Build
         run: |
@@ -40,5 +41,18 @@ jobs:
       - name: No warnings
         run: python3 scripts/check-warnings.py build.log
 
+      # A hang fails after 10 minutes with the test process's thread stacks, in the log and the
+      # test-stacks artifact, instead of running out the job's 45 with no output.
       - name: Test
-        run: swift test
+        run: scripts/test-with-stacks.sh
+        env:
+          HANG_AFTER: 600
+          STACKS_DIR: ${{ runner.temp }}/test-stacks
+
+      - name: Keep the thread samples
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-stacks
+          path: ${{ runner.temp }}/test-stacks
+          if-no-files-found: ignore
