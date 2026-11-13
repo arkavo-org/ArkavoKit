@@ -151,18 +151,20 @@ struct RefusedAppendTests {
 
     /// Presentation times of the file's video samples, as stored, in file order
     static func videoSampleTimes(_ url: URL) async throws -> [CMTime] {
-        let asset = AVURLAsset(url: url)
-        let track = try #require(try await asset.loadTracks(withMediaType: .video).first)
-        let reader = try AVAssetReader(asset: asset)
-        let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
-        let buffers = reader.outputProvider(for: output)
-        try reader.start()
-        var times: [CMTime] = []
-        while let buffer = try await buffers.next() {
-            guard buffer.sampleCount > 0 else { continue }
-            times.append(buffer.presentationTimeStamp)
+        try await readingOffThePool {
+            let asset = AVURLAsset(url: url)
+            let track = try #require(try await asset.loadTracks(withMediaType: .video).first)
+            let reader = try AVAssetReader(asset: asset)
+            let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+            let buffers = reader.outputProvider(for: output)
+            try reader.start()
+            var times: [CMTime] = []
+            while let buffer = try await buffers.next() {
+                guard buffer.sampleCount > 0 else { continue }
+                times.append(buffer.presentationTimeStamp)
+            }
+            return times
         }
-        return times
     }
 
     static func url(_ fileExtension: String) -> URL {
