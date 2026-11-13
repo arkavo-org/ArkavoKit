@@ -73,6 +73,15 @@ final class ArkavoSocialPublicAPITests: XCTestCase {
         XCTAssertEqual(SessionEndReason(rawValue: "account_deleted"), .accountDeleted)
     }
 
+    /// Creator signs out of YouTube with revocation, and notices access withdrawn at Google.
+    func testYouTubeSessionEndingsArePublic() {
+        let _: @MainActor (YouTubeClient) async -> YouTubeRevocation = { await $0.signOut() }
+        let _: (YouTubeClient) async -> Bool = { await $0.verifyAccess() }
+        let _: @MainActor (YouTubeClient) -> Bool = { $0.accessWithdrawn }
+        XCTAssertNotNil(YouTubeError.accessWithdrawn.errorDescription)
+        XCTAssertEqual(YouTubeRevocation.failed, .failed)
+    }
+
     /// Creator links Patreon through identity with no client secret, and reads the membership from one source.
     func testSecretlessPatreonClientIsPublic() throws {
         let client = PatreonClient(clientID: "c")

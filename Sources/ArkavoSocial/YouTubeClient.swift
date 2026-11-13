@@ -13,12 +13,18 @@ public actor YouTubeClient: ObservableObject {
     @MainActor @Published public private(set) var isLoading = false
     @MainActor @Published public private(set) var error: YouTubeError?
     @MainActor @Published public private(set) var channelInfo: YouTubeChannelInfo?
+    /// True once Google has reported the grant gone (removed in the Google Account, or
+    /// expired) and the stored session was cleared for it. A new sign-in or sign-out resets it.
+    @MainActor @Published public private(set) var accessWithdrawn = false
 
     // MARK: - Private Properties
 
     private let clientId: String
     private let clientSecret: String
-    private let keychainServiceBase = "com.arkavo.youtube"
+    /// The stored session: the Keychain in the app, a fake in tests.
+    private let store: any YouTubeSessionStore
+    /// Every request to Google goes through here except the resumable-upload chunks.
+    private let send: YouTubeSend
     private var codeVerifier: String?
     private var currentRedirectUri: String?
     #if os(macOS)
@@ -35,12 +41,25 @@ public actor YouTubeClient: ObservableObject {
     // MARK: - Initialization
 
     public init(clientId: String, clientSecret: String) {
-        self.clientId = clientId
-        self.clientSecret = clientSecret
+        self.init(
+            clientId: clientId,
+            clientSecret: clientSecret,
+            store: KeychainYouTubeSessionStore(service: "com.arkavo.youtube"),
+            send: { try await URLSession.shared.data(for: $0) },
+        )
 
         Task { @MainActor in
             await loadStoredTokens()
         }
+    }
+
+    /// A client over `store` and `send`. It does not load the stored session; the public
+    /// initializer does.
+    init(clientId: String, clientSecret: String, store: any YouTubeSessionStore, send: @escaping YouTubeSend) {
+        self.clientId = clientId
+        self.clientSecret = clientSecret
+        self.store = store
+        self.send = send
     }
 
     // MARK: - PKCE Support
@@ -69,10 +88,7 @@ public actor YouTubeClient: ObservableObject {
     // MARK: - Token Management
 
     private func loadStoredTokens() async {
-        let accessToken = KeychainManager.getValue(
-            service: keychainServiceBase,
-            account: KeychainKey.accessToken,
-        )
+        let accessToken = store.value(for: KeychainKey.accessToken)
 
         await MainActor.run {
             isAuthenticated = accessToken != nil
@@ -85,35 +101,26 @@ public actor YouTubeClient: ObservableObject {
 
     private func saveTokens(accessToken: String, refreshToken: String, expiresIn: Int) {
         let expirationDate = Date().addingTimeInterval(TimeInterval(expiresIn))
+        store.save(accessToken, for: KeychainKey.accessToken)
+        store.save(refreshToken, for: KeychainKey.refreshToken)
+        store.save(ISO8601DateFormatter().string(from: expirationDate), for: KeychainKey.tokenExpiration)
+    }
 
-        KeychainManager.save(
-            value: accessToken,
-            service: keychainServiceBase,
-            account: KeychainKey.accessToken,
-        )
-
-        KeychainManager.save(
-            value: refreshToken,
-            service: keychainServiceBase,
-            account: KeychainKey.refreshToken,
-        )
-
-        KeychainManager.save(
-            value: ISO8601DateFormatter().string(from: expirationDate),
-            service: keychainServiceBase,
-            account: KeychainKey.tokenExpiration,
-        )
+    /// Removes the stored tokens and channel ID.
+    private nonisolated func clearStoredSession() {
+        store.delete(KeychainKey.accessToken)
+        store.delete(KeychainKey.refreshToken)
+        store.delete(KeychainKey.tokenExpiration)
+        store.delete(KeychainKey.channelId)
     }
 
     @MainActor
     public func logout() {
         Task { @MainActor in
-            try? KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.accessToken)
-            try? KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.refreshToken)
-            try? KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.tokenExpiration)
-            try? KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.channelId)
+            clearStoredSession()
 
             isAuthenticated = false
+            accessWithdrawn = false
             channelInfo = nil
         }
     }
@@ -132,20 +139,16 @@ public actor YouTubeClient: ObservableObject {
     @discardableResult
     public func signOut() async -> YouTubeRevocation {
         // A sign-in Google answered without a refresh token stores an empty one.
-        let refreshToken = KeychainManager.getValue(service: keychainServiceBase, account: KeychainKey.refreshToken)
+        let refreshToken = store.value(for: KeychainKey.refreshToken)
             .flatMap { $0.isEmpty ? nil : $0 }
-        let accessToken = KeychainManager.getValue(service: keychainServiceBase, account: KeychainKey.accessToken)
+        let accessToken = store.value(for: KeychainKey.accessToken)
 
-        try? KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.accessToken)
-        try? KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.refreshToken)
-        try? KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.tokenExpiration)
-        try? KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.channelId)
+        clearStoredSession()
         isAuthenticated = false
+        accessWithdrawn = false
         channelInfo = nil
 
-        return await Self.revoke(token: refreshToken ?? accessToken, isRefreshToken: refreshToken != nil) {
-            try await URLSession.shared.data(for: $0)
-        }
+        return await Self.revoke(token: refreshToken ?? accessToken, isRefreshToken: refreshToken != nil, send: send)
     }
 
     /// Google's OAuth 2.0 revocation request for one token. The token goes in
@@ -251,12 +254,8 @@ public actor YouTubeClient: ObservableObject {
             // Wait for the callback with the authorization code
             let code = try await serverTask.value
 
-            // Exchange code for tokens
-            try await exchangeCodeForTokens(code)
-            await fetchChannelInfo()
-
+            try await completeSignIn(code: code, redirectUri: redirectUri)
             await MainActor.run {
-                isAuthenticated = true
                 isLoading = false
             }
 
@@ -310,11 +309,10 @@ public actor YouTubeClient: ObservableObject {
         }
 
         do {
-            try await exchangeCodeForTokens(code)
-            await fetchChannelInfo()
-            await MainActor.run {
-                isAuthenticated = true
+            guard let redirectUri = currentRedirectUri else {
+                throw YouTubeError.invalidCallback
             }
+            try await completeSignIn(code: code, redirectUri: redirectUri)
         } catch {
             await MainActor.run {
                 self.error = error as? YouTubeError ?? .unknown(error)
@@ -327,12 +325,26 @@ public actor YouTubeClient: ObservableObject {
         }
     }
 
+    /// Stores the tokens for `code`, marks the person signed in, then loads their channel.
+    /// Signed in comes first, so a withdrawn grant the channel fetch finds is the state that remains.
+    func completeSignIn(code: String, redirectUri: String) async throws {
+        try await exchangeCodeForTokens(code, redirectUri: redirectUri)
+        await MainActor.run {
+            isAuthenticated = true
+            accessWithdrawn = false
+        }
+        await fetchChannelInfo()
+    }
+
     // Make exchangeCodeForTokens public so it can be used directly with authorization code
     public func exchangeCodeForTokens(_ code: String) async throws {
         guard let redirectUri = currentRedirectUri else {
             throw YouTubeError.invalidCallback
         }
+        try await exchangeCodeForTokens(code, redirectUri: redirectUri)
+    }
 
+    private func exchangeCodeForTokens(_ code: String, redirectUri: String) async throws {
         let tokenURL = URL(string: "https://oauth2.googleapis.com/token")!
         var request = URLRequest(url: tokenURL)
         request.httpMethod = "POST"
@@ -353,7 +365,7 @@ public actor YouTubeClient: ObservableObject {
 
         request.httpBody = parameters.percentEncoded()
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await send(request)
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw YouTubeError.invalidResponse
@@ -375,11 +387,14 @@ public actor YouTubeClient: ObservableObject {
         }
     }
 
-    private func refreshAccessToken() async throws {
-        guard let refreshToken = KeychainManager.getValue(
-            service: keychainServiceBase,
-            account: KeychainKey.refreshToken,
-        ) else {
+    /// Asks Google for a new access token with the stored refresh token.
+    ///
+    /// - Returns: the new access token, now stored; nil when the session was signed out or
+    ///   replaced while the request was out, so the answer was dropped.
+    @discardableResult
+    private func refreshAccessToken() async throws -> String? {
+        // A sign-in Google answered without a refresh token stores an empty one.
+        guard let refreshToken = store.value(for: KeychainKey.refreshToken), !refreshToken.isEmpty else {
             throw YouTubeError.noRefreshToken
         }
 
@@ -397,51 +412,89 @@ public actor YouTubeClient: ObservableObject {
 
         request.httpBody = parameters.percentEncoded()
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await send(request)
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw YouTubeError.invalidResponse
         }
 
+        // The actor may have signed out (revoking this very token) or signed in again while the
+        // request was out; its answer then speaks for a grant no longer stored, and is dropped.
+        let stillStored = store.value(for: KeychainKey.refreshToken) == refreshToken
+
         if httpResponse.statusCode == 200 {
+            guard stillStored else { return nil }
             let tokenResponse = try JSONDecoder().decode(YouTubeTokenResponse.self, from: data)
             saveTokens(
                 accessToken: tokenResponse.access_token,
                 refreshToken: refreshToken, // Keep existing refresh token
                 expiresIn: tokenResponse.expires_in,
             )
+            return tokenResponse.access_token
+        } else if stillStored, Self.grantWithdrawn(status: httpResponse.statusCode, data: data) {
+            await endWithdrawnSession()
+            throw YouTubeError.accessWithdrawn
         } else {
             throw YouTubeError.httpError(statusCode: httpResponse.statusCode)
+        }
+    }
+
+    /// Whether a token-refresh answer says the grant is gone: Google's 400 `invalid_grant`,
+    /// which it sends when the person removed the app's access or the refresh token expired.
+    /// Any other answer may be a passing failure and ends nothing.
+    static func grantWithdrawn(status: Int, data: Data) -> Bool {
+        guard status == 400,
+              let reply = try? JSONDecoder().decode(GoogleErrorResponse.self, from: data)
+        else { return false }
+        return reply.error == "invalid_grant"
+    }
+
+    /// Removes everything stored for a grant Google no longer honors.
+    private func endWithdrawnSession() async {
+        clearStoredSession()
+        await MainActor.run {
+            isAuthenticated = false
+            channelInfo = nil
+            accessWithdrawn = true
+        }
+    }
+
+    /// Checks with Google that the stored grant still stands, by refreshing the access token.
+    /// Call it from time to time while signed in (for example when the app becomes active),
+    /// so access removed in the Google Account is noticed without waiting for the next request.
+    ///
+    /// - Returns: false when Google reported the grant gone; the stored tokens and channel are
+    ///   then already removed and `accessWithdrawn` is true. True otherwise, including when
+    ///   nothing is stored, no refresh token is stored, or Google could not be reached.
+    @discardableResult
+    public func verifyAccess() async -> Bool {
+        let refreshToken = store.value(for: KeychainKey.refreshToken)
+        guard let refreshToken, !refreshToken.isEmpty else { return true }
+        do {
+            try await refreshAccessToken()
+            return true
+        } catch YouTubeError.accessWithdrawn {
+            return false
+        } catch {
+            return true
         }
     }
 
     // MARK: - API Methods
 
     private func getValidAccessToken() async throws -> String {
-        if let expirationString = KeychainManager.getValue(
-            service: keychainServiceBase,
-            account: KeychainKey.tokenExpiration,
-        ),
-            let expirationDate = ISO8601DateFormatter().date(from: expirationString),
-            let accessToken = KeychainManager.getValue(
-                service: keychainServiceBase,
-                account: KeychainKey.accessToken,
-            ),
-            expirationDate > Date().addingTimeInterval(60)
+        if let expirationString = store.value(for: KeychainKey.tokenExpiration),
+           let expirationDate = ISO8601DateFormatter().date(from: expirationString),
+           let accessToken = store.value(for: KeychainKey.accessToken),
+           expirationDate > Date().addingTimeInterval(60)
         {
             return accessToken
         }
 
         // Token expired or will expire soon, try to refresh
-        try await refreshAccessToken()
-
-        guard let newAccessToken = KeychainManager.getValue(
-            service: keychainServiceBase,
-            account: KeychainKey.accessToken,
-        ) else {
+        guard let newAccessToken = try await refreshAccessToken() else {
             throw YouTubeError.noAccessToken
         }
-
         return newAccessToken
     }
 
@@ -453,16 +506,47 @@ public actor YouTubeClient: ObservableObject {
         return request
     }
 
-    private func fetchChannelInfo() async {
+    /// Sends a request built by `makeAuthorizedRequest`.
+    ///
+    /// When Google refuses the access token (401), this asks whether the grant still stands by
+    /// refreshing it. A withdrawn grant ends the stored session and throws `accessWithdrawn`.
+    /// A grant that refreshes gets the request sent once more, unchanged but for the new token;
+    /// Google refuses a 401 before acting on the request, so this is safe for POSTs too. Any
+    /// other outcome of the check says nothing about the grant, and the 401 is returned for the
+    /// caller to report.
+    private func sendAuthorized(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        let (data, http) = try await sendHTTP(request)
+        guard http.statusCode == 401 else { return (data, http) }
+
+        let refreshed: String?
+        do {
+            refreshed = try await refreshAccessToken()
+        } catch YouTubeError.accessWithdrawn {
+            throw YouTubeError.accessWithdrawn
+        } catch {
+            return (data, http)
+        }
+        // Nil: signed out or in again meanwhile, so the request's session is gone.
+        guard let refreshed else { return (data, http) }
+
+        var retry = request
+        retry.setValue("Bearer \(refreshed)", forHTTPHeaderField: "Authorization")
+        return try await sendHTTP(retry)
+    }
+
+    private func sendHTTP(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        let (data, response) = try await send(request)
+        guard let http = response as? HTTPURLResponse else {
+            throw YouTubeError.invalidResponse
+        }
+        return (data, http)
+    }
+
+    func fetchChannelInfo() async {
         do {
             let url = URL(string: "https://www.googleapis.com/youtube/v3/channels?part=snippet,statistics&mine=true")!
             let request = try await makeAuthorizedRequest(url: url)
-
-            let (data, response) = try await URLSession.shared.data(for: request)
-
-            guard let httpResponse = response as? HTTPURLResponse else {
-                throw YouTubeError.invalidResponse
-            }
+            let (data, httpResponse) = try await sendAuthorized(request)
 
             if httpResponse.statusCode == 200 {
                 let channelResponse = try JSONDecoder().decode(YouTubeChannelResponse.self, from: data)
@@ -478,11 +562,7 @@ public actor YouTubeClient: ObservableObject {
                     )
 
                     // Save channel ID for future use
-                    KeychainManager.save(
-                        value: channel.id,
-                        service: keychainServiceBase,
-                        account: KeychainKey.channelId,
-                    )
+                    store.save(channel.id, for: KeychainKey.channelId)
 
                     await MainActor.run {
                         self.channelInfo = info
@@ -506,11 +586,7 @@ public actor YouTubeClient: ObservableObject {
     public func fetchStreamKey() async throws -> String? {
         let url = URL(string: "https://www.googleapis.com/youtube/v3/liveStreams?part=cdn,snippet&mine=true")!
         let request = try await makeAuthorizedRequest(url: url)
-        let (data, response) = try await URLSession.shared.data(for: request)
-
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw YouTubeError.invalidResponse
-        }
+        let (data, httpResponse) = try await sendAuthorized(request)
 
         if httpResponse.statusCode == 200 {
             let streamResponse = try JSONDecoder().decode(YouTubeLiveStreamResponse.self, from: data)
@@ -553,11 +629,7 @@ public actor YouTubeClient: ObservableObject {
 
         request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw YouTubeError.invalidResponse
-        }
+        let (data, httpResponse) = try await sendAuthorized(request)
 
         if httpResponse.statusCode == 200 || httpResponse.statusCode == 201 {
             let stream = try JSONDecoder().decode(YouTubeLiveStreamResponse.LiveStream.self, from: data)
@@ -583,9 +655,9 @@ public actor YouTubeClient: ObservableObject {
         // 1. Get or create a live stream
         let url = URL(string: "https://www.googleapis.com/youtube/v3/liveStreams?part=cdn,snippet&mine=true")!
         let listRequest = try await makeAuthorizedRequest(url: url)
-        let (listData, listResponse) = try await URLSession.shared.data(for: listRequest)
+        let (listData, listHttp) = try await sendAuthorized(listRequest)
 
-        guard let listHttp = listResponse as? HTTPURLResponse, listHttp.statusCode == 200 else {
+        guard listHttp.statusCode == 200 else {
             throw YouTubeError.googleError("Failed to list live streams")
         }
 
@@ -620,14 +692,12 @@ public actor YouTubeClient: ObservableObject {
         ]
         broadcastRequest.httpBody = try JSONSerialization.data(withJSONObject: broadcastBody)
 
-        let (broadcastData, broadcastResponse) = try await URLSession.shared.data(for: broadcastRequest)
-        guard let broadcastHttp = broadcastResponse as? HTTPURLResponse,
-              (200...201).contains(broadcastHttp.statusCode) else {
+        let (broadcastData, broadcastHttp) = try await sendAuthorized(broadcastRequest)
+        guard (200...201).contains(broadcastHttp.statusCode) else {
             if let errorResponse = try? JSONDecoder().decode(GoogleErrorResponse.self, from: broadcastData) {
                 throw YouTubeError.googleError("Broadcast creation failed: \(errorResponse.error_description ?? errorResponse.error)")
             }
-            let code = (broadcastResponse as? HTTPURLResponse)?.statusCode ?? 0
-            throw YouTubeError.googleError("Broadcast creation failed (HTTP \(code))")
+            throw YouTubeError.googleError("Broadcast creation failed (HTTP \(broadcastHttp.statusCode))")
         }
 
         let broadcast = try JSONDecoder().decode(YouTubeBroadcastResponse.self, from: broadcastData)
@@ -639,8 +709,8 @@ public actor YouTubeClient: ObservableObject {
         bindRequest.httpMethod = "POST"
         bindRequest.httpBody = Data() // empty body required
 
-        let (_, bindResponse) = try await URLSession.shared.data(for: bindRequest)
-        guard let bindHttp = bindResponse as? HTTPURLResponse, bindHttp.statusCode == 200 else {
+        let (_, bindHttp) = try await sendAuthorized(bindRequest)
+        guard bindHttp.statusCode == 200 else {
             throw YouTubeError.googleError("Failed to bind stream to broadcast")
         }
 
@@ -651,9 +721,9 @@ public actor YouTubeClient: ObservableObject {
     public func getBroadcastStatus(broadcastId: String) async throws -> String {
         let url = URL(string: "https://www.googleapis.com/youtube/v3/liveBroadcasts?id=\(broadcastId)&part=status")!
         let request = try await makeAuthorizedRequest(url: url)
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, httpResponse) = try await sendAuthorized(request)
 
-        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+        guard httpResponse.statusCode == 200 else {
             throw YouTubeError.googleError("Failed to get broadcast status")
         }
 
@@ -702,10 +772,7 @@ public actor YouTubeClient: ObservableObject {
         request.httpMethod = "POST"
         request.httpBody = Data()
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw YouTubeError.invalidResponse
-        }
+        let (data, httpResponse) = try await sendAuthorized(request)
 
         // Log the full response for debugging
         if httpResponse.statusCode != 200 {
@@ -734,26 +801,28 @@ public actor YouTubeClient: ObservableObject {
     }
 
     /// Ends a broadcast by transitioning to "complete".
+    ///
+    /// Best-effort: an answer other than 200 is ignored. It throws only when no request could
+    /// be made or sent, or when Google reports the grant withdrawn (`accessWithdrawn`).
     public func endBroadcast(broadcastId: String) async throws {
         let url = URL(string: "https://www.googleapis.com/youtube/v3/liveBroadcasts/transition?broadcastStatus=complete&id=\(broadcastId)&part=status")!
         var request = try await makeAuthorizedRequest(url: url)
         request.httpMethod = "POST"
         request.httpBody = Data()
 
-        let (_, response) = try await URLSession.shared.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-            // Best-effort — don't throw on end
-            return
-        }
+        _ = try await sendAuthorized(request)
     }
 
-    /// Fetches the liveChatId for a broadcast
+    /// Fetches the liveChatId for a broadcast.
+    ///
+    /// - Returns: nil when YouTube answers other than 200. Throws `accessWithdrawn` when Google
+    ///   reports the grant withdrawn.
     public func getLiveChatId(broadcastId: String) async throws -> String? {
         let url = URL(string: "https://www.googleapis.com/youtube/v3/liveBroadcasts?id=\(broadcastId)&part=snippet")!
         let request = try await makeAuthorizedRequest(url: url)
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, httpResponse) = try await sendAuthorized(request)
 
-        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+        guard httpResponse.statusCode == 200 else {
             return nil
         }
 
@@ -788,10 +857,10 @@ public actor YouTubeClient: ObservableObject {
         }
 
         let request = try await makeAuthorizedRequest(url: urlComponents.url!)
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, httpResponse) = try await sendAuthorized(request)
 
-        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-            throw YouTubeError.httpError(statusCode: (response as? HTTPURLResponse)?.statusCode ?? 0)
+        guard httpResponse.statusCode == 200 else {
+            throw YouTubeError.httpError(statusCode: httpResponse.statusCode)
         }
 
         return data
@@ -814,9 +883,8 @@ public actor YouTubeClient: ObservableObject {
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse,
-              (200...201).contains(httpResponse.statusCode) else {
+        let (data, httpResponse) = try await sendAuthorized(request)
+        guard (200...201).contains(httpResponse.statusCode) else {
             throw YouTubeError.googleError("Failed to create live stream")
         }
 
@@ -930,10 +998,7 @@ public actor YouTubeClient: ObservableObject {
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse else {
-            throw YouTubeError.invalidResponse
-        }
+        let (data, http) = try await sendAuthorized(request)
         guard http.statusCode == 200 else {
             if let apiError = try? JSONDecoder().decode(YouTubeAPIError.self, from: data),
                let reason = apiError.error.errors.first?.reason {
@@ -1166,6 +1231,33 @@ public actor YouTubeClient: ObservableObject {
 
 // MARK: - Supporting Types
 
+/// Sends one request to Google.
+typealias YouTubeSend = @Sendable (URLRequest) async throws -> (Data, URLResponse)
+
+/// Where `YouTubeClient` keeps the session's tokens and channel ID, by account name.
+protocol YouTubeSessionStore: Sendable {
+    func value(for account: String) -> String?
+    func save(_ value: String, for account: String)
+    func delete(_ account: String)
+}
+
+/// The app's session store: generic passwords in the Keychain under one service.
+struct KeychainYouTubeSessionStore: YouTubeSessionStore {
+    let service: String
+
+    func value(for account: String) -> String? {
+        KeychainManager.getValue(service: service, account: account)
+    }
+
+    func save(_ value: String, for account: String) {
+        KeychainManager.save(value: value, service: service, account: account)
+    }
+
+    func delete(_ account: String) {
+        try? KeychainManager.delete(service: service, account: account)
+    }
+}
+
 struct YouTubeBroadcastResponse: Codable {
     let id: String
     let snippet: Snippet?
@@ -1294,6 +1386,8 @@ public enum YouTubeError: LocalizedError {
     case googleError(String)
     case userCancelled
     case authSessionFailed
+    /// Google reported the grant gone; the stored session has been cleared.
+    case accessWithdrawn
     case unknown(Error)
 
     public var errorDescription: String? {
@@ -1314,6 +1408,8 @@ public enum YouTubeError: LocalizedError {
             "User cancelled the login"
         case .authSessionFailed:
             "Failed to start authentication session"
+        case .accessWithdrawn:
+            "YouTube access was removed in your Google Account. Sign in again to reconnect."
         case let .unknown(error):
             "Unknown error: \(error.localizedDescription)"
         }

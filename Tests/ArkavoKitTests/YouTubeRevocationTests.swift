@@ -64,3 +64,28 @@ final class YouTubeRevocationTests: XCTestCase {
         XCTAssertEqual(offline, .failed)
     }
 }
+
+/// Google reports a grant the person removed (or that expired) as `invalid_grant` on a token
+/// refresh. Only that answer ends the stored session; anything else may be a passing failure.
+final class YouTubeAccessWithdrawnTests: XCTestCase {
+    func testOnlyInvalidGrantOnARefreshMeansTheGrantIsGone() {
+        func withdrawn(_ status: Int, _ body: String) -> Bool {
+            YouTubeClient.grantWithdrawn(status: status, data: Data(body.utf8))
+        }
+        XCTAssertTrue(withdrawn(400, #"{"error":"invalid_grant","error_description":"Token has been expired or revoked."}"#))
+        XCTAssertTrue(withdrawn(400, #"{"error":"invalid_grant"}"#))
+
+        XCTAssertFalse(withdrawn(400, #"{"error":"invalid_request"}"#))
+        XCTAssertFalse(withdrawn(401, #"{"error":"invalid_client"}"#))
+        XCTAssertFalse(withdrawn(400, "not json"))
+        XCTAssertFalse(withdrawn(500, #"{"error":"invalid_grant"}"#), "a server error is not a verdict on the grant")
+        XCTAssertFalse(withdrawn(503, ""))
+        XCTAssertFalse(withdrawn(200, #"{"error":"invalid_grant"}"#))
+    }
+
+    func testTheWithdrawnErrorTellsThePersonToSignInAgain() {
+        XCTAssertEqual(
+            YouTubeError.accessWithdrawn.errorDescription,
+            "YouTube access was removed in your Google Account. Sign in again to reconnect.")
+    }
+}
