@@ -143,19 +143,21 @@ struct DroppedMediaTests {
     /// Presentation times and lengths of the file's decoded audio buffers, in file order. The
     /// reader's end-of-track and trim markers carry no samples and are left out.
     static func audioBufferTimes(_ url: URL) async throws -> [(pts: CMTime, frames: Int)] {
-        let asset = AVURLAsset(url: url)
-        let track = try #require(try await asset.loadTracks(withMediaType: .audio).first)
-        let reader = try AVAssetReader(asset: asset)
-        let output = AVAssetReaderTrackOutput(track: track, outputSettings: [AVFormatIDKey: kAudioFormatLinearPCM])
-        let buffers = reader.outputProvider(for: output)
-        try reader.start()
-        var times: [(pts: CMTime, frames: Int)] = []
-        while let buffer = try await buffers.next() {
-            let frames = buffer.sampleCount
-            guard frames > 0 else { continue }
-            times.append((buffer.presentationTimeStamp, frames))
+        try await readingOffThePool {
+            let asset = AVURLAsset(url: url)
+            let track = try #require(try await asset.loadTracks(withMediaType: .audio).first)
+            let reader = try AVAssetReader(asset: asset)
+            let output = AVAssetReaderTrackOutput(track: track, outputSettings: [AVFormatIDKey: kAudioFormatLinearPCM])
+            let buffers = reader.outputProvider(for: output)
+            try reader.start()
+            var times: [(pts: CMTime, frames: Int)] = []
+            while let buffer = try await buffers.next() {
+                let frames = buffer.sampleCount
+                guard frames > 0 else { continue }
+                times.append((buffer.presentationTimeStamp, frames))
+            }
+            return times
         }
-        return times
     }
 
     @Test("A new recording starts with no drops counted")
@@ -180,16 +182,18 @@ struct DroppedMediaTests {
 
     /// Linear PCM frames decoded from the file's audio track
     static func decodedFrames(_ url: URL) async throws -> Int {
-        let asset = AVURLAsset(url: url)
-        let track = try #require(try await asset.loadTracks(withMediaType: .audio).first)
-        let reader = try AVAssetReader(asset: asset)
-        let output = AVAssetReaderTrackOutput(track: track, outputSettings: [AVFormatIDKey: kAudioFormatLinearPCM])
-        let buffers = reader.outputProvider(for: output)
-        try reader.start()
-        var frames = 0
-        while let buffer = try await buffers.next() {
-            frames += buffer.sampleCount
+        try await readingOffThePool {
+            let asset = AVURLAsset(url: url)
+            let track = try #require(try await asset.loadTracks(withMediaType: .audio).first)
+            let reader = try AVAssetReader(asset: asset)
+            let output = AVAssetReaderTrackOutput(track: track, outputSettings: [AVFormatIDKey: kAudioFormatLinearPCM])
+            let buffers = reader.outputProvider(for: output)
+            try reader.start()
+            var frames = 0
+            while let buffer = try await buffers.next() {
+                frames += buffer.sampleCount
+            }
+            return frames
         }
-        return frames
     }
 }

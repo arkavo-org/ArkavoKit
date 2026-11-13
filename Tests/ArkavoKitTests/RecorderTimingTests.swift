@@ -33,15 +33,18 @@ struct RecorderTimingTests {
         _ = try await encoder.finishRecording()
 
         let dropped = await encoder.droppedMedia.video
-        let asset = AVURLAsset(url: url)
-        let track = try #require(try await asset.loadTracks(withMediaType: .video).first)
-        let reader = try AVAssetReader(asset: asset)
-        let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
-        let buffers = reader.outputProvider(for: output)
-        try reader.start()
-        var written = 0
-        while let buffer = try await buffers.next() {
-            written += buffer.sampleCount
+        let written = try await readingOffThePool {
+            let asset = AVURLAsset(url: url)
+            let track = try #require(try await asset.loadTracks(withMediaType: .video).first)
+            let reader = try AVAssetReader(asset: asset)
+            let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+            let buffers = reader.outputProvider(for: output)
+            try reader.start()
+            var written = 0
+            while let buffer = try await buffers.next() {
+                written += buffer.sampleCount
+            }
+            return written
         }
         #expect(written + dropped.total == frames, "wrote \(written), dropped \(dropped)")
         #expect(dropped.outOfOrder == 0, "\(dropped)")
