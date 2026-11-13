@@ -807,26 +807,28 @@ struct RecordingSessionStopTests {
     }
 
     /// The average color at the center of each video frame in the file.
-    private static func centerColors(in url: URL) async throws -> [(r: UInt8, g: UInt8, b: UInt8, a: UInt8)] {
-        let asset = AVURLAsset(url: url)
-        let track = try #require(try await asset.loadTracks(withMediaType: .video).first)
-        let reader = try AVAssetReader(asset: asset)
-        let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-        ])
-        let samples = reader.outputProvider(for: output)
-        try reader.start()
-        var colors: [(r: UInt8, g: UInt8, b: UInt8, a: UInt8)] = []
-        while let ready = try await samples.next() {
-            let color = ready.withUnsafeSampleBuffer { sample -> (r: UInt8, g: UInt8, b: UInt8, a: UInt8)? in
-                guard let pixel = CMSampleBufferGetImageBuffer(sample) else { return nil }
-                let width = CVPixelBufferGetWidth(pixel), height = CVPixelBufferGetHeight(pixel)
-                let center = CGRect(x: width / 2 - 20, y: height / 2 - 20, width: 40, height: 40)
-                return getAverageColor(in: pixel, region: center)
+    nonisolated private static func centerColors(in url: URL) async throws -> [(r: UInt8, g: UInt8, b: UInt8, a: UInt8)] {
+        try await readingOffThePool {
+            let asset = AVURLAsset(url: url)
+            let track = try #require(try await asset.loadTracks(withMediaType: .video).first)
+            let reader = try AVAssetReader(asset: asset)
+            let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            ])
+            let samples = reader.outputProvider(for: output)
+            try reader.start()
+            var colors: [(r: UInt8, g: UInt8, b: UInt8, a: UInt8)] = []
+            while let ready = try await samples.next() {
+                let color = ready.withUnsafeSampleBuffer { sample -> (r: UInt8, g: UInt8, b: UInt8, a: UInt8)? in
+                    guard let pixel = CMSampleBufferGetImageBuffer(sample) else { return nil }
+                    let width = CVPixelBufferGetWidth(pixel), height = CVPixelBufferGetHeight(pixel)
+                    let center = CGRect(x: width / 2 - 20, y: height / 2 - 20, width: 40, height: 40)
+                    return getAverageColor(in: pixel, region: center)
+                }
+                if let color { colors.append(color) }
             }
-            if let color { colors.append(color) }
+            return colors
         }
-        return colors
     }
 
     /// A 1 kHz tone (silence at amplitude 0) stamped with the host clock, as capture sources are.
@@ -837,32 +839,34 @@ struct RecordingSessionStopTests {
     }
 
     /// The largest absolute sample value in the file's decoded audio.
-    private static func peakAudioSample(in url: URL) async throws -> Int {
-        let asset = AVURLAsset(url: url)
-        let track = try #require(try await asset.loadTracks(withMediaType: .audio).first)
-        let reader = try AVAssetReader(asset: asset)
-        let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
-            AVFormatIDKey: kAudioFormatLinearPCM,
-            AVLinearPCMBitDepthKey: 16,
-            AVLinearPCMIsFloatKey: false,
-            AVLinearPCMIsBigEndianKey: false,
-            AVLinearPCMIsNonInterleaved: false,
-        ])
-        let buffers = reader.outputProvider(for: output)
-        try reader.start()
-        var peak = 0
-        while let ready = try await buffers.next() {
-            let bufferPeak = ready.withUnsafeSampleBuffer { buffer -> Int in
-                guard let block = CMSampleBufferGetDataBuffer(buffer) else { return 0 }
-                var samples = [Int16](repeating: 0, count: CMBlockBufferGetDataLength(block) / 2)
-                _ = samples.withUnsafeMutableBytes {
-                    CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: $0.count, destination: $0.baseAddress!)
+    nonisolated private static func peakAudioSample(in url: URL) async throws -> Int {
+        try await readingOffThePool {
+            let asset = AVURLAsset(url: url)
+            let track = try #require(try await asset.loadTracks(withMediaType: .audio).first)
+            let reader = try AVAssetReader(asset: asset)
+            let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
+                AVFormatIDKey: kAudioFormatLinearPCM,
+                AVLinearPCMBitDepthKey: 16,
+                AVLinearPCMIsFloatKey: false,
+                AVLinearPCMIsBigEndianKey: false,
+                AVLinearPCMIsNonInterleaved: false,
+            ])
+            let buffers = reader.outputProvider(for: output)
+            try reader.start()
+            var peak = 0
+            while let ready = try await buffers.next() {
+                let bufferPeak = ready.withUnsafeSampleBuffer { buffer -> Int in
+                    guard let block = CMSampleBufferGetDataBuffer(buffer) else { return 0 }
+                    var samples = [Int16](repeating: 0, count: CMBlockBufferGetDataLength(block) / 2)
+                    _ = samples.withUnsafeMutableBytes {
+                        CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: $0.count, destination: $0.baseAddress!)
+                    }
+                    return samples.map { abs(Int($0)) }.max() ?? 0
                 }
-                return samples.map { abs(Int($0)) }.max() ?? 0
+                peak = max(peak, bufferPeak)
             }
-            peak = max(peak, bufferPeak)
+            return peak
         }
-        return peak
     }
 }
 
