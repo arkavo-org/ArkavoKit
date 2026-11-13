@@ -75,6 +75,9 @@ public actor VideoEncoder {
     /// Each audio input's latest appended buffer, on the file's timeline. Forgotten at a resume,
     /// which moves the rest of the recording back to close the pause.
     private var lastAudioAppended: [String: (start: CMTime, end: CMTime)] = [:]
+    /// Whether the writer's session has started. It starts once per recording, so this stays true
+    /// even when the buffer that started it isn't taken; `startTime == nil` means the file's
+    /// timeline has no zero point yet.
     private var sessionStarted: Bool = false
     /// Whether the file got at least one video frame or audio sample
     private var appendedMedia: Bool = false
@@ -107,6 +110,8 @@ public actor VideoEncoder {
     private var streamsWithoutDestinationForTesting = false
     /// Tests: awaited once `finishRecording()` has begun, before the file is finished
     private var finishingHookForTesting: (@Sendable () async -> Void)?
+    /// Tests: what the next appends to the file get instead of the writer's answer, in order
+    private var refusalsForTesting: [RefusalForTesting] = []
 
     /// Whether any streaming (regular RTMP or NTDF) is active
     private var isStreaming: Bool { !streamDestinations.isEmpty || streamsWithoutDestinationForTesting }
@@ -532,13 +537,21 @@ public actor VideoEncoder {
             return
         }
 
-        // Initialize session on the first frame
-        if !sessionStarted {
-            sessionStarted = true
+        // Whether the file takes the frame is known only once it's appended, so the timeline it
+        // sets (the file's start, a pause's gap) is undone if it isn't (#44)
+        let timeline = (startTime, resumePending, totalPausedDuration)
+        var appended = false
+        defer { if !appended { (startTime, resumePending, totalPausedDuration) = timeline } }
+
+        // The first frame sets the file's start
+        if startTime == nil {
             startTime = timestamp
-            // Start session at time zero - we'll normalize all timestamps
-            assetWriter.startSession(atSourceTime: .zero)
             lastVideoTimestamp = nil
+            if !sessionStarted {
+                sessionStarted = true
+                // Start session at time zero - we'll normalize all timestamps
+                assetWriter.startSession(atSourceTime: .zero)
+            }
             print("📹 VideoEncoder: Session started, base timestamp \(timestamp.seconds)")
         }
 
@@ -581,7 +594,7 @@ public actor VideoEncoder {
 
         // Append pixel buffer to file. False: a real-time input that fell behind; a throw: it failed.
         do {
-            guard try videoReceiver.appendImmediately(frame, with: adjustedTimestamp) else {
+            guard try refusalForTesting() ?? videoReceiver.appendImmediately(frame, with: adjustedTimestamp) else {
                 droppedMedia.video.notReady += 1
                 return
             }
@@ -598,6 +611,7 @@ public actor VideoEncoder {
             }
             return
         }
+        appended = true
         appendedMedia = true
         lastVideoTimestamp = adjustedTimestamp
         appendedMediaEnd = CMTimeMaximum(appendedMediaEnd, CMTimeAdd(adjustedTimestamp, CMTime(value: 1, timescale: frameRate)))
@@ -668,12 +682,19 @@ public actor VideoEncoder {
             return
         }
 
-        // Audio-only: start the session with the first sample
-        if isAudioOnly && !sessionStarted {
+        // As for video: the timeline this sample sets is undone unless the file takes it (#44)
+        let timeline = (startTime, resumePending, totalPausedDuration)
+        var appended = false
+        defer { if !appended { (startTime, resumePending, totalPausedDuration) = timeline } }
+
+        // Audio-only: the first sample sets the file's start
+        if isAudioOnly && startTime == nil {
             let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-            sessionStarted = true
             startTime = timestamp
-            writer.startSession(atSourceTime: .zero)
+            if !sessionStarted {
+                sessionStarted = true
+                writer.startSession(atSourceTime: .zero)
+            }
             print("🎵 VideoEncoder: Audio-only session started, base timestamp \(timestamp.seconds)")
         }
 
@@ -725,7 +746,7 @@ public actor VideoEncoder {
         // nobody writes to, so the writer can read them while the stream encoder does too.
         nonisolated(unsafe) let handedOver = finalBuffer
         do {
-            guard try audioReceiver.appendImmediately(CMReadySampleBuffer(unsafeBuffer: handedOver)) else {
+            guard try refusalForTesting() ?? audioReceiver.appendImmediately(CMReadySampleBuffer(unsafeBuffer: handedOver)) else {
                 droppedMedia.audio.notReady += 1
                 return
             }
@@ -734,6 +755,7 @@ public actor VideoEncoder {
             print("⚠️ Audio input [\(sourceID)] rejected sample buffer; dropping frame: \(error.localizedDescription)")
             return
         }
+        appended = true
         appendedMedia = true
         let end = duration.isValid ? CMTimeAdd(adjustedTimestamp, duration) : adjustedTimestamp
         lastAudioAppended[sourceID] = (adjustedTimestamp, end)
@@ -1025,6 +1047,25 @@ public actor VideoEncoder {
     /// file is being finished.
     func setFinishingHookForTesting(_ hook: (@Sendable () async -> Void)?) {
         finishingHookForTesting = hook
+    }
+
+    /// Tests: how the writer refuses a buffer. `notReady`: `appendImmediately` returns false,
+    /// as for a real-time input that fell behind. `failed`: it throws, as for a failed writer.
+    enum RefusalForTesting: Sendable { case notReady, failed }
+
+    /// Tests: the next appends to the file, video or audio, get `refusals` in order instead of
+    /// reaching the writer.
+    func refuseAppendsForTesting(_ refusals: [RefusalForTesting]) {
+        refusalsForTesting = refusals
+    }
+
+    /// The next scripted refusal: false for not ready, a throw for failed; nil when none is left
+    private func refusalForTesting() throws -> Bool? {
+        guard !refusalsForTesting.isEmpty else { return nil }
+        switch refusalsForTesting.removeFirst() {
+        case .notReady: return false
+        case .failed: throw RecorderError.encodingFailed
+        }
     }
 
     /// Stop streaming to a single destination (others continue)
