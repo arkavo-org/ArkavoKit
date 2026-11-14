@@ -10,11 +10,15 @@ public enum CreatorCatalogError: Error, Sendable, Equatable {
 }
 
 /// Why a fetched catalog is not the one a verified pointer names. `CatalogEnvelope.verify` checks the envelope's bytes
-/// (the first three cases); `CreatorCatalog.decode(_:owner:)` checks its decrypted payload (the last two).
+/// (the first three cases); `CreatorCatalog.decode(_:owner:)` checks its decrypted payload (`invalid`, `ownerMismatch`);
+/// `CreatorCatalog.checkIndexHash(against:)` checks its entries against a `/2` pointer's `indexHash`
+/// (`indexHashMismatch`).
 public enum CatalogDocumentError: Error, Sendable, Equatable {
     case tooLarge, sizeMismatch, hashMismatch
     case invalid(CreatorCatalogError)
     case ownerMismatch
+    /// The entries are not the index the `/2` pointer signs: their `canonicalIndexHash()` is not its `indexHash`.
+    case indexHashMismatch
 }
 
 /// A creator's catalog, `arkavo.creator-catalog/2` (tdf-iroh-s3 `docs/creator-catalogs.md`, as amended on
@@ -155,6 +159,25 @@ public struct CreatorCatalog: Sendable, Equatable {
         }
         guard catalog.owner.utf8.elementsEqual(owner.utf8) else { throw .ownerMismatch }
         return catalog
+    }
+
+    /// Checks this catalog, decrypted from the envelope `pointer` names, against the index the pointer signs: a `/2`
+    /// pointer's `indexHash` must be this catalog's `canonicalIndexHash()` (`.indexHashMismatch`), and a catalog the format
+    /// refuses is `.invalid`. A `/1` pointer signs no index, so there is nothing to check.
+    ///
+    /// The contract doesn't ask readers for this check, and `CatalogEnvelope.verify` and `decode(_:owner:)` don't run it:
+    /// the node checks the clear index a publish sends against `indexHash`, and the document's entries agree with that index
+    /// only by the creator's honesty. A reader that wants to refuse a document whose entries aren't the index its creator
+    /// signed calls this after `decode(_:owner:)`.
+    public func checkIndexHash(against pointer: CatalogPointer) throws(CatalogDocumentError) {
+        guard let signed = pointer.indexHash else { return }
+        let hash: String
+        do {
+            hash = try canonicalIndexHash()
+        } catch {
+            throw .invalid(error)
+        }
+        guard hash.utf8.elementsEqual(signed.utf8) else { throw .indexHashMismatch }
     }
 
     // MARK: - The index

@@ -58,7 +58,8 @@ public enum CatalogEnvelope {
     /// Checks fetched envelope bytes against the verified pointer that names them, in this order: the size limit
     /// (`.tooLarge`), the pointer's `catalogSize` (`.sizeMismatch`), then its `catalogHash` with the caller's BLAKE3, as
     /// 64 lowercase hex (`.hashMismatch`). Unwrap the envelope next, then decode its payload with
-    /// `CreatorCatalog.decode(_:owner:)` and the pointer's owner.
+    /// `CreatorCatalog.decode(_:owner:)` and the pointer's owner. The contract stops there; a reader may also check the
+    /// entries against a `/2` pointer's `indexHash` with `CreatorCatalog.checkIndexHash(against:)`.
     public static func verify(_ envelope: Data, pointer: CatalogPointer,
                               blake3: (Data) -> String) throws(CatalogDocumentError) {
         guard envelope.count <= maxBytes else { throw .tooLarge }

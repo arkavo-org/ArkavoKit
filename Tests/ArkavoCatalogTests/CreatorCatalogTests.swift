@@ -164,6 +164,64 @@ struct CreatorCatalogTests {
         #expect(throws: CatalogDocumentError.ownerMismatch) { try CreatorCatalog.decode(data, owner: "someone-else") }
     }
 
+    // MARK: The index a /2 pointer signs
+
+    /// A `/2` pointer of this catalog's owner signing `indexHash`.
+    static func pointer2(indexHash: String) throws -> CatalogPointer {
+        try CatalogPointer(owner: owner, seq: 1, catalogHash: CatalogV2Fixture.documentHash, catalogSize: 97,
+                           indexHash: indexHash, issuedAt: CatalogV2Fixture.pointerIssuedAt)
+    }
+
+    /// The reader's flow: decode the decrypted payload for the pointer's owner, then check the entries against the index
+    /// the pointer signs, whatever order the document lists them in.
+    @Test func aPayloadMatchesThePointer2ThatSignsItsIndex() throws {
+        let entries = Self.twoEntries.map {
+            "{\"contentID\":\"\($0.contentID)\",\"version\":\($0.version),\"payloadHash\":\"\($0.payloadHash)\",\"payloadSize\":\($0.payloadSize),\"metadata\":\"enRkZg\"}"
+        }
+        let payload = Data(#"{"schema":"arkavo.creator-catalog/2","owner":"\#(Self.owner)","entries":[\#(entries.joined(separator: ","))]}"#.utf8)
+        let pointer = try Self.pointer2(indexHash: Self.twoIndexHash)
+        let catalog = try CreatorCatalog.decode(payload, owner: pointer.owner)
+        #expect(throws: Never.self) { try catalog.checkIndexHash(against: pointer) }
+        #expect(throws: Never.self) {
+            try CreatorCatalog(owner: Self.owner).checkIndexHash(against: Self.pointer2(indexHash: Self.emptyIndexHash))
+        }
+    }
+
+    @Test func aPointer2ThatSignsAnotherIndexIsAMismatch() throws {
+        let catalog = Self.catalog(Self.twoEntries)
+        for other in [Self.emptyIndexHash, Self.byteOrderIndexHash, String(repeating: "0", count: 64)] {
+            #expect(throws: CatalogDocumentError.indexHashMismatch) {
+                try catalog.checkIndexHash(against: Self.pointer2(indexHash: other))
+            }
+        }
+        // One entry's version differs from the signed index.
+        var changed = catalog
+        changed.upsert(CreatorCatalog.Entry(contentID: "rec-a", version: 4, payloadHash: String(repeating: "aa", count: 32),
+                                            payloadSize: 1_024, metadata: Self.metadata))
+        #expect(throws: CatalogDocumentError.indexHashMismatch) {
+            try changed.checkIndexHash(against: Self.pointer2(indexHash: Self.twoIndexHash))
+        }
+        // An empty catalog under a pointer that signed two entries.
+        #expect(throws: CatalogDocumentError.indexHashMismatch) {
+            try CreatorCatalog(owner: Self.owner).checkIndexHash(against: Self.pointer2(indexHash: Self.twoIndexHash))
+        }
+    }
+
+    /// A `/1` pointer signs no index, so there is nothing to check.
+    @Test func aPointer1HasNoIndexToCheck() throws {
+        let pointer = try CatalogPointer.decode(CatalogV2Fixture.makePointer(owner: Self.owner))
+        #expect(pointer.indexHash == nil)
+        #expect(throws: Never.self) { try Self.catalog(Self.twoEntries).checkIndexHash(against: pointer) }
+        #expect(throws: Never.self) { try CreatorCatalog(owner: Self.owner).checkIndexHash(against: pointer) }
+    }
+
+    @Test func aCatalogTheFormatRefusesIsInvalid() throws {
+        let bad = CreatorCatalog(owner: Self.owner, entries: [Self.entry(version: 0)])
+        #expect(throws: CatalogDocumentError.invalid(.version(0))) {
+            try bad.checkIndexHash(against: Self.pointer2(indexHash: Self.emptyIndexHash))
+        }
+    }
+
     // MARK: The index
 
     @Test func theIndexIsTheEntriesWithoutTheirMetadata() throws {
