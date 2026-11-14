@@ -124,6 +124,68 @@ struct CatalogEnvelopeTests {
         }
     }
 
+    // MARK: The index a /2 pointer signs
+
+    /// A bundle around a `/1` pointer to `envelope`, which signs no index.
+    static func bundle1(for envelope: Data = envelope) throws -> CatalogBundle {
+        let pointer = CatalogV2Fixture.makePointer(owner: owner, seq: 1, catalogHash: CreatorCatalogTests.sha256(envelope),
+                                                   catalogSize: envelope.count)
+        return try CatalogBundle(pointer: pointer, credentialID: Data([1]), authenticatorData: Data([2]),
+                                 clientDataJSON: Data([3]), signature: Data([4]), attestation: Data([5]))
+    }
+
+    @Test func theBodyTakesA2PointerThatSignsTheCatalogsIndex() throws {
+        let bundle = try Self.bundle(listing: Self.catalog)
+        #expect(try CatalogPointer.decode(bundle.pointer).indexHash == Self.catalog.canonicalIndexHash())
+        #expect(throws: Never.self) {
+            try CatalogPublishRequest.body(envelope: Self.envelope, bundle: bundle, catalog: Self.catalog,
+                                           blake3: CreatorCatalogTests.sha256)
+        }
+    }
+
+    /// The node would answer 422 `invalid bundle: indexHash does not match the index`.
+    @Test func theBodyRefusesA2PointerThatSignsAnotherIndex() throws {
+        let others = [
+            CreatorCatalog(owner: Self.owner),
+            CreatorCatalog(owner: Self.owner, entries: [CreatorCatalogTests.entry(version: 2)]),
+            CreatorCatalog(owner: Self.owner, entries: [CreatorCatalogTests.entry(), CreatorCatalogTests.entry("rec-b")]),
+        ]
+        for other in others {
+            let bundle = try Self.bundle(listing: other)
+            #expect(try CatalogPointer.decode(bundle.pointer).indexHash != Self.catalog.canonicalIndexHash())
+            #expect(throws: CatalogPublishRequestError.pointerMismatch) {
+                try CatalogPublishRequest.body(envelope: Self.envelope, bundle: bundle, catalog: Self.catalog,
+                                               blake3: CreatorCatalogTests.sha256)
+            }
+        }
+    }
+
+    /// The node requires `/1` until its switch to `/2`, so a `/1` pointer, which signs no index, still makes a body.
+    @Test func theBodyStillTakesA1Pointer() throws {
+        let bundle = try Self.bundle1()
+        #expect(try CatalogPointer.decode(bundle.pointer).indexHash == nil)
+        let body = try CatalogPublishRequest.body(envelope: Self.envelope, bundle: bundle, catalog: Self.catalog,
+                                                  blake3: CreatorCatalogTests.sha256)
+        let root = try #require(StrictJSON.parse(body)?.object)
+        #expect(root["bundle"]?.object?["pointer"]?.string.flatMap(Base64URL.decode) == bundle.pointer)
+        // Every other check still applies to a `/1`.
+        #expect(throws: CatalogPublishRequestError.pointerMismatch) {
+            try CatalogPublishRequest.body(envelope: Self.envelope + Data([0]), bundle: bundle, catalog: Self.catalog,
+                                           blake3: CreatorCatalogTests.sha256)
+        }
+    }
+
+    /// A catalog the format refuses is still `.index`, whichever index the pointer signs.
+    @Test func anInvalidCatalogIsAnIndexErrorBeforeAnyIndexHashMismatch() throws {
+        let bad = CreatorCatalog(owner: Self.owner, entries: [CreatorCatalogTests.entry(version: 0)])
+        for bundle in [try Self.bundle(), try Self.bundle1()] {
+            #expect(throws: CatalogPublishRequestError.index(.version(0))) {
+                try CatalogPublishRequest.body(envelope: Self.envelope, bundle: bundle, catalog: bad,
+                                               blake3: CreatorCatalogTests.sha256)
+            }
+        }
+    }
+
     @Test func theBodyRefusesABadEnvelopeOrIndex() throws {
         #expect(throws: CatalogPublishRequestError.envelopeSize) {
             try CatalogPublishRequest.body(envelope: Data(), bundle: Self.bundle(), catalog: Self.catalog,

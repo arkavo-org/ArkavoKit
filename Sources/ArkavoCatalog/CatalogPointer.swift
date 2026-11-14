@@ -7,17 +7,17 @@ import Foundation
 /// One strict JSON object of 1 to 1,024 bytes, in one of two schemas:
 /// - `arkavo.catalog-pointer/2` (`schema`): exactly `schema`, `owner`, `seq`, `catalogHash`, `catalogSize`, `indexHash` and
 ///   `issuedAt`. `indexHash` is the catalog's `CreatorCatalog.canonicalIndexHash()`, so the passkey covers the index the
-///   node checks. The node accepts only `/2` in a publish.
-/// - `arkavo.catalog-pointer/1` (`schema1`): exactly the other six keys. The node still serves a stored `/1` until the
-///   creator's next publish replaces it, so readers decode both.
+///   node checks. Once the node switches to `/2`, it accepts only `/2` in a publish; until then it refuses `/2`.
+/// - `arkavo.catalog-pointer/1` (`schema1`): exactly the other six keys. After the switch the node still serves a stored
+///   `/1` until the creator's next publish replaces it, so readers decode both.
 ///
 /// A `/2` without `indexHash`, a `/1` with one (even `null`), and any other schema are refused. `bytes` are the bytes the
 /// passkey signed. They are carried base64url-encoded and never re-serialized: `decode` keeps the bytes exactly as received,
 /// and the builder writes them once. `issuedAt` is checked for its format only and is never compared with the clock.
 public struct CatalogPointer: Sendable, Equatable {
-    /// The schema a publish carries: seven keys, `indexHash` among them.
+    /// The schema a publish carries once the node switches: seven keys, `indexHash` among them.
     public static let schema = "arkavo.catalog-pointer/2"
-    /// The schema before `indexHash`: exactly six keys. Still read; the node refuses it in a publish.
+    /// The schema before `indexHash`: exactly six keys. Still read; after its switch the node refuses it in a publish.
     public static let schema1 = "arkavo.catalog-pointer/1"
     public static let maxBytes = 1_024
     public static let maxSeq: UInt64 = 9_007_199_254_740_991
