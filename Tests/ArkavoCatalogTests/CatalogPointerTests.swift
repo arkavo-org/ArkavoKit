@@ -2,15 +2,28 @@ import Foundation
 import Testing
 @testable import ArkavoCatalog
 
-/// `arkavo.catalog-pointer/1`: every refusal is one edit of the contract's pointer P7, and the builder writes P7 byte for
-/// byte from its values.
+/// `arkavo.catalog-pointer/2` and `/1`: every refusal is one edit of the contract's pointer P7 or of P7/2, and the builder
+/// writes P7/2 byte for byte from its values. The deprecated `/1` builder still writes P7.
 struct CatalogPointerTests {
     private typealias Fixture = CatalogV2Fixture
 
+    /// P7 with `old` replaced by `new`.
     private static func edited(_ old: String, _ new: String) -> Data {
-        precondition(Fixture.pointerText.contains(old))
-        return Data(Fixture.pointerText.replacingOccurrences(of: old, with: new).utf8)
+        edited(Fixture.pointerText, old, new)
     }
+
+    /// P7/2 with `old` replaced by `new`.
+    private static func edited2(_ old: String, _ new: String) -> Data {
+        edited(Fixture.pointer2Text, old, new)
+    }
+
+    private static func edited(_ text: String, _ old: String, _ new: String) -> Data {
+        precondition(text.contains(old))
+        return Data(text.replacingOccurrences(of: old, with: new).utf8)
+    }
+
+    /// P7/2's `indexHash` member, with its comma.
+    private static let indexHashMember = #""indexHash":"\#(CatalogV2Fixture.indexHash)","#
 
     // MARK: Decoding
 
@@ -25,21 +38,43 @@ struct CatalogPointerTests {
         #expect(pointer.catalogSize == 97)
         #expect(pointer.catalogSize == Fixture.document.count)
         #expect(pointer.issuedAt == Date(timeIntervalSince1970: 1_792_371_723))
+        #expect(pointer.indexHash == nil)
         #expect(pointer.bytes == Fixture.pointer)
     }
 
     @Test
-    func acceptsTheBoundaries() throws {
-        #expect(CreatorCatalog.maxDocumentBytes == 4_194_304)
-        #expect(try CatalogPointer.decode(Self.edited("\"seq\":7", "\"seq\":9007199254740991")).seq == 9_007_199_254_740_991)
-        #expect(try CatalogPointer.decode(Self.edited("\"seq\":7", "\"seq\":1")).seq == 1)
-        #expect(try CatalogPointer.decode(Self.edited("\"catalogSize\":97", "\"catalogSize\":4194304")).catalogSize == 4_194_304)
-        #expect(try CatalogPointer.decode(Self.edited("\"catalogSize\":97", "\"catalogSize\":1")).catalogSize == 1)
+    func decodesThePointer2Fixture() throws {
+        let pointer = try CatalogPointer.decode(Fixture.pointer2)
+        #expect(Fixture.pointer2.count == 303)
+        #expect(pointer.owner == "0a1b2c3d-0000-4000-8000-000000000001")
+        #expect(pointer.seq == 7)
+        #expect(pointer.catalogHash == Fixture.documentHash)
+        #expect(pointer.catalogSize == 97)
+        #expect(pointer.indexHash == "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945")
+        #expect(pointer.issuedAt == Date(timeIntervalSince1970: 1_792_371_723))
+        #expect(pointer.bytes == Fixture.pointer2)
     }
 
     @Test
-    func acceptsSurroundingWhitespaceAndKeepsTheBytes() throws {
-        let padded = Data(" \n\t".utf8) + Fixture.pointer + Data("\r\n ".utf8)
+    func theSchemasAreTheNodes() {
+        #expect(CatalogPointer.schema == "arkavo.catalog-pointer/2")
+        #expect(CatalogPointer.schema1 == "arkavo.catalog-pointer/1")
+    }
+
+    /// P7, then P7/2.
+    @Test(arguments: [false, true])
+    func acceptsTheBoundaries(_ two: Bool) throws {
+        func edited(_ old: String, _ new: String) -> Data { two ? Self.edited2(old, new) : Self.edited(old, new) }
+        #expect(CreatorCatalog.maxDocumentBytes == 4_194_304)
+        #expect(try CatalogPointer.decode(edited("\"seq\":7", "\"seq\":9007199254740991")).seq == 9_007_199_254_740_991)
+        #expect(try CatalogPointer.decode(edited("\"seq\":7", "\"seq\":1")).seq == 1)
+        #expect(try CatalogPointer.decode(edited("\"catalogSize\":97", "\"catalogSize\":4194304")).catalogSize == 4_194_304)
+        #expect(try CatalogPointer.decode(edited("\"catalogSize\":97", "\"catalogSize\":1")).catalogSize == 1)
+    }
+
+    @Test(arguments: [Fixture.pointer, Fixture.pointer2])
+    func acceptsSurroundingWhitespaceAndKeepsTheBytes(_ bytes: Data) throws {
+        let padded = Data(" \n\t".utf8) + bytes + Data("\r\n ".utf8)
         let pointer = try CatalogPointer.decode(padded)
         #expect(pointer.seq == 7)
         #expect(pointer.bytes == padded)
@@ -50,6 +85,11 @@ struct CatalogPointerTests {
         let reordered = Data(
             #"{"issuedAt":"2026-10-19T01:02:03Z","catalogSize":97,"catalogHash":"729d79721d28362279f6e2a5a9e0f7b64a7e9097adfa67207f41b615618d01e7","seq":7,"owner":"a:b@c.d_e-f","schema":"arkavo.catalog-pointer/1"}"#.utf8)
         #expect(try CatalogPointer.decode(reordered).owner == "a:b@c.d_e-f")
+        let reordered2 = Data(
+            #"{"issuedAt":"2026-10-19T01:02:03Z","indexHash":"\#(Fixture.indexHash)","catalogSize":97,"catalogHash":"729d79721d28362279f6e2a5a9e0f7b64a7e9097adfa67207f41b615618d01e7","seq":7,"owner":"a:b@c.d_e-f","schema":"arkavo.catalog-pointer/2"}"#.utf8)
+        let pointer = try CatalogPointer.decode(reordered2)
+        #expect(pointer.owner == "a:b@c.d_e-f")
+        #expect(pointer.indexHash == Fixture.indexHash)
     }
 
     struct Refusal: Sendable, CustomTestStringConvertible {
@@ -73,7 +113,8 @@ struct CatalogPointerTests {
         .init(label: "uppercase catalogHash", bytes: edited("729d79721d28362279f6e2a5a9e0f7b64a7e9097adfa67207f41b615618d01e7",
                                                              "729D79721D28362279F6E2A5A9E0F7B64A7E9097ADFA67207F41B615618D01E7")),
         .init(label: "short catalogHash", bytes: edited("729d79721d28362279f6e2a5a9e0f7b64a7e9097adfa67207f41b615618d01e7", "729d")),
-        .init(label: "schema 2", bytes: edited("arkavo.catalog-pointer/1", "arkavo.catalog-pointer/2")),
+        .init(label: "schema 2 without indexHash", bytes: edited("arkavo.catalog-pointer/1", "arkavo.catalog-pointer/2")),
+        .init(label: "schema 3", bytes: edited("arkavo.catalog-pointer/1", "arkavo.catalog-pointer/3")),
         .init(label: "owner a/b", bytes: edited("0a1b2c3d-0000-4000-8000-000000000001", "a/b")),
         .init(label: "owner a..b", bytes: edited("0a1b2c3d-0000-4000-8000-000000000001", "a..b")),
         .init(label: "issuedAt with a fraction", bytes: edited("2026-10-19T01:02:03Z", "2026-10-19T01:02:03.000Z")),
@@ -87,6 +128,27 @@ struct CatalogPointerTests {
         .init(label: "a leading BOM", bytes: Data([0xEF, 0xBB, 0xBF]) + Fixture.pointer),
         .init(label: "not an object", bytes: Data("[]".utf8)),
         .init(label: "empty", bytes: Data()),
+        // `/2`: exactly seven keys, `indexHash` 64 lowercase hex. `/1` must not carry it, even as null.
+        .init(label: "/2 without indexHash", bytes: edited2(indexHashMember, "")),
+        .init(label: "/2 with an extra key", bytes: edited2("\"seq\":7", "\"seq\":7,\"extra\":1")),
+        .init(label: "/2 with indexHash repeated", bytes: edited2(indexHashMember, indexHashMember + indexHashMember)),
+        .init(label: "/2 without issuedAt", bytes: edited2(",\"issuedAt\":\"2026-10-19T01:02:03Z\"", "")),
+        .init(label: "/2 uppercase indexHash", bytes: edited2(Fixture.indexHash, Fixture.indexHash.uppercased())),
+        .init(label: "/2 indexHash of 63 characters", bytes: edited2(Fixture.indexHash, String(Fixture.indexHash.dropLast()))),
+        .init(label: "/2 indexHash of 65 characters", bytes: edited2(Fixture.indexHash, Fixture.indexHash + "0")),
+        .init(label: "/2 indexHash that is not hex", bytes: edited2(Fixture.indexHash, String(repeating: "g", count: 64))),
+        .init(label: "/2 empty indexHash", bytes: edited2(Fixture.indexHash, "")),
+        .init(label: "/2 indexHash null", bytes: edited2(#""\#(Fixture.indexHash)""#, "null")),
+        .init(label: "/2 indexHash as a number", bytes: edited2(#""\#(Fixture.indexHash)""#, "7")),
+        .init(label: "/2 seq 0", bytes: edited2("\"seq\":7", "\"seq\":0")),
+        .init(label: "/2 owner a/b", bytes: edited2("0a1b2c3d-0000-4000-8000-000000000001", "a/b")),
+        .init(label: "/2 1025 bytes",
+              bytes: Fixture.pointer2.dropLast() + Data(repeating: 0x20, count: 1_025 - 303) + Data("}".utf8)),
+        .init(label: "/1 with indexHash", bytes: edited2("arkavo.catalog-pointer/2", "arkavo.catalog-pointer/1")),
+        .init(label: "/1 with indexHash null", bytes: edited(Fixture.pointer2Text
+            .replacingOccurrences(of: "arkavo.catalog-pointer/2", with: "arkavo.catalog-pointer/1"),
+            #""\#(Fixture.indexHash)""#, "null")),
+        .init(label: "schema 3 with indexHash", bytes: edited2("arkavo.catalog-pointer/2", "arkavo.catalog-pointer/3")),
     ]
 
     @Test(arguments: refusals)
@@ -94,21 +156,22 @@ struct CatalogPointerTests {
         #expect(throws: CatalogBundleError.pointer) { try CatalogPointer.decode(refusal.bytes) }
     }
 
-    @Test
-    func the1024ByteBoundaryIsAccepted() throws {
-        let padding = Data(repeating: 0x20, count: 1_024 - Fixture.pointer.count)
-        #expect(try CatalogPointer.decode(Fixture.pointer.dropLast() + padding + Data("}".utf8)).seq == 7)
+    @Test(arguments: [Fixture.pointer, Fixture.pointer2])
+    func the1024ByteBoundaryIsAccepted(_ bytes: Data) throws {
+        let padding = Data(repeating: 0x20, count: 1_024 - bytes.count)
+        #expect(try CatalogPointer.decode(bytes.dropLast() + padding + Data("}".utf8)).seq == 7)
     }
 
     // MARK: The builder
 
-    /// The builder's inputs; the defaults are P7's values.
+    /// The builder's inputs; the defaults are P7/2's values.
     struct Inputs: Sendable, CustomTestStringConvertible {
         let label: String
         var owner = CatalogV2Fixture.subject
         var seq: UInt64 = 7
         var catalogHash = CatalogV2Fixture.documentHash
         var catalogSize = 97
+        var indexHash = CatalogV2Fixture.indexHash
         var issuedAt = CatalogV2Fixture.pointerIssuedAt
         /// The `issuedAt` text an accepted case writes.
         var stamp = "2026-10-19T01:02:03Z"
@@ -116,11 +179,24 @@ struct CatalogPointerTests {
         var testDescription: String { label }
 
         func build() throws(CatalogBundleError) -> CatalogPointer {
+            try CatalogPointer(owner: owner, seq: seq, catalogHash: catalogHash, catalogSize: catalogSize,
+                               indexHash: indexHash, issuedAt: issuedAt)
+        }
+
+        /// The deprecated `/1` builder, which takes no `indexHash`. Deprecated itself so that calling it does not warn.
+        @available(*, deprecated)
+        func build1() throws(CatalogBundleError) -> CatalogPointer {
             try CatalogPointer(owner: owner, seq: seq, catalogHash: catalogHash, catalogSize: catalogSize, issuedAt: issuedAt)
         }
 
-        /// What an accepted case writes: P7's key order, no whitespace, with these values.
+        /// What an accepted case writes: P7/2's key order, no whitespace, with these values.
         var expectedBytes: Data {
+            CatalogV2Fixture.makePointer(owner: owner, seq: seq, catalogHash: catalogHash, catalogSize: catalogSize,
+                                         indexHash: indexHash, issuedAt: stamp)
+        }
+
+        /// What the `/1` builder writes: P7's key order and six keys.
+        var expected1Bytes: Data {
             CatalogV2Fixture.makePointer(owner: owner, seq: seq, catalogHash: catalogHash, catalogSize: catalogSize,
                                          issuedAt: stamp)
         }
@@ -129,12 +205,13 @@ struct CatalogPointerTests {
     private static let otherHash = String(repeating: "0123456789abcdef", count: 4)
 
     private static let builds: [Inputs] = [
-        .init(label: "P7"),
+        .init(label: "P7/2"),
         .init(label: "seq 1", seq: 1),
         .init(label: "seq 2^53 - 1", seq: CatalogPointer.maxSeq),
         .init(label: "catalogSize 1", catalogSize: 1),
         .init(label: "catalogSize 4194304", catalogSize: 4_194_304),
         .init(label: "another catalogHash", catalogHash: otherHash),
+        .init(label: "another indexHash", indexHash: otherHash),
         .init(label: "an owner of every allowed kind of byte", owner: "a:b@c.d_e-f"),
         .init(label: "an owner of 248 bytes", owner: String(repeating: "a", count: 248)),
         .init(label: "issuedAt with a fraction", issuedAt: Date(timeIntervalSince1970: 1_792_371_723.999)),
@@ -156,29 +233,44 @@ struct CatalogPointerTests {
         #expect(pointer.seq == inputs.seq)
         #expect(pointer.catalogHash == inputs.catalogHash)
         #expect(pointer.catalogSize == inputs.catalogSize)
+        #expect(pointer.indexHash == inputs.indexHash)
         #expect(pointer.issuedAt == CatalogField.timestamp(inputs.stamp))
         #expect(try CatalogPointer.decode(pointer.bytes) == pointer)
     }
 
     @Test
-    func theBuilderWritesP7() throws {
+    func theBuilderWritesP7In2() throws {
         let pointer = try CatalogPointer(owner: Fixture.subject, seq: 7, catalogHash: Fixture.documentHash, catalogSize: 97,
-                                         issuedAt: Fixture.pointerIssuedAt)
-        #expect(pointer.bytes == Fixture.pointer)
-        #expect(String(decoding: pointer.bytes, as: UTF8.self) == Fixture.pointerText)
-        #expect(try CatalogPointer.decode(Fixture.pointer) == pointer)
+                                         indexHash: Fixture.indexHash, issuedAt: Fixture.pointerIssuedAt)
+        #expect(pointer.bytes == Fixture.pointer2)
+        #expect(String(decoding: pointer.bytes, as: UTF8.self) == Fixture.pointer2Text)
+        #expect(try CatalogPointer.decode(Fixture.pointer2) == pointer)
+    }
+
+    /// What Creator signs: a `/2` pointer over the catalog's own `canonicalIndexHash()`.
+    @Test
+    func theBuilderTakesTheCatalogsCanonicalIndexHash() throws {
+        let catalog = CreatorCatalogTests.catalog(CreatorCatalogTests.twoEntries)
+        let pointer = try CatalogPointer(owner: catalog.owner, seq: 1, catalogHash: Fixture.documentHash, catalogSize: 97,
+                                         indexHash: catalog.canonicalIndexHash(), issuedAt: Fixture.pointerIssuedAt)
+        #expect(pointer.indexHash == CreatorCatalogTests.twoIndexHash)
+        #expect(String(decoding: pointer.bytes, as: UTF8.self)
+            .contains(#","catalogSize":97,"indexHash":"\#(CreatorCatalogTests.twoIndexHash)","issuedAt":"#))
+        #expect(try CatalogPointer.decode(pointer.bytes) == pointer)
     }
 
     @Test
     func theBuilderRoundsIssuedAtDownToTheSecond() throws {
         let fraction = try CatalogPointer(owner: Fixture.subject, seq: 7, catalogHash: Fixture.documentHash,
-                                          catalogSize: 97, issuedAt: Date(timeIntervalSince1970: 1_792_371_723.999))
+                                          catalogSize: 97, indexHash: Fixture.indexHash,
+                                          issuedAt: Date(timeIntervalSince1970: 1_792_371_723.999))
         #expect(fraction.issuedAt == Date(timeIntervalSince1970: 1_792_371_723))
-        #expect(fraction.bytes == Fixture.pointer)
+        #expect(fraction.bytes == Fixture.pointer2)
         let beforeEpoch = try CatalogPointer(owner: Fixture.subject, seq: 7, catalogHash: Fixture.documentHash,
-                                             catalogSize: 97, issuedAt: Date(timeIntervalSince1970: -0.5))
+                                             catalogSize: 97, indexHash: Fixture.indexHash,
+                                             issuedAt: Date(timeIntervalSince1970: -0.5))
         #expect(beforeEpoch.issuedAt == Date(timeIntervalSince1970: -1))
-        #expect(beforeEpoch.bytes == Fixture.makePointer(issuedAt: "1969-12-31T23:59:59Z"))
+        #expect(beforeEpoch.bytes == Fixture.makePointer(indexHash: Fixture.indexHash, issuedAt: "1969-12-31T23:59:59Z"))
     }
 
     private static let builderRefusals: [Inputs] = [
@@ -207,11 +299,49 @@ struct CatalogPointerTests {
         .init(label: "issuedAt the first second of 10000", issuedAt: Date(timeIntervalSince1970: 253_402_300_800)),
         .init(label: "issuedAt far in the past", issuedAt: Date(timeIntervalSince1970: -1e15)),
         .init(label: "issuedAt far in the future", issuedAt: Date(timeIntervalSince1970: 1e15)),
+        .init(label: "an uppercase indexHash", indexHash: Fixture.indexHash.uppercased()),
+        .init(label: "an indexHash of 63 characters", indexHash: String(Fixture.indexHash.dropLast())),
+        .init(label: "an indexHash of 65 characters", indexHash: Fixture.indexHash + "0"),
+        .init(label: "an indexHash that is not hex", indexHash: String(repeating: "g", count: 64)),
+        .init(label: "an indexHash with a quote", indexHash: "\"" + String(Fixture.indexHash.dropFirst())),
+        .init(label: "an empty indexHash", indexHash: ""),
     ]
 
     @Test(arguments: builderRefusals)
     func theBuilderRefusesAnInvalidField(_ inputs: Inputs) {
         #expect(throws: CatalogBundleError.pointer) { try inputs.build() }
+    }
+
+    // MARK: The deprecated /1 builder
+
+    /// Deprecated itself so that calling the deprecated builder does not warn.
+    @available(*, deprecated)
+    @Test
+    func theDeprecatedBuilderStillWritesP7() throws {
+        let pointer = try CatalogPointer(owner: Fixture.subject, seq: 7, catalogHash: Fixture.documentHash, catalogSize: 97,
+                                         issuedAt: Fixture.pointerIssuedAt)
+        #expect(pointer.bytes == Fixture.pointer)
+        #expect(String(decoding: pointer.bytes, as: UTF8.self) == Fixture.pointerText)
+        #expect(pointer.indexHash == nil)
+        #expect(try CatalogPointer.decode(Fixture.pointer) == pointer)
+    }
+
+    /// The `/1` builder writes six keys in P7's order, from the same values the `/2` builder takes.
+    @available(*, deprecated)
+    @Test(arguments: builds)
+    func theDeprecatedBuilderWritesSixKeys(_ inputs: Inputs) throws {
+        let pointer = try inputs.build1()
+        #expect(pointer.bytes == inputs.expected1Bytes)
+        #expect(pointer.indexHash == nil)
+        #expect(pointer.issuedAt == CatalogField.timestamp(inputs.stamp))
+        #expect(try CatalogPointer.decode(pointer.bytes) == pointer)
+    }
+
+    /// The `/1` builder refuses what it always refused.
+    @available(*, deprecated)
+    @Test(arguments: builderRefusals.filter { $0.indexHash == CatalogV2Fixture.indexHash })
+    func theDeprecatedBuilderRefusesAnInvalidField(_ inputs: Inputs) {
+        #expect(throws: CatalogBundleError.pointer) { try inputs.build1() }
     }
 
     // MARK: The next seq

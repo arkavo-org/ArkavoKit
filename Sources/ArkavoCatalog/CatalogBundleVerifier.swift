@@ -13,7 +13,8 @@ public enum CatalogBundleVerifier {
     /// Verifies `bundle` for the requested `subject`. The checks run in this order, and the first that fails ends
     /// verification with its own error:
     ///
-    /// - the pointer (`.pointer`), then its owner against `subject` (`.pointerOwner`);
+    /// - the pointer, `/2` or `/1` as `CatalogPointer.decode` reads them (`.pointer`), then its owner against `subject`
+    ///   (`.pointerOwner`);
     /// - the attestation's envelope (`.attestationEnvelope`);
     /// - the key `keys` gives for the envelope's kid (`.unknownKey` when it lists none). Whatever the lookup throws
     ///   propagates unchanged;

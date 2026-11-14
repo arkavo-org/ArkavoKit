@@ -92,6 +92,17 @@ struct CatalogBundleVerifierTests {
         #expect(await keys.requests == [Fixture.goldenKID])
     }
 
+    /// A `/2` pointer verifies like P7, and the verified pointer carries its `indexHash`. Readers decode both schemas: the
+    /// node still serves a stored `/1` until the creator's next publish.
+    @Test
+    func aPointer2Verifies() async throws {
+        let verified = try await Self.verify(Fixture.bundle(pointer: Fixture.pointer2))
+        #expect(verified.pointer.bytes == Fixture.pointer2)
+        #expect(verified.pointer.indexHash == Fixture.indexHash)
+        #expect(verified.pointer.seq == 7)
+        #expect(verified.credentialID == Fixture.credentialID)
+    }
+
     @Test
     func aPointerIssuedInTheFutureStillVerifies() async throws {
         let pointer = Fixture.makePointer(issuedAt: "2099-01-01T00:00:00Z")
@@ -210,6 +221,12 @@ struct CatalogBundleVerifierTests {
     private static let ordered: [Case] = [
         Case("an invalid pointer and an attestation that is not COSE",
              Fixture.bundle(pointer: Data("{}".utf8), credential: Data([0x00])), keys: .unavailable, .pointer),
+        Case("a /2 pointer without indexHash and an attestation that is not COSE",
+             Fixture.bundle(pointer: Data(Fixture.pointerText.replacingOccurrences(of: "pointer/1", with: "pointer/2").utf8),
+                            credential: Data([0x00])), keys: .unavailable, .pointer),
+        Case("a /1 pointer with indexHash and an attestation that is not COSE",
+             Fixture.bundle(pointer: Data(Fixture.pointer2Text.replacingOccurrences(of: "pointer/2", with: "pointer/1").utf8),
+                            credential: Data([0x00])), keys: .unavailable, .pointer),
         Case("another owner and an assertion by another passkey",
              Fixture.bundle(key: Fixture.secondCredentialPrivateKey), subject: otherSubject, keys: .unavailable,
              .pointerOwner),
@@ -246,11 +263,11 @@ struct CatalogBundleVerifierTests {
 
     // MARK: Built here
 
-    /// What a publisher sends: a pointer from the builder and a bundle from the initializer, as `encoded()` writes it.
+    /// What a publisher sends: a `/2` pointer from the builder and a bundle from the initializer, as `encoded()` writes it.
     @Test
     func aBundleBuiltAndEncodedHereVerifies() async throws {
         let pointer = try CatalogPointer(owner: Fixture.subject, seq: 8, catalogHash: Fixture.documentHash,
-                                         catalogSize: 97, issuedAt: Fixture.pointerIssuedAt)
+                                         catalogSize: 97, indexHash: Fixture.indexHash, issuedAt: Fixture.pointerIssuedAt)
         let challenge = Base64URL.encode(Data(SHA256.hash(data: pointer.bytes)))
         let clientData = Self.clientData(challenge: challenge)
         let bundle = try CatalogBundle(pointer: pointer.bytes, credentialID: Fixture.credentialID,
@@ -259,6 +276,7 @@ struct CatalogBundleVerifierTests {
                                        attestation: Fixture.goldenAttestation)
         let verified = try await Self.verify(bundle.encoded())
         #expect(verified.pointer == pointer)
+        #expect(verified.pointer.indexHash == Fixture.indexHash)
         #expect(verified.credentialID == Fixture.credentialID)
     }
 

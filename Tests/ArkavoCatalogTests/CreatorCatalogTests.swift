@@ -164,6 +164,64 @@ struct CreatorCatalogTests {
         #expect(throws: CatalogDocumentError.ownerMismatch) { try CreatorCatalog.decode(data, owner: "someone-else") }
     }
 
+    // MARK: The index a /2 pointer signs
+
+    /// A `/2` pointer of this catalog's owner signing `indexHash`.
+    static func pointer2(indexHash: String) throws -> CatalogPointer {
+        try CatalogPointer(owner: owner, seq: 1, catalogHash: CatalogV2Fixture.documentHash, catalogSize: 97,
+                           indexHash: indexHash, issuedAt: CatalogV2Fixture.pointerIssuedAt)
+    }
+
+    /// The reader's flow: decode the decrypted payload for the pointer's owner, then check the entries against the index
+    /// the pointer signs, whatever order the document lists them in.
+    @Test func aPayloadMatchesThePointer2ThatSignsItsIndex() throws {
+        let entries = Self.twoEntries.map {
+            "{\"contentID\":\"\($0.contentID)\",\"version\":\($0.version),\"payloadHash\":\"\($0.payloadHash)\",\"payloadSize\":\($0.payloadSize),\"metadata\":\"enRkZg\"}"
+        }
+        let payload = Data(#"{"schema":"arkavo.creator-catalog/2","owner":"\#(Self.owner)","entries":[\#(entries.joined(separator: ","))]}"#.utf8)
+        let pointer = try Self.pointer2(indexHash: Self.twoIndexHash)
+        let catalog = try CreatorCatalog.decode(payload, owner: pointer.owner)
+        #expect(throws: Never.self) { try catalog.checkIndexHash(against: pointer) }
+        #expect(throws: Never.self) {
+            try CreatorCatalog(owner: Self.owner).checkIndexHash(against: Self.pointer2(indexHash: Self.emptyIndexHash))
+        }
+    }
+
+    @Test func aPointer2ThatSignsAnotherIndexIsAMismatch() throws {
+        let catalog = Self.catalog(Self.twoEntries)
+        for other in [Self.emptyIndexHash, Self.byteOrderIndexHash, String(repeating: "0", count: 64)] {
+            #expect(throws: CatalogDocumentError.indexHashMismatch) {
+                try catalog.checkIndexHash(against: Self.pointer2(indexHash: other))
+            }
+        }
+        // One entry's version differs from the signed index.
+        var changed = catalog
+        changed.upsert(CreatorCatalog.Entry(contentID: "rec-a", version: 4, payloadHash: String(repeating: "aa", count: 32),
+                                            payloadSize: 1_024, metadata: Self.metadata))
+        #expect(throws: CatalogDocumentError.indexHashMismatch) {
+            try changed.checkIndexHash(against: Self.pointer2(indexHash: Self.twoIndexHash))
+        }
+        // An empty catalog under a pointer that signed two entries.
+        #expect(throws: CatalogDocumentError.indexHashMismatch) {
+            try CreatorCatalog(owner: Self.owner).checkIndexHash(against: Self.pointer2(indexHash: Self.twoIndexHash))
+        }
+    }
+
+    /// A `/1` pointer signs no index, so there is nothing to check.
+    @Test func aPointer1HasNoIndexToCheck() throws {
+        let pointer = try CatalogPointer.decode(CatalogV2Fixture.makePointer(owner: Self.owner))
+        #expect(pointer.indexHash == nil)
+        #expect(throws: Never.self) { try Self.catalog(Self.twoEntries).checkIndexHash(against: pointer) }
+        #expect(throws: Never.self) { try CreatorCatalog(owner: Self.owner).checkIndexHash(against: pointer) }
+    }
+
+    @Test func aCatalogTheFormatRefusesIsInvalid() throws {
+        let bad = CreatorCatalog(owner: Self.owner, entries: [Self.entry(version: 0)])
+        #expect(throws: CatalogDocumentError.invalid(.version(0))) {
+            try bad.checkIndexHash(against: Self.pointer2(indexHash: Self.emptyIndexHash))
+        }
+    }
+
     // MARK: The index
 
     @Test func theIndexIsTheEntriesWithoutTheirMetadata() throws {
@@ -184,6 +242,95 @@ struct CreatorCatalogTests {
         let p = String(repeating: "1", count: 64)
         let withMetadata = #"[{"contentID":"rec-a","version":1,"payloadHash":"\#(p)","payloadSize":1,"metadata":"enRkZg"}]"#
         #expect(throws: CreatorCatalogError.entryKeys(0)) { try CreatorCatalog.decodeIndex(Data(withMetadata.utf8)) }
+    }
+
+    // MARK: The canonical index hash
+
+    /// The node's `index_hash_vectors` (tdf-iroh-s3 `src/creator_catalog.rs`), which the contract lists under `indexHash`.
+    static let emptyIndexHash = "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    static let twoIndexHash = "03f745d8d08d9e9e11cabf33d85e8beb452eb3a2b2e541f92e1703c1f4152df4"
+    static let byteOrderIndexHash = "79129b9fa70e8ab5d0894d07098294de6dec2677c9df538b3eb05df98bd8ef18"
+
+    static func indexEntry(_ contentID: String, version: UInt64, payloadHash: String,
+                           payloadSize: UInt64) -> CreatorCatalog.IndexEntry {
+        CreatorCatalog.IndexEntry(contentID: contentID, version: version, payloadHash: payloadHash, payloadSize: payloadSize)
+    }
+
+    /// "two": `rec-b` (v1, `bb`×32, 2048), then `rec-a` (v3, `aa`×32, 1024).
+    static let twoEntries = [
+        indexEntry("rec-b", version: 1, payloadHash: String(repeating: "bb", count: 32), payloadSize: 2_048),
+        indexEntry("rec-a", version: 3, payloadHash: String(repeating: "aa", count: 32), payloadSize: 1_024),
+    ]
+
+    /// "byte-order": entry n, counting from 0 in this order, has hash byte n ×32, size n + 1, v1.
+    static let byteOrderEntries = ["a_1", "a@1", "A", "a:1", "a.1", "a-1"].enumerated().map { n, contentID in
+        indexEntry(contentID, version: 1, payloadHash: String(repeating: "0\(n)", count: 32), payloadSize: UInt64(n + 1))
+    }
+
+    /// The catalog listing `entries`, each with the same stand-in metadata.
+    static func catalog(_ entries: [CreatorCatalog.IndexEntry]) -> CreatorCatalog {
+        CreatorCatalog(owner: owner, entries: entries.map {
+            CreatorCatalog.Entry(contentID: $0.contentID, version: $0.version, payloadHash: $0.payloadHash,
+                                 payloadSize: $0.payloadSize, metadata: metadata)
+        })
+    }
+
+    @Test func theCanonicalIndexOfNoEntriesIsAnEmptyArray() throws {
+        #expect(String(decoding: CreatorCatalog.canonicalIndex([]), as: UTF8.self) == "[]")
+        #expect(CreatorCatalog.indexHash([]) == Self.emptyIndexHash)
+        #expect(try CreatorCatalog(owner: Self.owner).canonicalIndexHash() == Self.emptyIndexHash)
+    }
+
+    @Test func theCanonicalIndexSortsEntriesAndWritesKeysInTheContractsOrder() throws {
+        let a = String(repeating: "aa", count: 32), b = String(repeating: "bb", count: 32)
+        #expect(String(decoding: CreatorCatalog.canonicalIndex(Self.twoEntries), as: UTF8.self)
+            == #"[{"contentID":"rec-a","version":3,"payloadHash":"\#(a)","payloadSize":1024},{"contentID":"rec-b","version":1,"payloadHash":"\#(b)","payloadSize":2048}]"#)
+        #expect(CreatorCatalog.indexHash(Self.twoEntries) == Self.twoIndexHash)
+        #expect(try Self.catalog(Self.twoEntries).canonicalIndexHash() == Self.twoIndexHash)
+    }
+
+    /// UTF-8 byte order: `A` < `a-1` < `a.1` < `a:1` < `a@1` < `a_1`.
+    @Test func theCanonicalIndexComparesContentIDsAsUTF8Bytes() throws {
+        let canonical = String(decoding: CreatorCatalog.canonicalIndex(Self.byteOrderEntries), as: UTF8.self)
+        let positions = ["A", "a-1", "a.1", "a:1", "a@1", "a_1"].map {
+            canonical.range(of: #""contentID":"\#($0)""#)?.lowerBound
+        }
+        #expect(!positions.contains(nil))
+        #expect(positions.compactMap(\.self) == positions.compactMap(\.self).sorted())
+        #expect(canonical.hasPrefix(#"[{"contentID":"A","version":1,"payloadHash":"0202"#))
+        #expect(CreatorCatalog.indexHash(Self.byteOrderEntries) == Self.byteOrderIndexHash)
+        #expect(try Self.catalog(Self.byteOrderEntries).canonicalIndexHash() == Self.byteOrderIndexHash)
+    }
+
+    /// The hash covers the four index fields only: not the metadata, and not the order the entries were given in.
+    @Test func theCanonicalIndexHashIgnoresMetadataAndEntryOrder() throws {
+        let one = CreatorCatalog(owner: Self.owner, entries: [Self.entry("rec-b", payload: "3"), Self.entry("rec-a")])
+        let other = CreatorCatalog(owner: Self.owner, entries: [
+            Self.entry("rec-a", metadata: Data([1, 2, 3])), Self.entry("rec-b", payload: "3", metadata: Data([4])),
+        ])
+        #expect(try one.canonicalIndexHash() == other.canonicalIndexHash())
+        #expect(try one.canonicalIndexHash() == CreatorCatalog.indexHash(CreatorCatalog.decodeIndex(one.encodedIndex())))
+        let changed = CreatorCatalog(owner: Self.owner, entries: [Self.entry("rec-b", payload: "3"),
+                                                                  Self.entry("rec-a", version: 2)])
+        #expect(try one.canonicalIndexHash() != changed.canonicalIndexHash())
+    }
+
+    /// Like `encodedIndex()`, it throws the error the document's encoding would, so it never hashes entries the node
+    /// refuses.
+    @Test func theCanonicalIndexHashRefusesWhatTheDocumentRefuses() {
+        #expect(throws: CreatorCatalogError.contentID(0)) {
+            try CreatorCatalog(owner: Self.owner, entries: [Self.entry("rec\"a")]).canonicalIndexHash()
+        }
+        #expect(throws: CreatorCatalogError.version(0)) {
+            try CreatorCatalog(owner: Self.owner, entries: [Self.entry(version: 0)]).canonicalIndexHash()
+        }
+        #expect(throws: CreatorCatalogError.duplicateContentID(1)) {
+            try CreatorCatalog(owner: Self.owner, entries: [Self.entry(), Self.entry(payload: "3")]).canonicalIndexHash()
+        }
+        #expect(throws: CreatorCatalogError.metadata(0)) {
+            try CreatorCatalog(owner: Self.owner, entries: [Self.entry(metadata: Data())]).canonicalIndexHash()
+        }
+        #expect(throws: CreatorCatalogError.owner) { try CreatorCatalog(owner: ".").canonicalIndexHash() }
     }
 
     static func hex(_ value: Int) -> String {

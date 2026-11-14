@@ -58,7 +58,8 @@ public enum CatalogEnvelope {
     /// Checks fetched envelope bytes against the verified pointer that names them, in this order: the size limit
     /// (`.tooLarge`), the pointer's `catalogSize` (`.sizeMismatch`), then its `catalogHash` with the caller's BLAKE3, as
     /// 64 lowercase hex (`.hashMismatch`). Unwrap the envelope next, then decode its payload with
-    /// `CreatorCatalog.decode(_:owner:)` and the pointer's owner.
+    /// `CreatorCatalog.decode(_:owner:)` and the pointer's owner. The contract stops there; a reader may also check the
+    /// entries against a `/2` pointer's `indexHash` with `CreatorCatalog.checkIndexHash(against:)`.
     public static func verify(_ envelope: Data, pointer: CatalogPointer,
                               blake3: (Data) -> String) throws(CatalogDocumentError) {
         guard envelope.count <= maxBytes else { throw .tooLarge }
@@ -71,7 +72,8 @@ public enum CatalogEnvelope {
 public enum CatalogPublishRequestError: Error, Sendable, Equatable {
     /// The envelope is empty or larger than `CatalogEnvelope.maxBytes`.
     case envelopeSize
-    /// The bundle's pointer does not name the envelope's size or BLAKE3 hash, or another owner.
+    /// The bundle's pointer does not name the envelope's size or BLAKE3 hash, names another owner, or is a `/2` whose
+    /// `indexHash` is not the catalog's `canonicalIndexHash()`.
     case pointerMismatch
     case index(CreatorCatalogError)
     /// The body is larger than `CatalogPublishRequest.maxBytes`.
@@ -85,8 +87,13 @@ public enum CatalogPublishRequest {
     public static let maxBytes = 10_485_760
 
     /// The body for `envelope`, signed by `bundle`, listing `catalog` (the envelope's payload) in the clear as `index`.
-    /// The pointer must name the envelope's size and hash (with the caller's BLAKE3) and the catalog's owner. The node
-    /// can't compare `index` with the encrypted payload, so `catalog` must be exactly what the envelope holds.
+    /// The pointer must name the envelope's size and hash (with the caller's BLAKE3) and the catalog's owner, and a `/2`
+    /// pointer's `indexHash` must be `catalog.canonicalIndexHash()` (`.pointerMismatch`), as the node requires. A catalog
+    /// the format refuses is `.index` first. The node can't compare `index` with the encrypted payload, so `catalog` must be
+    /// exactly what the envelope holds.
+    ///
+    /// A `/1` pointer, which signs no index, still makes a body: the node requires `/1` until its switch to `/2`, and
+    /// accepts only `/2` from then on.
     public static func body(envelope: Data, bundle: CatalogBundle, catalog: CreatorCatalog,
                             blake3: (Data) -> String) throws(CatalogPublishRequestError) -> Data {
         guard (1...CatalogEnvelope.maxBytes).contains(envelope.count) else { throw .envelopeSize }
@@ -98,6 +105,11 @@ public enum CatalogPublishRequest {
             index = try catalog.encodedIndex()
         } catch {
             throw .index(error)
+        }
+        // `encodedIndex()` validated the catalog, so this is `canonicalIndexHash()` without encoding the document again.
+        if let signed = pointer.indexHash,
+           !CreatorCatalog.indexHash(catalog.entries.map(CreatorCatalog.IndexEntry.init)).utf8.elementsEqual(signed.utf8) {
+            throw .pointerMismatch
         }
         var body = Data(#"{"bundle":"#.utf8)
         body.append(bundle.encoded())
