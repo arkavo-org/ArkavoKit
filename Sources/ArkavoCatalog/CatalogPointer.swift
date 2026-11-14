@@ -49,7 +49,7 @@ public struct CatalogPointer: Sendable, Equatable {
     }
 
     /// The `/1` pointer: the same conventions, six keys, no `indexHash`.
-    @available(*, deprecated, message: "The node accepts only arkavo.catalog-pointer/2 publishes. Use init(owner:seq:catalogHash:catalogSize:indexHash:issuedAt:) with the catalog's canonicalIndexHash().")
+    @available(*, deprecated, message: "From its switch on, the node accepts only arkavo.catalog-pointer/2 publishes; use init(owner:seq:catalogHash:catalogSize:indexHash:issuedAt:) with the catalog's canonicalIndexHash().")
     public init(owner: String, seq: UInt64, catalogHash: String, catalogSize: Int,
                 issuedAt: Date) throws(CatalogBundleError) {
         self = try Self.build(owner: owner, seq: seq, catalogHash: catalogHash, catalogSize: catalogSize, indexHash: nil,
