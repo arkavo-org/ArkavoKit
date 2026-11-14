@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// Why bytes are not an `arkavo.creator-catalog/2` document. An entry's error carries its position in `entries`.
@@ -167,6 +168,38 @@ public struct CreatorCatalog: Sendable, Equatable {
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         guard let data = try? encoder.encode(entries.map(IndexEntry.init)) else { throw .malformed }
         return data
+    }
+
+    /// The `indexHash` a `/2` pointer signs (`CatalogPointer`): the lowercase hex SHA-256 of this catalog's canonical
+    /// index, as the node computes it from the `index` a publish sends (tdf-iroh-s3 `docs/creator-catalogs.md`,
+    /// `indexHash`). So the passkey covers the entries the node checks, whatever key and entry order `encodedIndex()`
+    /// writes them in. The metadata is not covered. It is SHA-256, while `catalogHash` and `payloadHash` are BLAKE3.
+    ///
+    /// It throws the error the document's encoding would, so it never hashes entries the node refuses.
+    public func canonicalIndexHash() throws(CreatorCatalogError) -> String {
+        _ = try encoded()
+        return Self.indexHash(entries.map(IndexEntry.init))
+    }
+
+    /// The canonical index of valid `entries`: sorted by the UTF-8 bytes of `contentID`, each written as
+    /// `{"contentID":"<id>","version":<n>,"payloadHash":"<hex>","payloadSize":<n>}` with keys in exactly that order,
+    /// joined with `,` inside `[` `]`, no whitespace. The empty index is `[]`. Nothing needs escaping: a valid contentID is
+    /// `[A-Za-z0-9:._@-]` and a payloadHash is lowercase hex.
+    static func canonicalIndex(_ entries: [IndexEntry]) -> Data {
+        let items = entries.sorted { precedes($0.contentID, $1.contentID) }.map { entry in
+            #"{"contentID":"\#(entry.contentID)","version":\#(entry.version),"payloadHash":"\#(entry.payloadHash)","payloadSize":\#(entry.payloadSize)}"#
+        }
+        return Data("[\(items.joined(separator: ","))]".utf8)
+    }
+
+    /// The lowercase hex SHA-256 of `canonicalIndex(entries)`.
+    static func indexHash(_ entries: [IndexEntry]) -> String {
+        let digits = Array("0123456789abcdef".utf8)
+        var hex: [UInt8] = []
+        for byte in SHA256.hash(data: canonicalIndex(entries)) {
+            hex += [digits[Int(byte >> 4)], digits[Int(byte & 0x0F)]]
+        }
+        return String(decoding: hex, as: UTF8.self)
     }
 
     /// One entry of an `index`.

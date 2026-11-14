@@ -11,6 +11,8 @@ struct CatalogVectorTests {
         let valid: Bool
         let text: String?
         let base64: String?
+        /// On an `index` vector: the lowercase hex SHA-256 of its canonical form, which a `/2` pointer signs.
+        let indexHash: String?
 
         var bytes: Data { text.map { Data($0.utf8) } ?? Data(base64Encoded: base64 ?? "") ?? Data() }
         var testDescription: String { "\(kind): \(name)" }
@@ -35,6 +37,24 @@ struct CatalogVectorTests {
             #expect(Self.vectors.contains { $0.kind == kind && $0.valid })
             #expect(Self.vectors.contains { $0.kind == kind && !$0.valid })
         }
+        // The node's three `index_hash_vectors`.
+        #expect(Self.vectors.filter { $0.indexHash != nil }.map(\.name)
+            == ["indexHash: empty", "indexHash: two, given out of order", "indexHash: byte order"])
+    }
+
+    /// An index vector's `indexHash` is the SHA-256 of its canonical form, as the node computes it from the parsed
+    /// entries, and as `canonicalIndexHash()` computes it for the catalog listing them.
+    @Test(arguments: vectors.filter { $0.indexHash != nil })
+    func indexHashIsTheCanonicalIndexsSHA256(_ vector: Vector) throws {
+        #expect(vector.kind == "index")
+        #expect(vector.valid)
+        let entries = try CreatorCatalog.decodeIndex(vector.bytes)
+        #expect(CreatorCatalog.indexHash(entries) == vector.indexHash)
+        let catalog = CreatorCatalog(owner: CreatorCatalogTests.owner, entries: entries.map {
+            CreatorCatalog.Entry(contentID: $0.contentID, version: $0.version, payloadHash: $0.payloadHash,
+                                 payloadSize: $0.payloadSize, metadata: CreatorCatalogTests.metadata)
+        })
+        #expect(try catalog.canonicalIndexHash() == vector.indexHash)
     }
 
     @Test(arguments: vectors)
