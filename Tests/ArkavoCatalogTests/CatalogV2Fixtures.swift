@@ -65,10 +65,22 @@ enum CatalogV2Fixture {
     /// P7's `issuedAt`.
     static let pointerIssuedAt = Date(timeIntervalSince1970: 1_792_371_723)
 
-    /// A pointer in P7's key order with the given values; the defaults are P7 itself, byte for byte.
+    /// The SHA-256 of the empty canonical index, `[]`: the contract's "empty" `indexHash` vector, which P7/2 carries.
+    static let indexHash = "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+
+    /// `P7/2`: P7 as `arkavo.catalog-pointer/2`, 303 bytes, with `indexHash` between `catalogSize` and `issuedAt`, where the
+    /// contract writes it.
+    static let pointer2Text = #"{"schema":"arkavo.catalog-pointer/2","owner":"0a1b2c3d-0000-4000-8000-000000000001","seq":7,"catalogHash":"729d79721d28362279f6e2a5a9e0f7b64a7e9097adfa67207f41b615618d01e7","catalogSize":97,"indexHash":"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945","issuedAt":"2026-10-19T01:02:03Z"}"#
+    static let pointer2 = Data(pointer2Text.utf8)
+
+    /// A pointer in P7's key order with the given values: `/1` without an `indexHash`, `/2` with one. The defaults are P7
+    /// itself, byte for byte, and with `indexHash: indexHash` P7/2.
     static func makePointer(owner: String = subject, seq: UInt64 = 7, catalogHash: String = documentHash,
-                            catalogSize: Int = 97, issuedAt: String = "2026-10-19T01:02:03Z") -> Data {
-        Data(#"{"schema":"arkavo.catalog-pointer/1","owner":"\#(owner)","seq":\#(seq),"catalogHash":"\#(catalogHash)","catalogSize":\#(catalogSize),"issuedAt":"\#(issuedAt)"}"#.utf8)
+                            catalogSize: Int = 97, indexHash: String? = nil,
+                            issuedAt: String = "2026-10-19T01:02:03Z") -> Data {
+        let (schema, indexHashMember) = indexHash.map { ("arkavo.catalog-pointer/2", #""indexHash":"\#($0)","#) }
+            ?? ("arkavo.catalog-pointer/1", "")
+        return Data(#"{"schema":"\#(schema)","owner":"\#(owner)","seq":\#(seq),"catalogHash":"\#(catalogHash)","catalogSize":\#(catalogSize),\#(indexHashMember)"issuedAt":"\#(issuedAt)"}"#.utf8)
     }
 
     /// `C7`: the client data that signs P7's SHA-256.

@@ -19,6 +19,17 @@ struct CatalogV2FixtureTests {
         #expect(Fixture.makePointer() == Fixture.pointer)
     }
 
+    /// P7/2 is P7 with the schema `/2` and the empty index's `indexHash` before `issuedAt`.
+    @Test
+    func pointer2IsP7WithTheEmptyIndexsHash() {
+        #expect(Fixture.pointer2.count == 303)
+        #expect(Fixture.makePointer(indexHash: Fixture.indexHash) == Fixture.pointer2)
+        #expect(Fixture.pointer2Text == Fixture.pointerText
+            .replacingOccurrences(of: "catalog-pointer/1", with: "catalog-pointer/2")
+            .replacingOccurrences(of: #""issuedAt""#, with: #""indexHash":"\#(Fixture.indexHash)","issuedAt""#))
+        #expect(Fixture.indexHash == SHA256.hash(data: Data("[]".utf8)).map { String(format: "%02x", $0) }.joined())
+    }
+
     @Test
     func theCredentialAttestationMinterReproducesTheGoldenEncoding() {
         #expect(Fixture.mintCredentialAttestation().prefix(336) == Fixture.goldenAttestation.prefix(336))

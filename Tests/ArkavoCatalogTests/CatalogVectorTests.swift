@@ -37,6 +37,12 @@ struct CatalogVectorTests {
             #expect(Self.vectors.contains { $0.kind == kind && $0.valid })
             #expect(Self.vectors.contains { $0.kind == kind && !$0.valid })
         }
+        // Both pointer schemas: `/2`, and `/1` as the node still serves it.
+        let pointers = Self.vectors.filter { $0.kind == "pointer" && $0.valid }.compactMap {
+            try? CatalogPointer.decode($0.bytes)
+        }
+        #expect(pointers.contains { $0.indexHash != nil })
+        #expect(pointers.contains { $0.indexHash == nil })
         // The node's three `index_hash_vectors`.
         #expect(Self.vectors.filter { $0.indexHash != nil }.map(\.name)
             == ["indexHash: empty", "indexHash: two, given out of order", "indexHash: byte order"])

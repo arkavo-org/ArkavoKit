@@ -7,9 +7,12 @@ struct CatalogEnvelopeTests {
     /// Stands in for the ZTDF bytes: the envelope's checks see only its bytes.
     static let envelope = Data("PK\u{3}\u{4} envelope bytes".utf8)
 
-    static func pointer(for envelope: Data = envelope, owner: String = owner) throws -> CatalogPointer {
+    /// The `/2` pointer to `envelope`, signing the index of `catalog`, the envelope's payload.
+    static func pointer(for envelope: Data = envelope, owner: String = owner,
+                        listing catalog: CreatorCatalog = catalog) throws -> CatalogPointer {
         try CatalogPointer(owner: owner, seq: 1, catalogHash: CreatorCatalogTests.sha256(envelope),
-                           catalogSize: envelope.count, issuedAt: Date(timeIntervalSince1970: 1_792_371_723))
+                           catalogSize: envelope.count, indexHash: catalog.canonicalIndexHash(),
+                           issuedAt: Date(timeIntervalSince1970: 1_792_371_723))
     }
 
     @Test func theConstantsAreTheNodes() {
@@ -81,8 +84,9 @@ struct CatalogEnvelopeTests {
 
     // MARK: The publish request
 
-    static func bundle(for envelope: Data = envelope, owner: String = owner) throws -> CatalogBundle {
-        try CatalogBundle(pointer: pointer(for: envelope, owner: owner).bytes, credentialID: Data([1]),
+    static func bundle(for envelope: Data = envelope, owner: String = owner,
+                       listing catalog: CreatorCatalog = catalog) throws -> CatalogBundle {
+        try CatalogBundle(pointer: pointer(for: envelope, owner: owner, listing: catalog).bytes, credentialID: Data([1]),
                           authenticatorData: Data([2]), clientDataJSON: Data([3]), signature: Data([4]),
                           attestation: Data([5]))
     }
@@ -148,7 +152,7 @@ struct CatalogEnvelopeTests {
                 payloadSize: CatalogField.maxPayloadSize, metadata: CreatorCatalogTests.metadata)
         }
         let catalog = CreatorCatalog(owner: Self.owner, entries: entries)
-        let body = try CatalogPublishRequest.body(envelope: envelope, bundle: Self.bundle(for: envelope),
+        let body = try CatalogPublishRequest.body(envelope: envelope, bundle: Self.bundle(for: envelope, listing: catalog),
                                                   catalog: catalog, blake3: CreatorCatalogTests.sha256)
         #expect(body.count > 5_000_000)
         #expect(body.count <= CatalogPublishRequest.maxBytes)

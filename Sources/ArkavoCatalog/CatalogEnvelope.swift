@@ -87,6 +87,9 @@ public enum CatalogPublishRequest {
     /// The body for `envelope`, signed by `bundle`, listing `catalog` (the envelope's payload) in the clear as `index`.
     /// The pointer must name the envelope's size and hash (with the caller's BLAKE3) and the catalog's owner. The node
     /// can't compare `index` with the encrypted payload, so `catalog` must be exactly what the envelope holds.
+    ///
+    /// The node accepts only a `/2` pointer whose `indexHash` is `catalog.canonicalIndexHash()`, and refuses anything else
+    /// with a 422. This body doesn't check either: sign the pointer with `CatalogPointer`'s `/2` initializer over that hash.
     public static func body(envelope: Data, bundle: CatalogBundle, catalog: CreatorCatalog,
                             blake3: (Data) -> String) throws(CatalogPublishRequestError) -> Data {
         guard (1...CatalogEnvelope.maxBytes).contains(envelope.count) else { throw .envelopeSize }
