@@ -48,6 +48,26 @@ struct CatalogVectorTests {
             == ["indexHash: empty", "indexHash: two, given out of order", "indexHash: byte order"])
     }
 
+    /// A pointer or an index entry is a JSON object. The same values as an array, in the schema's key order, are refused,
+    /// which a reader that deserializes a struct from a sequence would accept.
+    @Test func arrayFormsAreRefused() throws {
+        let names = ["pointer": ["/1 pointer as an array", "/2 pointer as an array"], "index": ["index entry as an array"]]
+        for (kind, names) in names {
+            for name in names {
+                let vector = try #require(Self.vectors.first { $0.kind == kind && $0.name == name }, "\(kind): \(name)")
+                #expect(!vector.valid)
+                #expect(vector.text?.hasPrefix("[") == true)
+            }
+        }
+        let pointers = Self.vectors.filter { $0.kind == "pointer" && $0.name.hasSuffix("as an array") }
+        #expect(pointers.count == 2)
+        for vector in pointers {
+            #expect(throws: CatalogBundleError.pointer) { try CatalogPointer.decode(vector.bytes) }
+        }
+        let index = try #require(Self.vectors.first { $0.kind == "index" && $0.name == "index entry as an array" })
+        #expect(throws: CreatorCatalogError.entryKeys(0)) { try CreatorCatalog.decodeIndex(index.bytes) }
+    }
+
     /// An index vector's `indexHash` is the SHA-256 of its canonical form, as the node computes it from the parsed
     /// entries, and as `canonicalIndexHash()` computes it for the catalog listing them.
     @Test(arguments: vectors.filter { $0.indexHash != nil })
