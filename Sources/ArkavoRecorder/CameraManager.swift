@@ -302,12 +302,24 @@ public final class CameraManager: NSObject, Sendable {
             }
 
             do {
-                try graph.attachInput(request.input, captureID: request.captureID)
-                Self.activateCapture(
+                let previous = try graph.attachInput(request.input, captureID: request.captureID)
+                let activated = Self.activateCapture(
                     captureID: request.captureID,
                     inputID: ObjectIdentifier(request.input),
                     in: frameStateLock
                 )
+                guard activated else {
+                    // Cancelled or superseded while attachInput ran: revert the graph back to
+                    // the previous input so the displaced camera is restored cleanly.
+                    graph.restorePreviousInput(previous, ifStillAttached: request.captureID)
+                    _ = Self.restoreCaptureAfterFailure(
+                        failedCaptureID: request.captureID,
+                        restored: graph.attachedCapture,
+                        in: frameStateLock
+                    )
+                    completion(.failure(CancellationError()))
+                    return
+                }
                 graph.startRunningIfAttached(captureID: request.captureID)
                 completion(.success(()))
             } catch {
@@ -353,21 +365,26 @@ public final class CameraManager: NSObject, Sendable {
 
     /// Marks `captureID` as committed and accepting frames from `inputID`.
     nonisolated func commitInputSwitch(captureID: UUID, inputID: ObjectIdentifier?) {
-        Self.activateCapture(captureID: captureID, inputID: inputID, in: frameStateLock)
+        _ = Self.activateCapture(captureID: captureID, inputID: inputID, in: frameStateLock)
     }
 
+    @discardableResult
     private nonisolated static func activateCapture(
         captureID: UUID,
         inputID: ObjectIdentifier?,
         in frameStateLock: OSAllocatedUnfairLock<FrameDeliveryState>
-    ) {
+    ) -> Bool {
         frameStateLock.withLock { state in
-            guard state.pendingCaptureID == captureID else { return }
+            guard state.pendingCaptureID == captureID,
+                  state.cancelledPendingCaptureID != captureID else {
+                return false
+            }
             state.cancelledPendingCaptureID = nil
             state.activeCaptureID = captureID
             state.activeInput = inputID
             state.acceptingFrames = true
             state.firstFrameDelivered = false
+            return true
         }
     }
 
@@ -522,7 +539,8 @@ private final class CameraSessionGraph: @unchecked Sendable {
         session.commitConfiguration()
     }
 
-    func attachInput(_ input: AVCaptureDeviceInput, captureID: UUID) throws {
+    @discardableResult
+    func attachInput(_ input: AVCaptureDeviceInput, captureID: UUID) throws -> (input: AVCaptureDeviceInput, captureID: UUID)? {
         dispatchPrecondition(condition: .onQueue(queue))
         session.beginConfiguration()
 
@@ -544,6 +562,25 @@ private final class CameraSessionGraph: @unchecked Sendable {
 
         session.addInput(input)
         attached = (input, captureID)
+        session.commitConfiguration()
+        return previous
+    }
+
+    func restorePreviousInput(
+        _ previous: (input: AVCaptureDeviceInput, captureID: UUID)?,
+        ifStillAttached captureID: UUID
+    ) {
+        dispatchPrecondition(condition: .onQueue(queue))
+        guard let current = attached, current.captureID == captureID else { return }
+
+        session.beginConfiguration()
+        session.removeInput(current.input)
+        if let previous, session.canAddInput(previous.input) {
+            session.addInput(previous.input)
+            attached = previous
+        } else {
+            attached = nil
+        }
         session.commitConfiguration()
     }
 

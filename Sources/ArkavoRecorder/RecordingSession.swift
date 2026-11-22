@@ -1528,6 +1528,10 @@ public final class RecordingSession: Sendable {
         let stopGeneration = streamStopGeneration
         try await encoder.startStreaming(to: destination, streamKey: streamKey)
         guard streamStopGeneration == stopGeneration else {
+            if !_streamingActive.withLock({ $0 }) {
+                await encoder.stopStreaming()
+                await encoder.stopNTDFStreaming()
+            }
             throw CancellationError()
         }
         _streamingActive.withLock { $0 = true }
@@ -1541,6 +1545,10 @@ public final class RecordingSession: Sendable {
         let stopGeneration = streamStopGeneration
         try await encoder.startStreaming(to: destinations)
         guard streamStopGeneration == stopGeneration else {
+            if !_streamingActive.withLock({ $0 }) {
+                await encoder.stopStreaming()
+                await encoder.stopNTDFStreaming()
+            }
             throw CancellationError()
         }
         _streamingActive.withLock { $0 = true }
@@ -1558,6 +1566,10 @@ public final class RecordingSession: Sendable {
         let stopGeneration = streamStopGeneration
         try await encoder.startNTDFStreaming(kasURL: kasURL, rtmpURL: rtmpURL, streamKey: streamKey)
         guard streamStopGeneration == stopGeneration else {
+            if !_streamingActive.withLock({ $0 }) {
+                await encoder.stopStreaming()
+                await encoder.stopNTDFStreaming()
+            }
             throw CancellationError()
         }
         _streamingActive.withLock { $0 = true }
@@ -1586,6 +1598,10 @@ public final class RecordingSession: Sendable {
         let stopGeneration = streamStopGeneration
         try await encoder.startStreamingForTesting(onEncodedVideo: onEncodedVideo)
         guard streamStopGeneration == stopGeneration else {
+            if !_streamingActive.withLock({ $0 }) {
+                await encoder.stopStreaming()
+                await encoder.stopNTDFStreaming()
+            }
             throw CancellationError()
         }
         _streamingActive.withLock { $0 = true }
@@ -1610,16 +1626,18 @@ public final class RecordingSession: Sendable {
     /// stream as `stopStreaming()` does.
     public func stopStreaming(id: String) async {
         await encoder.stopStreaming(id: id)
-        // Only deactivate streaming when no RTMP or NTDF streams remain active
-        // and streaming was previously active.
+        // Only deactivate streaming when no RTMP or NTDF streams remain active.
+        // Also advance `streamStopGeneration` if no destinations remain so an in-flight
+        // single-destination start that was cancelled by `stopStreaming(id:)` cannot
+        // subsequently mark `_streamingActive = true`.
         if !(await encoder.isStreamingActive) {
+            streamStopGeneration &+= 1
             let wasStreaming = _streamingActive.withLock { active -> Bool in
                 let previous = active
                 active = false
                 return previous
             }
             if wasStreaming {
-                streamStopGeneration &+= 1
                 await streamDidEnd()
             }
         }

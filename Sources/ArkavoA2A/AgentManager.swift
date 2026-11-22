@@ -64,12 +64,20 @@ public final class AgentManager: ObservableObject {
         try await connect(to: agent, isManual: true)
     }
 
-    private func connect(to agent: AgentEndpoint, isManual: Bool) async throws {
+    private func connect(
+        to agent: AgentEndpoint,
+        isManual: Bool,
+        expectedDiscoveryGeneration: UInt64? = nil
+    ) async throws {
         // Check existing connection state before deciding whether to reuse or replace
         var previousConnection: AgentConnection?
         if let existingConnection = connections[agent.id] {
             let existingConnected = await existingConnection.isConnected()
             let existingStatus = await existingConnection.getStatus()
+
+            if let expectedDiscoveryGeneration, discoveryGeneration != expectedDiscoveryGeneration {
+                return
+            }
 
             if connections[agent.id] === existingConnection {
                 if existingConnected && existingConnection.endpoint.url == agent.url {
@@ -100,6 +108,10 @@ public final class AgentManager: ObservableObject {
             }
         }
 
+        if let expectedDiscoveryGeneration, discoveryGeneration != expectedDiscoveryGeneration {
+            return
+        }
+
         // Install the replacement connection before disconnecting the old one so
         // `connections[agent.id]` never has a nil window across suspension points
         let connection = AgentConnection(endpoint: agent)
@@ -111,8 +123,13 @@ public final class AgentManager: ObservableObject {
 
         if let previousConnection {
             await previousConnection.disconnect()
-            // Abort cleanly if superseded while tearing down the old connection
-            guard connections[agent.id] === connection else {
+            // Abort cleanly if superseded or invalidated while tearing down the old connection
+            if connections[agent.id] !== connection
+                || (expectedDiscoveryGeneration != nil && discoveryGeneration != expectedDiscoveryGeneration) {
+                if connections[agent.id] === connection {
+                    connections.removeValue(forKey: agent.id)
+                    statuses[agent.id] = .disconnected
+                }
                 await connection.disconnect()
                 return
             }
@@ -121,20 +138,35 @@ public final class AgentManager: ObservableObject {
         // Perform initial connection so unreachable agents are not falsely marked connected
         do {
             try await connection.connect()
-            guard connections[agent.id] === connection else {
+            if connections[agent.id] !== connection
+                || (expectedDiscoveryGeneration != nil && discoveryGeneration != expectedDiscoveryGeneration) {
+                if connections[agent.id] === connection {
+                    connections.removeValue(forKey: agent.id)
+                    statuses[agent.id] = .disconnected
+                }
                 await connection.disconnect()
                 return
             }
 
-            // Register status observer after initial handshake to avoid transient .failed flickers
+            // Register status observer after initial handshake and reconcile live status
+            // in case the connection dropped in the gap before the observer was attached.
             await installStatusObserver(on: connection, for: agent.id)
-            statuses[agent.id] = .connected
+            let liveStatus = await connection.getStatus()
+            guard connections[agent.id] === connection else {
+                await connection.disconnect()
+                return
+            }
+            statuses[agent.id] = liveStatus
             if autoReconnect {
                 await connection.setAutoReconnectionEnabled(true)
             }
         } catch {
             if connections[agent.id] === connection {
-                if autoReconnect {
+                if let expectedDiscoveryGeneration, discoveryGeneration != expectedDiscoveryGeneration {
+                    connections.removeValue(forKey: agent.id)
+                    statuses[agent.id] = .disconnected
+                    await connection.disconnect()
+                } else if autoReconnect {
                     await installStatusObserver(on: connection, for: agent.id)
                     statuses[agent.id] = .reconnecting(attempt: 1)
                     await connection.startWithReconnection(afterInitialFailure: true)
@@ -249,7 +281,11 @@ public final class AgentManager: ObservableObject {
                 }
                 if shouldConnect {
                     print("Auto-connecting to discovered agent: \(agent.id)")
-                    try? await self.connect(to: agent, isManual: false)
+                    try? await self.connect(
+                        to: agent,
+                        isManual: false,
+                        expectedDiscoveryGeneration: generation
+                    )
                 }
             }
         }

@@ -33,6 +33,7 @@ public final class LocalAIAgent: NSObject, ObservableObject {
     private var connectionMetadata: [UUID: ConnectionMetadata] = [:]
     private var partialMessages: [UUID: Data] = [:]
     private var configuredAuthToken: String?
+    private var listenerGeneration: UInt64 = 0
 
     /// Maximum WebSocket message size (16 MiB)
     static let maxMessageSize = 16 * 1024 * 1024
@@ -50,6 +51,7 @@ public final class LocalAIAgent: NSObject, ObservableObject {
     private struct ConnectionMetadata: Sendable {
         let isLoopback: Bool
         let isAuthenticated: Bool
+        let listenerGeneration: UInt64
     }
 
     // Unique agent ID based on device
@@ -242,16 +244,24 @@ public final class LocalAIAgent: NSObject, ObservableObject {
         }
 
         configuredAuthToken = normalizedToken
+        listenerGeneration &+= 1
+        let activeGeneration = listenerGeneration
+        let listenerAuthenticated = normalizedToken != nil
 
         listener?.stateUpdateHandler = { [weak self] state in
             Task { @MainActor [weak self] in
-                self?.handleListenerState(state)
+                guard let self, self.listenerGeneration == activeGeneration else { return }
+                self.handleListenerState(state)
             }
         }
 
         listener?.newConnectionHandler = { [weak self] connection in
             Task { @MainActor [weak self] in
-                self?.handleNewConnection(connection)
+                self?.handleNewConnection(
+                    connection,
+                    listenerGeneration: activeGeneration,
+                    isAuthenticated: listenerAuthenticated
+                )
             }
         }
 
@@ -419,6 +429,7 @@ public final class LocalAIAgent: NSObject, ObservableObject {
 
     /// Stop publishing the A2A service
     public func stopPublishing() {
+        listenerGeneration &+= 1
         listener?.cancel()
         listener = nil
 
@@ -464,14 +475,24 @@ public final class LocalAIAgent: NSObject, ObservableObject {
         }
     }
 
-    private func handleNewConnection(_ connection: NWConnection) {
+    private func handleNewConnection(
+        _ connection: NWConnection,
+        listenerGeneration generation: UInt64,
+        isAuthenticated: Bool
+    ) {
+        guard generation == listenerGeneration else {
+            connection.cancel()
+            return
+        }
+
         let connectionId = UUID()
         connections[connectionId] = connection
 
         let remoteEndpoint = connection.currentPath?.remoteEndpoint ?? connection.endpoint
         connectionMetadata[connectionId] = ConnectionMetadata(
             isLoopback: Self.isLoopbackEndpoint(remoteEndpoint),
-            isAuthenticated: configuredAuthToken != nil
+            isAuthenticated: isAuthenticated,
+            listenerGeneration: generation
         )
 
         connection.stateUpdateHandler = { [weak self] state in
@@ -495,7 +516,8 @@ public final class LocalAIAgent: NSObject, ObservableObject {
                let existing = connectionMetadata[connectionId] {
                 connectionMetadata[connectionId] = ConnectionMetadata(
                     isLoopback: Self.isLoopbackEndpoint(remoteEndpoint),
-                    isAuthenticated: existing.isAuthenticated
+                    isAuthenticated: existing.isAuthenticated,
+                    listenerGeneration: existing.listenerGeneration
                 )
             }
             print("[LocalAIAgent] Connection ready: \(connectionId)")
@@ -639,10 +661,12 @@ public final class LocalAIAgent: NSObject, ObservableObject {
 
             print("[LocalAIAgent] Received request: \(request.method) (connection: \(connectionId))")
 
-            let metadata = connectionMetadata[connectionId] ?? ConnectionMetadata(
-                isLoopback: Self.isLoopbackEndpoint(connection.currentPath?.remoteEndpoint ?? connection.endpoint),
-                isAuthenticated: configuredAuthToken != nil
-            )
+            guard let metadata = connectionMetadata[connectionId],
+                  metadata.listenerGeneration == listenerGeneration else {
+                print("[LocalAIAgent] Rejecting message from stale or closed connection: \(connectionId)")
+                cleanupConnection(connectionId, connection: connection)
+                return
+            }
 
             let response = try await processRequest(
                 request,

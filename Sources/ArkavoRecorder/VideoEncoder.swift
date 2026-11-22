@@ -124,13 +124,15 @@ public actor VideoEncoder {
     private var activeStreamDescriptor: ActiveStreamStart?
     private var streamStartGeneration: UInt64 = 0
     private var stopRequestedDuringStreamStart: Bool = false
+    private var isStoppingStream: Bool = false
+    private var pendingCancelledDestinationIDs: Set<String> = []
     private var streamStartWaiters: [CheckedContinuation<Void, any Error>] = []
 
     /// Tests: streaming with no RTMP destination (see `startStreamingForTesting(onEncodedVideo:)`)
     private var streamsWithoutDestinationForTesting = false
     /// Tests: awaited once `finishRecording()` has begun, before the file is finished
     private var finishingHookForTesting: (@Sendable () async -> Void)?
-    /// Tests: awaited once `startStreaming` has marked `isStartingStream = true`, before connecting
+    /// Tests: awaited once `startStreaming` has marked `activeStreamStart != nil`, before connecting
     private var streamStartHookForTesting: (@Sendable () async -> Void)?
     /// Tests: what the next appends to the file get instead of the writer's answer, in order
     private var refusalsForTesting: [RefusalForTesting] = []
@@ -906,6 +908,7 @@ public actor VideoEncoder {
     private func finishStreamStart(with result: Result<Void, any Error>) {
         activeStreamStart = nil
         stopRequestedDuringStreamStart = false
+        pendingCancelledDestinationIDs.removeAll()
         let waiters = streamStartWaiters
         streamStartWaiters.removeAll()
         for waiter in waiters {
@@ -915,6 +918,9 @@ public actor VideoEncoder {
 
     /// Start streaming to multiple RTMP destinations simultaneously (simulcast)
     public func startStreaming(to destinations: [(id: String, destination: RTMPPublisher.Destination, streamKey: String)]) async throws {
+        guard !isStoppingStream else {
+            throw StreamingError.alreadyStreaming
+        }
         let request = Self.rtmpDescriptor(for: destinations)
         if let inFlight = activeStreamStart {
             guard inFlight == request else {
@@ -936,9 +942,10 @@ public actor VideoEncoder {
         let generation = streamStartGeneration
         activeStreamStart = request
         stopRequestedDuringStreamStart = false
+        pendingCancelledDestinationIDs.removeAll()
         do {
-            try await performStartStreaming(to: destinations, generation: generation)
-            activeStreamDescriptor = request
+            let activeDescriptor = try await performStartStreaming(to: destinations, generation: generation)
+            activeStreamDescriptor = activeDescriptor
             finishStreamStart(with: .success(()))
         } catch {
             finishStreamStart(with: .failure(error))
@@ -949,7 +956,7 @@ public actor VideoEncoder {
     private func performStartStreaming(
         to destinations: [(id: String, destination: RTMPPublisher.Destination, streamKey: String)],
         generation: UInt64
-    ) async throws {
+    ) async throws -> ActiveStreamStart {
         if let streamStartHookForTesting {
             await streamStartHookForTesting()
         }
@@ -968,7 +975,13 @@ public actor VideoEncoder {
             }
         }
 
-        print("📡 Starting RTMP stream to \(uniqueDestinations.count) destination(s)...")
+        // Drop any destinations already cancelled via `stopStreaming(id:)` before connecting
+        let activeUniqueDestinations = uniqueDestinations.filter { !pendingCancelledDestinationIDs.contains($0.id) }
+        if activeUniqueDestinations.isEmpty && !uniqueDestinations.isEmpty {
+            throw CancellationError()
+        }
+
+        print("📡 Starting RTMP stream to \(activeUniqueDestinations.count) destination(s)...")
         streamConnectionErrors.removeAll()
 
         // Create shared media encoders using the configured quality (encode once, fan out to all destinations)
@@ -986,7 +999,7 @@ public actor VideoEncoder {
         // until startup completes (and a concurrent stop disconnects everything cleanly).
         var connectedDestinations: [String: StreamDestination] = [:]
         await withTaskGroup(of: (id: String, result: Result<StreamDestination, Error>).self) { group in
-            for dest in uniqueDestinations {
+            for dest in activeUniqueDestinations {
                 group.addTask {
                     do {
                         let publisher = RTMPPublisher()
@@ -1020,7 +1033,17 @@ public actor VideoEncoder {
             }
         }
 
-        if isStreamStartCancelled(generation: generation) {
+        // Disconnect any destination individually stopped while connections were in flight
+        if !pendingCancelledDestinationIDs.isEmpty {
+            for cancelledID in pendingCancelledDestinationIDs {
+                if let cancelledDest = connectedDestinations.removeValue(forKey: cancelledID) {
+                    await cancelledDest.publisher.disconnect()
+                }
+            }
+        }
+
+        if isStreamStartCancelled(generation: generation)
+            || (!uniqueDestinations.isEmpty && uniqueDestinations.allSatisfy { pendingCancelledDestinationIDs.contains($0.id) }) {
             videoEncoder.stop()
             audioEncoder.onFrame = nil
             for dest in connectedDestinations.values {
@@ -1150,6 +1173,8 @@ public actor VideoEncoder {
         startSilentAudioGenerator(encoder: audioEncoder)
 
         print("✅ RTMP stream started to \(streamDestinations.count) destination(s)")
+        let remaining = activeUniqueDestinations.filter { connectedDestinations[$0.id] != nil }
+        return Self.rtmpDescriptor(for: remaining)
     }
 
     /// Stop streaming to all destinations
@@ -1162,18 +1187,15 @@ public actor VideoEncoder {
 
         print("📡 Stopping RTMP stream (\(streamDestinations.count) destination(s))...")
 
+        isStoppingStream = true
+        defer { isStoppingStream = false }
+
         silentAudioTask?.cancel()
         silentAudioTask = nil
 
-        // Tear down all destinations
-        for (id, dest) in streamDestinations {
-            dest.videoContinuation?.finish()
-            dest.audioContinuation?.finish()
-            dest.videoSendTask?.cancel()
-            dest.audioSendTask?.cancel()
-            await dest.publisher.disconnect()
-            print("📡 [\(id)] Disconnected")
-        }
+        // Detach live state synchronously before awaiting publisher disconnects so a concurrent
+        // startStreaming() never observes stale `isStreaming == true` during teardown.
+        let destinationsToDisconnect = streamDestinations
         streamDestinations.removeAll()
         streamsWithoutDestinationForTesting = false
         activeStreamDescriptor = nil
@@ -1182,6 +1204,16 @@ public actor VideoEncoder {
         streamAudioEncoder = nil
         streamVideoEncoder = nil
         streamStartTime = nil
+
+        // Tear down all destinations
+        for (id, dest) in destinationsToDisconnect {
+            dest.videoContinuation?.finish()
+            dest.audioContinuation?.finish()
+            dest.videoSendTask?.cancel()
+            dest.audioSendTask?.cancel()
+            await dest.publisher.disconnect()
+            print("📡 [\(id)] Disconnected")
+        }
 
         print("✅ RTMP stream stopped")
     }
@@ -1209,7 +1241,7 @@ public actor VideoEncoder {
         finishingHookForTesting = hook
     }
 
-    /// Tests: `hook` is awaited while `isStartingStream` is true, before destinations connect.
+    /// Tests: `hook` is awaited while `activeStreamStart` is set, before destinations connect.
     func setStreamStartHookForTesting(_ hook: (@Sendable () async -> Void)?) {
         streamStartHookForTesting = hook
     }
@@ -1235,7 +1267,39 @@ public actor VideoEncoder {
 
     /// Stop streaming to a single destination (others continue)
     public func stopStreaming(id: String) async {
+        // Handle stopping a destination while an RTMP start is still in flight
+        if case let .rtmp(descriptors) = activeStreamStart,
+           descriptors.contains(where: { $0.id == id }) {
+            pendingCancelledDestinationIDs.insert(id)
+            if descriptors.allSatisfy({ pendingCancelledDestinationIDs.contains($0.id) }) {
+                stopRequestedDuringStreamStart = true
+                streamStartGeneration &+= 1
+            }
+        }
+
         guard let dest = streamDestinations.removeValue(forKey: id) else { return }
+
+        if case let .rtmp(descriptors) = activeStreamDescriptor {
+            let remaining = descriptors.filter { $0.id != id }
+            activeStreamDescriptor = remaining.isEmpty ? nil : .rtmp(remaining)
+        }
+
+        let noDestinationsRemaining = streamDestinations.isEmpty
+        if noDestinationsRemaining {
+            isStoppingStream = true
+            silentAudioTask?.cancel()
+            silentAudioTask = nil
+            activeStreamDescriptor = nil
+            streamVideoEncoder?.stop()
+            streamAudioEncoder = nil
+            streamVideoEncoder = nil
+            streamStartTime = nil
+        }
+        defer {
+            if noDestinationsRemaining {
+                isStoppingStream = false
+            }
+        }
 
         dest.videoContinuation?.finish()
         dest.audioContinuation?.finish()
@@ -1244,15 +1308,7 @@ public actor VideoEncoder {
         await dest.publisher.disconnect()
         print("📡 [\(id)] Disconnected (remaining: \(streamDestinations.count))")
 
-        // If no destinations left, clean up shared state
-        if streamDestinations.isEmpty {
-            silentAudioTask?.cancel()
-            silentAudioTask = nil
-            activeStreamDescriptor = nil
-            streamVideoEncoder?.stop()
-            streamAudioEncoder = nil
-            streamVideoEncoder = nil
-            streamStartTime = nil
+        if noDestinationsRemaining {
             print("✅ All RTMP streams stopped")
         }
     }
@@ -1379,6 +1435,9 @@ public actor VideoEncoder {
     ///   - rtmpURL: RTMP server URL (e.g., rtmp://platform.arkavo.net:1935)
     ///   - streamKey: Stream key (e.g., live/test)
     public func startNTDFStreaming(kasURL: URL, rtmpURL: String, streamKey: String) async throws {
+        guard !isStoppingStream else {
+            throw StreamingError.alreadyStreaming
+        }
         let request = ActiveStreamStart.ntdf(kasURL: kasURL, rtmpURL: rtmpURL, streamKey: streamKey)
         if let inFlight = activeStreamStart {
             guard inFlight == request else {
@@ -1400,6 +1459,7 @@ public actor VideoEncoder {
         let generation = streamStartGeneration
         activeStreamStart = request
         stopRequestedDuringStreamStart = false
+        pendingCancelledDestinationIDs.removeAll()
         do {
             try await performStartNTDFStreaming(
                 kasURL: kasURL,
@@ -1561,6 +1621,11 @@ public actor VideoEncoder {
 
         print("🔐 Stopping NTDF stream...")
 
+        isStoppingStream = true
+        defer { isStoppingStream = false }
+
+        // Detach live state synchronously before awaiting manager.disconnect() so a concurrent
+        // startNTDFStreaming() never observes stale `isNTDFStreaming == true` during teardown.
         ntdfVideoContinuation?.finish()
         ntdfAudioContinuation?.finish()
         ntdfVideoContinuation = nil
@@ -1571,8 +1636,6 @@ public actor VideoEncoder {
         ntdfVideoSendTask = nil
         ntdfAudioSendTask = nil
 
-        await manager.disconnect()
-
         streamVideoEncoder?.stop()
         streamAudioEncoder = nil
         streamVideoEncoder = nil
@@ -1581,6 +1644,8 @@ public actor VideoEncoder {
         isNTDFStreaming = false
         activeStreamDescriptor = nil
         streamStartTime = nil
+
+        await manager.disconnect()
 
         print("✅ NTDF stream stopped")
     }

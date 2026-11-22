@@ -433,6 +433,42 @@ struct RecorderVideoAuditFixesTests {
         #expect(await !encoder.isStreamingActive)
     }
 
+    @Test("VideoEncoder stopStreaming(id:) during in-flight start cancels that destination cleanly")
+    func videoEncoderStopStreamingByIDDuringInFlightStartCancelsCleanly() async throws {
+        let encoder = VideoEncoder(quality: .performance)
+        let hookState = OSAllocatedUnfairLock(initialState: (entered: false, release: false))
+        await encoder.setStreamStartHookForTesting {
+            hookState.withLock { $0.entered = true }
+            while !hookState.withLock({ $0.release }) {
+                try? await Task.sleep(for: .milliseconds(5))
+            }
+        }
+
+        let dest = (
+            id: "twitch",
+            destination: RTMPPublisher.Destination(url: "rtmp://127.0.0.1:1/app", platform: "twitch"),
+            streamKey: "key-a"
+        )
+        let startTask = Task {
+            try await encoder.startStreaming(to: [dest])
+        }
+
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !hookState.withLock({ $0.entered }) && .now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(hookState.withLock { $0.entered })
+
+        // Stopping the only destination by ID while start is in flight must cancel the start
+        await encoder.stopStreaming(id: "twitch")
+        hookState.withLock { $0.release = true }
+
+        await #expect(throws: CancellationError.self) {
+            try await startTask.value
+        }
+        #expect(await !encoder.isStreamingActive)
+    }
+
     @Test("CameraManager ignores stale frames received before input switch completes")
     @MainActor
     func cameraManagerIgnoresFramesUntilInputSwitchCompletes() async throws {
