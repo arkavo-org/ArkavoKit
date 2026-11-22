@@ -230,6 +230,111 @@ struct RecorderAudioSessionAuditFixesTests {
         }
         #expect(!session.registeredAudioSourceIDs.contains("remote-camera-iphone-1"))
     }
+
+    @Test("RecordingSession remote camera disconnect cleanup does not remove a fast-reconnected replacement with the same sourceID")
+    @MainActor
+    func recordingSessionRemoteAudioDisconnectPreservesFastReconnect() async throws {
+        let session = try RecordingSession()
+        let server = RemoteCameraServer()
+        let pcmBytes = Data(repeating: 0x01, count: 64)
+        let payload = RemoteCameraMessage.AudioPayload(
+            sourceID: "iphone-reconnect",
+            timestamp: 1.0,
+            sampleRate: 48_000,
+            channels: 2,
+            audioData: pcmBytes
+        )
+
+        session.remoteCameraServer(server, didReceiveAudio: payload, sourceID: "iphone-reconnect")
+        #expect(session.registeredAudioSourceIDs.contains("remote-camera-iphone-reconnect"))
+
+        // Disconnect and immediately reconnect with the same sourceID before deferred cleanup runs
+        session.remoteCameraServer(server, didUpdateSources: [])
+        session.remoteCameraServer(server, didReceiveAudio: payload, sourceID: "iphone-reconnect")
+        session.remoteCameraServer(server, didUpdateSources: ["iphone-reconnect"])
+
+        // Let deferred stop tasks settle
+        try await Task.sleep(for: .milliseconds(50))
+
+        #expect(session.registeredAudioSourceIDs.contains("remote-camera-iphone-reconnect"))
+    }
+
+    @Test("RecordingSession does not register remote camera audio when microphone capture is disabled")
+    @MainActor
+    func recordingSessionIgnoresRemoteCameraAudioWhenMicrophoneDisabled() throws {
+        let session = try RecordingSession()
+        session.enableMicrophone = false
+        let server = RemoteCameraServer()
+        let payload = RemoteCameraMessage.AudioPayload(
+            sourceID: "iphone-muted",
+            timestamp: 1.0,
+            sampleRate: 48_000,
+            channels: 2,
+            audioData: Data(repeating: 0x01, count: 64)
+        )
+
+        session.remoteCameraServer(server, didReceiveAudio: payload, sourceID: "iphone-muted")
+        #expect(!session.registeredAudioSourceIDs.contains("remote-camera-iphone-muted"))
+    }
+
+    @Test("RecordingSession stopRecording during Step 6 tears down audio sources and fails startRecording")
+    @MainActor
+    func recordingSessionStopDuringStep6TearsDownAudioAndFailsStart() async throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("step6-stop-\(UUID().uuidString).mov")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let finishHookState = OSAllocatedUnfairLock(initialState: (entered: false, release: false))
+        let encoder = VideoEncoder()
+        await encoder.setFinishingHookForTesting {
+            finishHookState.withLock { $0.entered = true }
+            while !finishHookState.withLock({ $0.release }) {
+                try? await Task.sleep(for: .milliseconds(5))
+            }
+        }
+
+        let session = try RecordingSession(screenCapture: ScreenCaptureManager(), encoder: encoder)
+        session.enableDesktop = false
+        session.enableCamera = false
+        session.enableMicrophone = false
+        session.enableScreenAudio = false
+        session.enableAvatar = true
+        session.watermarkEnabled = false
+        session.avatarTextureProvider = {
+            createTestPixelBuffer(width: 64, height: 64, red: 0, green: 255, blue: 0)
+        }
+
+        let slowAudio = SuspendedStartAudioSource(sourceID: "muse-voice")
+        session.addMuseAudioSource(slowAudio)
+
+        let startTask = Task {
+            try await session.startRecording(outputURL: url, title: "step6-stop")
+        }
+        try await slowAudio.waitUntilStartEntered()
+
+        // Step 5 has set _isRecording = true and cleared recordingStarting = false;
+        // stopRecording() now enters finishRecording() while Step 6 is suspended in audioRouter.startAll().
+        let stopTask = Task {
+            try? await session.stopRecording()
+        }
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !finishHookState.withLock({ $0.entered }) && .now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(finishHookState.withLock { $0.entered })
+
+        // Release audio start while stopRecording() is still in finishRecording() (recordingStopping == true, _isRecording == true).
+        slowAudio.releaseStart()
+
+        await #expect(throws: CancellationError.self) {
+            try await startTask.value
+        }
+        #expect(!slowAudio.isActive, "Audio opened during Step 6 must be stopped when stopRecording() raced with startAll()")
+
+        finishHookState.withLock { $0.release = true }
+        _ = await stopTask.value
+        #expect(!session.isRecording)
+    }
     #endif
 
     // MARK: - M9 & C6: AudioManager & MicrophoneAudioSource 0-byte, Float32, and non-contiguous level
@@ -622,5 +727,54 @@ private final class SuspendedStopAudioSource: AudioSource, @unchecked Sendable {
     func deliverStaleSample(_ sampleBuffer: CMSampleBuffer) {
         let stale = state.withLockUnchecked { $0.lastOnSample }
         stale?(sampleBuffer)
+    }
+}
+
+private final class SuspendedStartAudioSource: AudioSource, @unchecked Sendable {
+    let sourceID: String
+    let sourceName = "SuspendedStart"
+    let format = AudioFormat(sampleRate: 48_000, channels: 2, bitDepth: 16, formatID: kAudioFormatLinearPCM)
+
+    private struct State {
+        var active = false
+        var onSample: ((CMSampleBuffer) -> Void)?
+        var startEntered = false
+        var releaseStart = false
+    }
+
+    private let state = OSAllocatedUnfairLock<State>(uncheckedState: State())
+
+    var isActive: Bool { state.withLockUnchecked { $0.active } }
+    var onSample: ((CMSampleBuffer) -> Void)? {
+        get { state.withLockUnchecked { $0.onSample } }
+        set { state.withLockUnchecked { $0.onSample = newValue } }
+    }
+
+    init(sourceID: String) {
+        self.sourceID = sourceID
+    }
+
+    func start() async throws {
+        state.withLockUnchecked { $0.startEntered = true }
+        while !state.withLockUnchecked({ $0.releaseStart }) {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        state.withLockUnchecked { $0.active = true }
+    }
+
+    func stop() async throws {
+        state.withLockUnchecked { $0.active = false }
+    }
+
+    func waitUntilStartEntered() async throws {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !state.withLockUnchecked({ $0.startEntered }) && .now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(state.withLockUnchecked { $0.startEntered })
+    }
+
+    func releaseStart() {
+        state.withLockUnchecked { $0.releaseStart = true }
     }
 }

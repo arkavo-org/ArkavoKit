@@ -55,7 +55,7 @@ public final class AgentStreamHandler: ObservableObject, AgentNotificationHandle
         lastSequence = 0
 
         // Register as notification handler before subscribing so early deltas are delivered
-        await connection.setNotificationHandler(self)
+        await connection.addNotificationHandler(self)
 
         print("[AgentStreamHandler] Calling chat_stream with positional params: [\(sessionId)]")
 
@@ -66,7 +66,7 @@ public final class AgentStreamHandler: ObservableObject, AgentNotificationHandle
                 arrayParams: [sessionId]
             )
         } catch {
-            await connection.clearNotificationHandler(ifMatching: self)
+            await connection.removeNotificationHandler(self)
             isStreaming = false
             throw error
         }
@@ -74,7 +74,7 @@ public final class AgentStreamHandler: ObservableObject, AgentNotificationHandle
         print("[AgentStreamHandler] Got subscription response: \(response)")
 
         guard case .success(_, let result) = response else {
-            await connection.clearNotificationHandler(ifMatching: self)
+            await connection.removeNotificationHandler(self)
             isStreaming = false
             if case .error(_, let code, let message) = response {
                 print("[AgentStreamHandler] ERROR: Subscription failed: \(code) - \(message)")
@@ -114,7 +114,7 @@ public final class AgentStreamHandler: ObservableObject, AgentNotificationHandle
             )
         }
 
-        await connection.clearNotificationHandler(ifMatching: self)
+        await connection.removeNotificationHandler(self)
     }
 
     // MARK: - Notification Handling

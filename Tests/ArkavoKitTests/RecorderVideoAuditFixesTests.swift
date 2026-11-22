@@ -1,4 +1,5 @@
 import AVFoundation
+import ArkavoStreaming
 import CoreGraphics
 import CoreImage
 import CoreMedia
@@ -340,6 +341,98 @@ struct RecorderVideoAuditFixesTests {
         #expect(!streamingActive)
     }
 
+    @Test("VideoEncoder rejects mismatched concurrent NTDF or RTMP starts instead of silently succeeding")
+    func videoEncoderRejectsMismatchedConcurrentStreamStarts() async throws {
+        let encoder = VideoEncoder(quality: .performance)
+        let hookState = OSAllocatedUnfairLock(initialState: (entered: false, release: false))
+        await encoder.setStreamStartHookForTesting {
+            hookState.withLock { $0.entered = true }
+            while !hookState.withLock({ $0.release }) {
+                try? await Task.sleep(for: .milliseconds(5))
+            }
+        }
+
+        let destA = (
+            id: "twitch",
+            destination: RTMPPublisher.Destination(url: "rtmp://127.0.0.1:1/app", platform: "twitch"),
+            streamKey: "key-a"
+        )
+        let destB = (
+            id: "youtube",
+            destination: RTMPPublisher.Destination(url: "rtmp://127.0.0.1:1/live2", platform: "youtube"),
+            streamKey: "key-b"
+        )
+
+        let first = Task {
+            try await encoder.startStreaming(to: [destA])
+        }
+
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !hookState.withLock({ $0.entered }) && .now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(hookState.withLock { $0.entered })
+
+        // Concurrent NTDF start during in-flight plaintext RTMP start must fail immediately with alreadyStreaming
+        let kasURL = try #require(URL(string: "https://platform.arkavo.net"))
+        await #expect(throws: VideoEncoder.StreamingError.alreadyStreaming) {
+            try await encoder.startNTDFStreaming(
+                kasURL: kasURL,
+                rtmpURL: "rtmp://127.0.0.1:1/app",
+                streamKey: "key-a"
+            )
+        }
+
+        // Concurrent RTMP start with different destinations must also fail immediately with alreadyStreaming
+        await #expect(throws: VideoEncoder.StreamingError.alreadyStreaming) {
+            try await encoder.startStreaming(to: [destB])
+        }
+
+        hookState.withLock { $0.release = true }
+        await #expect(throws: VideoEncoder.StreamingError.self) {
+            try await first.value
+        }
+        #expect(await !encoder.isStreamingActive)
+    }
+
+    @Test("VideoEncoder stopStreaming during in-flight start aborts cleanly without leaving streaming active")
+    func videoEncoderStopStreamingDuringInFlightStartAbortsCleanly() async throws {
+        let encoder = VideoEncoder(quality: .performance)
+        let hookState = OSAllocatedUnfairLock(initialState: (entered: false, release: false))
+        await encoder.setStreamStartHookForTesting {
+            hookState.withLock { $0.entered = true }
+            while !hookState.withLock({ $0.release }) {
+                try? await Task.sleep(for: .milliseconds(5))
+            }
+        }
+
+        let first = Task {
+            try await encoder.startStreaming(to: [])
+        }
+
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !hookState.withLock({ $0.entered }) && .now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(hookState.withLock { $0.entered })
+
+        let joiner = Task {
+            try await encoder.startStreaming(to: [])
+        }
+        try await Task.sleep(for: .milliseconds(25))
+
+        await encoder.stopStreaming()
+        hookState.withLock { $0.release = true }
+
+        await #expect(throws: CancellationError.self) {
+            try await first.value
+        }
+        await #expect(throws: CancellationError.self) {
+            try await joiner.value
+        }
+        #expect(await !encoder.isStreamingActive)
+    }
+
     @Test("CameraManager ignores stale frames received before input switch completes")
     @MainActor
     func cameraManagerIgnoresFramesUntilInputSwitchCompletes() async throws {
@@ -385,8 +478,9 @@ struct RecorderVideoAuditFixesTests {
         // Commit input switch to capture B
         manager.commitInputSwitch(captureID: captureB, inputID: newInputID)
 
-        // Late frame from the old input after commit must still be ignored
+        // Late frame from the old input or a torn-down connection (nil inputID) must be ignored
         manager.handleOutputFrame(sample, fromInput: oldInputID)
+        manager.handleOutputFrame(sample, fromInput: nil)
         try await Task.sleep(for: .milliseconds(30))
         #expect(deliveredCount.withLock { $0 } == 1)
         #expect(!firstFrameReceived.withLock { $0 })

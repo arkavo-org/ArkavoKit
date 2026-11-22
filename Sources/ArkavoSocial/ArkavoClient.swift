@@ -404,42 +404,51 @@ public final class ArkavoClient: NSObject {
         let cachedToken = KeychainManager.getAuthenticationToken()
         let cachedHandle = KeychainManager.getArkavoHandle()
         if Self.reusesCachedSession(token: cachedToken, handle: cachedHandle, account: account), let cachedHandle {
+            var ownedTransport: (webSocket: URLSessionWebSocketTask, session: URLSession)?
             do {
                 currentState = .connecting
-                try await openAndWaitForWebSocketConnection()
+                let transport = try await openAndWaitForWebSocketConnection()
+                ownedTransport = transport
                 guard disconnectGeneration == gen else {
-                    tearDownConnection(error: ArkavoError.connectionFailed("Connection disconnected"))
-                    throw ArkavoError.connectionFailed("Connection disconnected")
+                    cleanUpOwnedTransport(webSocket: transport.webSocket, session: transport.session)
+                    throw CancellationError()
                 }
                 try await sendInitialMessages()
                 guard disconnectGeneration == gen else {
-                    tearDownConnection(error: ArkavoError.connectionFailed("Connection disconnected"))
-                    throw ArkavoError.connectionFailed("Connection disconnected")
+                    cleanUpOwnedTransport(webSocket: transport.webSocket, session: transport.session)
+                    throw CancellationError()
                 }
                 return cachedHandle
             } catch {
                 guard disconnectGeneration == gen else {
-                    throw ArkavoError.connectionFailed("Connection disconnected")
+                    if let ownedTransport {
+                        cleanUpOwnedTransport(webSocket: ownedTransport.webSocket, session: ownedTransport.session)
+                    }
+                    throw CancellationError()
                 }
                 print("ArkavoClient: cached token rejected (\(error)); falling back to passkey ceremony")
-                KeychainManager.deleteAuthenticationToken()
+                credentialStore.deleteAuthenticationToken()
+                if let ownedTransport {
+                    cleanUpOwnedTransport(webSocket: ownedTransport.webSocket, session: ownedTransport.session)
+                }
                 tearDownConnection(error: ArkavoError.connectionFailed("Cached session handshake failed"))
             }
         } else if cachedToken != nil {
             print("ArkavoClient: cached token does not fit this sign-in; dropping it")
-            KeychainManager.deleteAuthenticationToken()
+            credentialStore.deleteAuthenticationToken()
         }
 
         guard disconnectGeneration == gen else {
-            throw ArkavoError.connectionFailed("Connection disconnected")
+            throw CancellationError()
         }
 
+        var ceremonyTransport: (webSocket: URLSessionWebSocketTask, session: URLSession)?
         do {
             // First authenticate
             currentState = .authenticating
             let reply = try await passkeyCeremony(account: account)
             guard disconnectGeneration == gen else {
-                throw ArkavoError.connectionFailed("Connection disconnected")
+                throw CancellationError()
             }
             // The handle first: should the token's write fail, no token is left
             // beside a stale handle, so the next connect runs the ceremony.
@@ -449,26 +458,30 @@ public final class ArkavoClient: NSObject {
             // only no session: the sign-in goes on.
             await passkeySessions.open(token: reply.token, via: passkeySessionEndpoint)
             guard disconnectGeneration == gen else {
-                throw ArkavoError.connectionFailed("Connection disconnected")
+                throw CancellationError()
             }
 
             // Then establish WebSocket connection
             currentState = .connecting
-            try await openAndWaitForWebSocketConnection()
+            let transport = try await openAndWaitForWebSocketConnection()
+            ceremonyTransport = transport
             guard disconnectGeneration == gen else {
-                tearDownConnection(error: ArkavoError.connectionFailed("Connection disconnected"))
-                throw ArkavoError.connectionFailed("Connection disconnected")
+                cleanUpOwnedTransport(webSocket: transport.webSocket, session: transport.session)
+                throw CancellationError()
             }
             // swap keys
             try await sendInitialMessages()
             guard disconnectGeneration == gen else {
-                tearDownConnection(error: ArkavoError.connectionFailed("Connection disconnected"))
-                throw ArkavoError.connectionFailed("Connection disconnected")
+                cleanUpOwnedTransport(webSocket: transport.webSocket, session: transport.session)
+                throw CancellationError()
             }
             return reply.handle
         } catch {
             guard disconnectGeneration == gen else {
-                throw ArkavoError.connectionFailed("Connection disconnected")
+                if let ceremonyTransport {
+                    cleanUpOwnedTransport(webSocket: ceremonyTransport.webSocket, session: ceremonyTransport.session)
+                }
+                throw CancellationError()
             }
             print("connect error: \(error)")
             if let kcError = error as? KeychainManager.KeychainError {
@@ -486,15 +499,25 @@ public final class ArkavoClient: NSObject {
         }
     }
 
-    private func openAndWaitForWebSocketConnection() async throws {
-        let socket = try setupWebSocketConnection()
-        try await waitForConnection { [weak self] in
-            socket.resume()
-            self?.receiveMessage()
+    private func openAndWaitForWebSocketConnection() async throws -> (webSocket: URLSessionWebSocketTask, session: URLSession) {
+        let transport = try setupWebSocketConnection()
+        do {
+            try await waitForConnection(for: transport.webSocket, session: transport.session) { [weak self] in
+                transport.webSocket.resume()
+                self?.receiveMessage()
+            }
+        } catch {
+            cleanUpOwnedTransport(webSocket: transport.webSocket, session: transport.session)
+            throw error
         }
+        return transport
     }
 
-    private func waitForConnection(resumeSocket: (() -> Void)? = nil) async throws {
+    private func waitForConnection(
+        for socket: URLSessionWebSocketTask,
+        session ownedSession: URLSession,
+        resumeSocket: (() -> Void)? = nil
+    ) async throws {
         switch currentState {
         case .connected:
             return
@@ -506,16 +529,16 @@ public final class ArkavoClient: NSObject {
             break
         }
 
-        let timeoutTask = Task { @MainActor [weak self] in
+        let timeoutTask = Task { @MainActor [weak self, weak socket, weak ownedSession] in
             try await Task.sleep(nanoseconds: 10_000_000_000) // 10 seconds
             guard !Task.isCancelled else { return }
-            guard let self, let continuation = self.connectionContinuation else { return }
+            guard let self, let socket, let ownedSession,
+                  self.webSocket === socket,
+                  let continuation = self.connectionContinuation
+            else { return }
             self.connectionContinuation = nil
             let timeoutError = ArkavoError.connectionFailed("Connection timeout")
-            self.webSocket?.cancel()
-            self.webSocket = nil
-            self.session?.invalidateAndCancel()
-            self.session = nil
+            self.cleanUpOwnedTransport(webSocket: socket, session: ownedSession)
             self.currentState = .error(timeoutError)
             continuation.resume(throwing: timeoutError)
         }
@@ -535,15 +558,31 @@ public final class ArkavoClient: NSObject {
                 resumeSocket?()
             }
         } onCancel: {
-            Task { @MainActor [weak self] in
-                guard let self, let continuation = self.connectionContinuation else { return }
+            Task { @MainActor [weak self, weak socket, weak ownedSession] in
+                guard let self, let socket, let ownedSession,
+                      self.webSocket === socket,
+                      let continuation = self.connectionContinuation
+                else { return }
                 self.connectionContinuation = nil
-                self.webSocket?.cancel()
-                self.webSocket = nil
-                self.session?.invalidateAndCancel()
-                self.session = nil
+                self.cleanUpOwnedTransport(webSocket: socket, session: ownedSession)
                 continuation.resume(throwing: CancellationError())
             }
+        }
+    }
+
+    /// Cancels and invalidates only the transport created by a specific `connect()` attempt.
+    /// Never disturbs a replacement socket/session installed by a subsequent `connect()`.
+    func cleanUpOwnedTransport(
+        webSocket ownedSocket: URLSessionWebSocketTask,
+        session ownedSession: URLSession
+    ) {
+        ownedSocket.cancel()
+        ownedSession.invalidateAndCancel()
+        if webSocket === ownedSocket {
+            webSocket = nil
+        }
+        if session === ownedSession {
+            session = nil
         }
     }
 
@@ -568,16 +607,8 @@ public final class ArkavoClient: NSObject {
 
     public func disconnect() async {
         disconnectGeneration &+= 1
-        guard currentState != .disconnected
-            || webSocket != nil
-            || session != nil
-            || connectionContinuation != nil
-            || !messageHandlers.isEmpty
-            || !queuedMessageHandlers.isEmpty
-        else { return }
-
         tearDownConnection(error: ArkavoError.connectionFailed("Connection disconnected"))
-        KeychainManager.deleteAuthenticationToken()
+        credentialStore.deleteAuthenticationToken()
     }
 
     /// Deletes the user's account from the server
@@ -1085,6 +1116,9 @@ public final class ArkavoClient: NSObject {
         print("Sending public key message, key length: \(publicKeyMessage.publicKey.count)")
         do {
             let publicKeyData = try await sendAndWaitForMessage(publicKeyMessage.toData(), responseType: .publicKey)
+            guard disconnectGeneration == gen else {
+                throw CancellationError()
+            }
             print("Received public key response, length: \(publicKeyData.count)")
 
             print("Processing public key response...")
@@ -1105,6 +1139,9 @@ public final class ArkavoClient: NSObject {
         let kasKeyMessage = KASKeyMessage()
         do {
             let kasKeyData = try await sendAndWaitForMessage(kasKeyMessage.toData(), responseType: .kasKey)
+            guard disconnectGeneration == gen else {
+                throw CancellationError()
+            }
             print("Received KAS key response, length: \(kasKeyData.count)")
 
             print("Processing KAS key response...")
@@ -1465,7 +1502,7 @@ public final class ArkavoClient: NSObject {
         return AuthenticationReply(token: token, handle: handle)
     }
 
-    private func setupWebSocketConnection() throws -> URLSessionWebSocketTask {
+    private func setupWebSocketConnection() throws -> (webSocket: URLSessionWebSocketTask, session: URLSession) {
         print("Current state before WebSocket setup: \(currentState)")
         guard currentState == .connecting else {
             print("Invalid state for WebSocket setup: \(currentState)")
@@ -1510,7 +1547,7 @@ public final class ArkavoClient: NSObject {
         }
 
         print("\nWebSocket Task Created: \(webSocket)")
-        return webSocket
+        return (webSocket: webSocket, session: session)
     }
 
     /// Handles the reply to the first ping on `task`: a failure fails the

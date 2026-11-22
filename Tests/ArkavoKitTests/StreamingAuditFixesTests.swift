@@ -608,7 +608,8 @@ final class StreamingAuditFixesTests: XCTestCase {
     func testRTMPPublisherTimestampNormalizationSameClockDomainPreservesOffset() async {
         let publisher = RTMPPublisher()
 
-        // (b1) Same clock domain: audio arrives at 100.0s, video arrives at 100.5s -> preserves 500ms offset
+        // (b1) Same clock domain, second track starts later within 10s:
+        // audio arrives at 100.0s, video arrives at 100.5s -> preserves exact 500ms offset
         let a0 = await publisher.normalizeTimestamp(CMTime(value: 100_000, timescale: 1000), for: .audio)
         let v0 = await publisher.normalizeTimestamp(CMTime(value: 100_500, timescale: 1000), for: .video)
         let a1 = await publisher.normalizeTimestamp(CMTime(value: 100_500, timescale: 1000), for: .audio)
@@ -619,18 +620,46 @@ final class StreamingAuditFixesTests: XCTestCase {
         XCTAssertEqual(a1, 500)
         XCTAssertEqual(v1, 1000)
 
-        // (b2) Reverse arrival order: video at 100.5s first, then audio at 100.0s -> shares 100.0s anchor
+        // (b2) Video starts first at 100.0s, audio starts later at 100.5s -> preserves exact 500ms offset
+        await publisher.disconnect()
+
+        let vLate0 = await publisher.normalizeTimestamp(CMTime(value: 100_000, timescale: 1000), for: .video)
+        let aLate0 = await publisher.normalizeTimestamp(CMTime(value: 100_500, timescale: 1000), for: .audio)
+        let vLate1 = await publisher.normalizeTimestamp(CMTime(value: 100_500, timescale: 1000), for: .video)
+        let aLate1 = await publisher.normalizeTimestamp(CMTime(value: 101_000, timescale: 1000), for: .audio)
+
+        XCTAssertEqual(vLate0, 0)
+        XCTAssertEqual(aLate0, 500)
+        XCTAssertEqual(vLate1, 500)
+        XCTAssertEqual(aLate1, 1000)
+
+        // (b3) Video arrives first at 100.5s (emits 0ms), then earlier audio arrives at 100.0s:
+        // emitted anchor must remain frozen at 100.5s (zero jump on next video frame),
+        // pre-anchor audio clamps to 0ms, and subsequent frames align in exact sync.
         await publisher.disconnect()
 
         let vRev0 = await publisher.normalizeTimestamp(CMTime(value: 100_500, timescale: 1000), for: .video)
         let aRev0 = await publisher.normalizeTimestamp(CMTime(value: 100_000, timescale: 1000), for: .audio)
         let vRev1 = await publisher.normalizeTimestamp(CMTime(value: 101_000, timescale: 1000), for: .video)
-        let aRev1 = await publisher.normalizeTimestamp(CMTime(value: 100_500, timescale: 1000), for: .audio)
+        let aRev1 = await publisher.normalizeTimestamp(CMTime(value: 101_000, timescale: 1000), for: .audio)
 
         XCTAssertEqual(vRev0, 0)
         XCTAssertEqual(aRev0, 0)
-        XCTAssertEqual(vRev1, 1000)
+        XCTAssertEqual(vRev1, 500)
         XCTAssertEqual(aRev1, 500)
+
+        // (b4) Symmetric case: audio arrives first at 100.5s (emits 0ms), then earlier video at 100.0s
+        await publisher.disconnect()
+
+        let aFirst0 = await publisher.normalizeTimestamp(CMTime(value: 100_500, timescale: 1000), for: .audio)
+        let vSecond0 = await publisher.normalizeTimestamp(CMTime(value: 100_000, timescale: 1000), for: .video)
+        let aFirst1 = await publisher.normalizeTimestamp(CMTime(value: 101_000, timescale: 1000), for: .audio)
+        let vSecond1 = await publisher.normalizeTimestamp(CMTime(value: 101_000, timescale: 1000), for: .video)
+
+        XCTAssertEqual(aFirst0, 0)
+        XCTAssertEqual(vSecond0, 0)
+        XCTAssertEqual(aFirst1, 500)
+        XCTAssertEqual(vSecond1, 500)
     }
 
     func testRTMPSubscriberMetadataDimensionRejectsIntMaxAndTwoTo63WithoutTrapping() async {
@@ -763,5 +792,101 @@ final class StreamingAuditFixesTests: XCTestCase {
 
         encoder.stop()
         XCTAssertFalse(encoder.hasActiveCallbackContext)
+    }
+
+    func testVideoEncoderOnFrameReentrantReadAndMutationDoesNotDeadlock() async throws {
+        let encoder = VideoEncoder(quality: .performance)
+        try encoder.start()
+        defer { encoder.stop() }
+
+        let firstCallbackSawHandler = Mutex<Bool>(false)
+        let replacementCallbackCount = FrameCounter()
+
+        // (1) Deterministic synchronous re-entrancy while sessionLock is held:
+        // reading and mutating `encoder.onFrame` from inside an active callback must not deadlock.
+        encoder.onFrame = { [weak encoder] _ in
+            guard let encoder else { return }
+            let hadHandler = encoder.onFrame != nil
+            firstCallbackSawHandler.withLock { $0 = hadHandler }
+            encoder.onFrame = { [weak encoder] _ in
+                replacementCallbackCount.increment()
+                encoder?.onFrame = nil
+            }
+        }
+
+        let dummyFrame = EncodedVideoFrame(data: Data([0x00, 0x00, 0x00, 0x01, 0x65]), pts: .zero, isKeyframe: true)
+        encoder.invokeActiveCallbackWhileHoldingSessionLockForTesting(dummyFrame)
+        XCTAssertTrue(firstCallbackSawHandler.withLock { $0 })
+        XCTAssertNotNil(encoder.onFrame)
+
+        encoder.invokeActiveCallbackWhileHoldingSessionLockForTesting(dummyFrame)
+        XCTAssertEqual(replacementCallbackCount.count, 1)
+        XCTAssertNil(encoder.onFrame)
+
+        // Subsequent callback invocation after clearing onFrame is a no-op
+        encoder.invokeActiveCallbackWhileHoldingSessionLockForTesting(dummyFrame)
+        XCTAssertEqual(replacementCallbackCount.count, 1)
+
+        // (2) Real VideoToolbox encoding with re-entrant onFrame read & clear
+        let realCallbacks = FrameCounter()
+        let realCallbackSawHandler = Mutex<Bool>(false)
+        encoder.onFrame = { [weak encoder] _ in
+            guard let encoder else { return }
+            let hadHandler = encoder.onFrame != nil
+            realCallbackSawHandler.withLock { $0 = $0 || hadHandler }
+            realCallbacks.increment()
+            encoder.onFrame = nil
+        }
+
+        let pixelBuffer = try makeTestPixelBuffer(width: 1280, height: 720)
+        for i in 0 ..< 5 {
+            try encoder.encode(pixelBuffer, timestamp: CMTime(value: CMTimeValue(i), timescale: 30))
+        }
+        for _ in 0 ..< 100 {
+            if realCallbacks.count > 0 { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertGreaterThanOrEqual(realCallbacks.count, 1, "Re-entrant onFrame clear during real encoding must fire without deadlocking")
+        XCTAssertTrue(realCallbackSawHandler.withLock { $0 })
+        XCTAssertNil(encoder.onFrame)
+    }
+
+    func testNTDFTokenBuilderEmbedsPlaintextPolicyClaimsAndValidatesKASURL() async throws {
+        let kasPrivateKey = P256.KeyAgreement.PrivateKey()
+        let kasPublicKey = kasPrivateKey.publicKey.compressedRepresentation
+
+        let payload = NTDFTokenPayload(
+            subId: UUID(),
+            flags: [.profile, .webAuthn],
+            scopes: ["openid", "profile"],
+            attrs: [(NTDFAttributeType.subscriptionTier.rawValue, 2)],
+            iat: 1_700_000_000,
+            exp: 1_700_003_600,
+            aud: "https://kas.example.com:8443",
+            deviceId: "device-abc"
+        )
+        let expectedClaimsBytes = try payload.toBytesChecked()
+
+        let builder = NTDFTokenBuilder(kasPublicKey: kasPublicKey, kasURL: "https://kas.example.com:8443")
+        let z85Token = try await builder.build(payload: payload)
+
+        let decodedBytes = try XCTUnwrap(Z85.decode(z85Token))
+        let parser = BinaryParser(data: decodedBytes)
+        let header = try parser.parseHeader()
+
+        XCTAssertEqual(header.policy.type, .embeddedPlaintext)
+        XCTAssertEqual(header.policy.body?.body, expectedClaimsBytes)
+        XCTAssertEqual(header.payloadKeyAccess.kasLocator.body, "kas.example.com:8443")
+
+        // Non-loopback cleartext HTTP KAS URL must still be rejected
+        let insecureBuilder = NTDFTokenBuilder(kasPublicKey: kasPublicKey, kasURL: "http://kas.example.com")
+        do {
+            _ = try await insecureBuilder.build(payload: payload)
+            XCTFail("Expected non-loopback HTTP KAS URL to be rejected")
+        } catch let error as NTDFTokenError {
+            guard case .invalidKeyFormat = error else {
+                return XCTFail("Expected invalidKeyFormat, got \(error)")
+            }
+        }
     }
 }

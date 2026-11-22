@@ -1,4 +1,5 @@
 import Foundation
+import Network
 import XCTest
 #if canImport(Darwin)
 import Darwin
@@ -409,11 +410,239 @@ final class A2AAuditFixesTests: XCTestCase {
         }
     }
 
+    // MARK: - PR #88 Pass 2 Review Regression Tests
+
+    @MainActor
+    func test_localAIAgent_webSocketOptionsConfiguresMaxMessageSize() {
+        let options = LocalAIAgent.makeWebSocketOptions(authToken: nil)
+        XCTAssertEqual(options.maximumMessageSize, LocalAIAgent.maxMessageSize)
+        XCTAssertEqual(options.maximumMessageSize, 16 * 1024 * 1024)
+        XCTAssertTrue(options.autoReplyPing)
+
+        let authedOptions = LocalAIAgent.makeWebSocketOptions(authToken: "secret-token")
+        XCTAssertEqual(authedOptions.maximumMessageSize, LocalAIAgent.maxMessageSize)
+    }
+
+    func test_localAIAgent_bearerAuthorization_caseInsensitiveAndConstantTime() {
+        let token = "super-secret-token-123"
+
+        // Case-insensitive "Bearer " scheme per RFC 7235 / 6750
+        XCTAssertTrue(LocalAIAgent.verifyBearerAuthorization("Bearer \(token)", expectedToken: token))
+        XCTAssertTrue(LocalAIAgent.verifyBearerAuthorization("bearer \(token)", expectedToken: token))
+        XCTAssertTrue(LocalAIAgent.verifyBearerAuthorization("BEARER \(token)", expectedToken: token))
+        XCTAssertTrue(LocalAIAgent.verifyBearerAuthorization("BeArEr \(token)", expectedToken: token))
+
+        // Wrong token, mismatched length, wrong scheme, missing/empty token must fail
+        XCTAssertFalse(LocalAIAgent.verifyBearerAuthorization("Bearer wrong-token", expectedToken: token))
+        XCTAssertFalse(LocalAIAgent.verifyBearerAuthorization("bearer super-secret-token-124", expectedToken: token))
+        XCTAssertFalse(LocalAIAgent.verifyBearerAuthorization("Bearer \(token)x", expectedToken: token))
+        XCTAssertFalse(LocalAIAgent.verifyBearerAuthorization("Basic \(token)", expectedToken: token))
+        XCTAssertFalse(LocalAIAgent.verifyBearerAuthorization(token, expectedToken: token))
+        XCTAssertFalse(LocalAIAgent.verifyBearerAuthorization("Bearer ", expectedToken: token))
+        XCTAssertFalse(LocalAIAgent.verifyBearerAuthorization(nil, expectedToken: token))
+        XCTAssertFalse(LocalAIAgent.verifyBearerAuthorization("Bearer \(token)", expectedToken: ""))
+    }
+
+    func test_localAIAgent_isLoopbackEndpoint() throws {
+        let port = NWEndpoint.Port(integerLiteral: 8080)
+
+        let ipv4Loopback = try XCTUnwrap(IPv4Address("127.0.0.1"))
+        let ipv4LoopbackSubnet = try XCTUnwrap(IPv4Address("127.42.0.1"))
+        XCTAssertTrue(LocalAIAgent.isLoopbackEndpoint(.hostPort(host: .ipv4(ipv4Loopback), port: port)))
+        XCTAssertTrue(LocalAIAgent.isLoopbackEndpoint(.hostPort(host: .ipv4(ipv4LoopbackSubnet), port: port)))
+
+        let ipv6Loopback = try XCTUnwrap(IPv6Address("::1"))
+        let ipv4MappedLoopback = try XCTUnwrap(IPv6Address("::ffff:127.0.0.1"))
+        let ipv4MappedLoopbackSubnet = try XCTUnwrap(IPv6Address("::ffff:127.10.20.30"))
+        XCTAssertTrue(LocalAIAgent.isLoopbackEndpoint(.hostPort(host: .ipv6(ipv6Loopback), port: port)))
+        XCTAssertTrue(LocalAIAgent.isLoopbackEndpoint(.hostPort(host: .ipv6(ipv4MappedLoopback), port: port)))
+        XCTAssertTrue(LocalAIAgent.isLoopbackEndpoint(.hostPort(host: .ipv6(ipv4MappedLoopbackSubnet), port: port)))
+
+        XCTAssertTrue(LocalAIAgent.isLoopbackEndpoint(.hostPort(host: .name("localhost", nil), port: port)))
+        XCTAssertTrue(LocalAIAgent.isLoopbackEndpoint(.hostPort(host: .name("LOCALHOST", nil), port: port)))
+        XCTAssertTrue(LocalAIAgent.isLoopbackEndpoint(.hostPort(host: .name("127.0.0.1", nil), port: port)))
+        XCTAssertTrue(LocalAIAgent.isLoopbackEndpoint(.hostPort(host: .name("::1", nil), port: port)))
+
+        let lanIPv4 = try XCTUnwrap(IPv4Address("192.168.1.42"))
+        let lanIPv6 = try XCTUnwrap(IPv6Address("fe80::1"))
+        let mappedLAN = try XCTUnwrap(IPv6Address("::ffff:192.168.1.42"))
+        XCTAssertFalse(LocalAIAgent.isLoopbackEndpoint(.hostPort(host: .ipv4(lanIPv4), port: port)))
+        XCTAssertFalse(LocalAIAgent.isLoopbackEndpoint(.hostPort(host: .ipv6(lanIPv6), port: port)))
+        XCTAssertFalse(LocalAIAgent.isLoopbackEndpoint(.hostPort(host: .ipv6(mappedLAN), port: port)))
+        XCTAssertFalse(LocalAIAgent.isLoopbackEndpoint(.hostPort(host: .name("192.168.1.42", nil), port: port)))
+        XCTAssertFalse(LocalAIAgent.isLoopbackEndpoint(.hostPort(host: .name("peer.local", nil), port: port)))
+    }
+
+    @MainActor
+    func test_localAIAgent_authorizationPolicy_protectsPrivilegedMethodsFromUnauthenticatedLAN() async throws {
+        let agent = LocalAIAgent.shared
+
+        // Read-only discovery/health methods remain accessible without auth on non-loopback peers
+        for publicMethod in ["ping", "agent_card", "agent_info", "capabilities", "rpc.discover", "agent.discover"] {
+            XCTAssertFalse(LocalAIAgent.requiresAuthentication(forMethod: publicMethod))
+            XCTAssertTrue(LocalAIAgent.isAuthorized(method: publicMethod, isLoopback: false, isAuthenticated: false))
+        }
+
+        // Privileged methods require loopback or token auth
+        for privilegedMethod in [
+            "sensor_request", "tool_call", "task_offer",
+            "chat_open", "chat_send", "chat_close", "chat_stream", "chat_stream_unsubscribe"
+        ] {
+            XCTAssertTrue(LocalAIAgent.requiresAuthentication(forMethod: privilegedMethod))
+            XCTAssertFalse(LocalAIAgent.isAuthorized(method: privilegedMethod, isLoopback: false, isAuthenticated: false))
+            XCTAssertTrue(LocalAIAgent.isAuthorized(method: privilegedMethod, isLoopback: true, isAuthenticated: false))
+            XCTAssertTrue(LocalAIAgent.isAuthorized(method: privilegedMethod, isLoopback: false, isAuthenticated: true))
+        }
+
+        // When authTokenRequired is true, all connections must be authenticated
+        XCTAssertFalse(LocalAIAgent.isAuthorized(method: "ping", isLoopback: true, isAuthenticated: false, authTokenRequired: true))
+        XCTAssertTrue(LocalAIAgent.isAuthorized(method: "sensor_request", isLoopback: false, isAuthenticated: true, authTokenRequired: true))
+
+        // Unauthenticated non-loopback sensor_request and tool_call return JSON-RPC -32001
+        let sensorReq = AgentRequest(method: "sensor_request", params: AnyCodable([String: Any]()), id: "lan-sensor-1")
+        let sensorResp = try await agent.processRequest(sensorReq, isLoopback: false, isAuthenticated: false)
+        guard case .error(let sensorId, let sensorCode, _) = sensorResp else {
+            XCTFail("Expected -32001 error for unauthenticated non-loopback sensor_request")
+            return
+        }
+        XCTAssertEqual(sensorId, "lan-sensor-1")
+        XCTAssertEqual(sensorCode, -32001)
+
+        let toolReq = AgentRequest(method: "tool_call", params: AnyCodable([String: Any]()), id: "lan-tool-1")
+        let toolResp = try await agent.processRequest(toolReq, isLoopback: false, isAuthenticated: false)
+        guard case .error(let toolId, let toolCode, _) = toolResp else {
+            XCTFail("Expected -32001 error for unauthenticated non-loopback tool_call")
+            return
+        }
+        XCTAssertEqual(toolId, "lan-tool-1")
+        XCTAssertEqual(toolCode, -32001)
+
+        // Loopback unauthenticated request succeeds
+        let localChatReq = AgentRequest(method: "chat_open", params: AnyCodable([String: Any]()), id: "local-chat-1")
+        let localChatResp = try await agent.processRequest(localChatReq, isLoopback: true, isAuthenticated: false)
+        XCTAssertTrue(localChatResp.isSuccess)
+
+        // Authenticated non-loopback request succeeds
+        let authedLanChatReq = AgentRequest(method: "chat_open", params: AnyCodable([String: Any]()), id: "authed-lan-chat-1")
+        let authedLanChatResp = try await agent.processRequest(authedLanChatReq, isLoopback: false, isAuthenticated: true)
+        XCTAssertTrue(authedLanChatResp.isSuccess)
+    }
+
+    @MainActor
+    func test_agentConnection_multiplexesNotificationsAcrossHandlers() async {
+        let endpoint = AgentEndpoint(
+            id: "agent-multiplex",
+            url: "ws://127.0.0.1:9999",
+            metadata: AgentMetadata(name: "Test", purpose: "Test", model: "test")
+        )
+        let connection = AgentConnection(endpoint: endpoint)
+        let streamHandler = AgentStreamHandler(sessionId: "session-stream", connection: connection)
+        let recordingHandler = RecordingNotificationHandler()
+
+        // Register both handlers concurrently
+        await connection.addNotificationHandler(recordingHandler)
+        await connection.addNotificationHandler(streamHandler)
+
+        let firstParams: [String: Any] = [
+            "subscription": "sub-1",
+            "result": [
+                "session_id": "session-stream",
+                "message_id": "msg-1",
+                "sequence": 1,
+                "delta": [
+                    "type": "text",
+                    "text": "Hello"
+                ] as [String: Any]
+            ] as [String: Any]
+        ]
+        await connection.dispatchNotification(
+            AgentNotification(method: "chat_stream", params: AnyCodable(firstParams))
+        )
+
+        // Both handlers receive the notification
+        XCTAssertEqual(streamHandler.streamingText, "Hello")
+        XCTAssertEqual(recordingHandler.receivedMethods, ["chat_stream"])
+
+        // Unsubscribing streamHandler leaves recordingHandler receiving notifications
+        await streamHandler.unsubscribe()
+
+        let secondParams: [String: Any] = [
+            "subscription": "sub-1",
+            "result": [
+                "session_id": "session-stream",
+                "message_id": "msg-1",
+                "sequence": 2,
+                "delta": [
+                    "type": "text",
+                    "text": " World"
+                ] as [String: Any]
+            ] as [String: Any]
+        ]
+        await connection.dispatchNotification(
+            AgentNotification(method: "chat_stream", params: AnyCodable(secondParams))
+        )
+
+        XCTAssertEqual(streamHandler.streamingText, "Hello")
+        XCTAssertEqual(recordingHandler.receivedMethods, ["chat_stream", "chat_stream"])
+
+        // Legacy setNotificationHandler coexists with multiplexed handlers
+        let legacyHandler = RecordingNotificationHandler()
+        await connection.setNotificationHandler(legacyHandler)
+        await connection.dispatchNotification(AgentNotification(method: "heartbeat"))
+
+        XCTAssertEqual(recordingHandler.receivedMethods, ["chat_stream", "chat_stream", "heartbeat"])
+        XCTAssertEqual(legacyHandler.receivedMethods, ["heartbeat"])
+    }
+
+    @MainActor
+    func test_agentManager_reconnectingRetryAndDiscoveryReconciliation() async {
+        let invalidEndpoint = AgentEndpoint(
+            id: "retry-agent",
+            url: "http://not-a-websocket",
+            metadata: AgentMetadata(name: "Retry", purpose: "Test", model: "test")
+        )
+        let manager = AgentManager(autoConnect: false, autoReconnect: true)
+
+        do {
+            try await manager.connect(to: invalidEndpoint)
+            XCTFail("Expected initial connect to fail")
+        } catch {
+            // Expected
+        }
+        XCTAssertNotNil(manager.connections[invalidEndpoint.id])
+        XCTAssertEqual(manager.statuses[invalidEndpoint.id], .reconnecting(attempt: 1))
+
+        // Retrying connect while actively reconnecting cleanly replaces and stays .reconnecting
+        do {
+            try await manager.connect(to: invalidEndpoint)
+            XCTFail("Expected retry connect to fail")
+        } catch {
+            // Expected
+        }
+        XCTAssertNotNil(manager.connections[invalidEndpoint.id])
+        XCTAssertEqual(manager.statuses[invalidEndpoint.id], .reconnecting(attempt: 1))
+
+        // Discovery reconciliation without this manual agent must not disconnect it
+        await manager.reconcileDiscoveredAgents([])
+        XCTAssertNotNil(manager.connections[invalidEndpoint.id])
+
+        await manager.disconnectAll()
+    }
+
     // MARK: - Helpers
 
     @MainActor
     private final class DummyNotificationHandler: AgentNotificationHandler {
         func handleNotification(method: String, params: AnyCodable) async {}
+    }
+
+    @MainActor
+    private final class RecordingNotificationHandler: AgentNotificationHandler {
+        private(set) var receivedMethods: [String] = []
+
+        func handleNotification(method: String, params: AnyCodable) async {
+            receivedMethods.append(method)
+        }
     }
 
     private func makeIPv4AddressData(_ ip: String) -> Data {

@@ -258,19 +258,29 @@ final class SocialAuditFixesTests: XCTestCase {
         )
         XCTAssertTrue(faviconResponse.hasPrefix("HTTP/1.1 404"), "Expected 404 for favicon, got: \(faviconResponse)")
 
-        // Next send callback with code but NO state — must reject with .stateMismatch.
+        // Next send callback with code but NO state — must return 400 without aborting active sign-in.
         let missingStateResponse = try await Self.sendRawHTTP(
             chunks: ["GET /?code=attacker-code HTTP/1.1\r\nHost: 127.0.0.1:\(port)\r\nConnection: close\r\n\r\n"],
             port: port
         )
         XCTAssertTrue(missingStateResponse.hasPrefix("HTTP/1.1 400"), "Expected 400 for missing state")
 
-        do {
-            _ = try await waitTask.value
-            XCTFail("Missing state parameter must be rejected")
-        } catch OAuthCallbackServer.OAuthError.stateMismatch {
-            // expected
-        }
+        // Next send callback with mismatched state — must also return 400 without aborting active sign-in.
+        let wrongStateResponse = try await Self.sendRawHTTP(
+            chunks: ["GET /?code=attacker-code&state=wrong-state HTTP/1.1\r\nHost: 127.0.0.1:\(port)\r\nConnection: close\r\n\r\n"],
+            port: port
+        )
+        XCTAssertTrue(wrongStateResponse.hasPrefix("HTTP/1.1 400"), "Expected 400 for mismatched state")
+
+        // Legitimate callback with valid state immediately after must still succeed.
+        let validResponse = try await Self.sendRawHTTP(
+            chunks: ["GET /?code=legit-code&state=expected-csrf-state HTTP/1.1\r\nHost: 127.0.0.1:\(port)\r\nConnection: close\r\n\r\n"],
+            port: port
+        )
+        XCTAssertTrue(validResponse.hasPrefix("HTTP/1.1 200"), "Expected 200 for valid state callback")
+
+        let code = try await waitTask.value
+        XCTAssertEqual(code, "legit-code")
     }
 
     func testOAuthCallbackServerHandlesFragmentedHTTPRequest() async throws {
@@ -680,21 +690,29 @@ final class SocialAuditFixesTests: XCTestCase {
             try await server.waitForCallback(timeout: 5)
         }
 
-        let response = try await Self.sendRawHTTP(
+        let missingStateResponse = try await Self.sendRawHTTP(
             chunks: ["GET /?error=access_denied&error_description=attacker_injected_text HTTP/1.1\r\nHost: 127.0.0.1:\(port)\r\nConnection: close\r\n\r\n"],
             port: port
         )
-        XCTAssertTrue(response.hasPrefix("HTTP/1.1 400"), "Expected 400 for error callback without valid state")
-        XCTAssertFalse(response.contains("attacker_injected_text"), "Unauthenticated error text must not be reflected")
+        XCTAssertTrue(missingStateResponse.hasPrefix("HTTP/1.1 400"), "Expected 400 for error callback without valid state")
+        XCTAssertFalse(missingStateResponse.contains("attacker_injected_text"), "Unauthenticated error text must not be reflected")
 
-        do {
-            _ = try await waitTask.value
-            XCTFail("Error callback without valid state must fail with stateMismatch")
-        } catch OAuthCallbackServer.OAuthError.stateMismatch {
-            // expected
-        } catch {
-            XCTFail("Expected OAuthError.stateMismatch, got \(error)")
-        }
+        let mismatchedStateResponse = try await Self.sendRawHTTP(
+            chunks: ["GET /?error=access_denied&error_description=attacker_injected_text&state=wrong-state HTTP/1.1\r\nHost: 127.0.0.1:\(port)\r\nConnection: close\r\n\r\n"],
+            port: port
+        )
+        XCTAssertTrue(mismatchedStateResponse.hasPrefix("HTTP/1.1 400"), "Expected 400 for error callback with mismatched state")
+        XCTAssertFalse(mismatchedStateResponse.contains("attacker_injected_text"), "Unauthenticated error text must not be reflected")
+
+        // Forged error callbacks must NOT abort the active sign-in: the real callback must still succeed.
+        let validResponse = try await Self.sendRawHTTP(
+            chunks: ["GET /?code=real-auth-code&state=expected-csrf-state HTTP/1.1\r\nHost: 127.0.0.1:\(port)\r\nConnection: close\r\n\r\n"],
+            port: port
+        )
+        XCTAssertTrue(validResponse.hasPrefix("HTTP/1.1 200"), "Expected 200 for valid state callback after forged errors")
+
+        let code = try await waitTask.value
+        XCTAssertEqual(code, "real-auth-code")
     }
     #endif
 
@@ -724,6 +742,127 @@ final class SocialAuditFixesTests: XCTestCase {
         micropub.logout()
         let micropubState3 = try XCTUnwrap(stateQueryValue(from: micropub.authURL))
         XCTAssertNotEqual(micropubState1, micropubState3, "logout() must invalidate pendingOAuthState")
+    }
+
+    @MainActor
+    func testBlueskyDeletePostGuardsCollectionAndDID() async throws {
+        let myDID = "did:plc:alice"
+        let mockHTTP = AuditMockBlueskyHTTP { url, _, _ in
+            if url.path.hasSuffix("com.atproto.repo.deleteRecord") {
+                return Data("{}".utf8)
+            }
+            throw URLError(.badURL)
+        }
+
+        let client = BlueskyClient(
+            httpClient: mockHTTP,
+            accessTokenProvider: { "access-token" },
+            didProvider: { myDID }
+        )
+
+        // Non-post collections must be rejected without calling deleteRecord.
+        await client.deletePost(uri: "at://\(myDID)/app.bsky.actor.profile/self")
+        XCTAssertNotNil(client.error)
+        await client.deletePost(uri: "at://\(myDID)/app.bsky.feed.like/like-1")
+        XCTAssertNotNil(client.error)
+        XCTAssertTrue(mockHTTP.recorded.isEmpty, "deletePost must never call deleteRecord for non-post collections")
+
+        // Foreign DIDs must be rejected without calling deleteRecord.
+        await client.deletePost(uri: "at://did:plc:bob/app.bsky.feed.post/foreign-post")
+        XCTAssertNotNil(client.error)
+        XCTAssertTrue(mockHTTP.recorded.isEmpty, "deletePost must never call deleteRecord for another user's DID")
+
+        // Own app.bsky.feed.post record must succeed.
+        await client.deletePost(uri: "at://\(myDID)/app.bsky.feed.post/own-post-1")
+        XCTAssertNil(client.error)
+        XCTAssertEqual(mockHTTP.recorded.count, 1)
+        XCTAssertTrue(mockHTTP.recorded[0].endpoint.hasSuffix("com.atproto.repo.deleteRecord"))
+        let bodyData = try XCTUnwrap(mockHTTP.recorded[0].bodyData)
+        let payload = try JSONDecoder().decode([String: String].self, from: bodyData)
+        XCTAssertEqual(payload["repo"], myDID)
+        XCTAssertEqual(payload["collection"], "app.bsky.feed.post")
+        XCTAssertEqual(payload["rkey"], "own-post-1")
+    }
+
+    @MainActor
+    func testRedditHandleCallbackKeepsWebViewOpenOnInvalidState() throws {
+        func stateQueryValue(from url: URL) -> String? {
+            URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?
+                .first(where: { $0.name == "state" })?
+                .value
+        }
+
+        let reddit = RedditClient(clientId: "reddit-client")
+        let expectedState = try XCTUnwrap(stateQueryValue(from: reddit.authURL))
+        reddit.startOAuth()
+        XCTAssertTrue(reddit.showingWebView)
+
+        // Missing state must not dismiss the login webview or consume pendingOAuthState.
+        reddit.handleCallback(URL(string: "arkavocreator://oauth/reddit?code=forged")!)
+        XCTAssertTrue(reddit.showingWebView, "Callback with missing state must keep showingWebView == true")
+        XCTAssertNotNil(reddit.error)
+
+        // Mismatched state must not dismiss the login webview or consume pendingOAuthState.
+        reddit.handleCallback(URL(string: "arkavocreator://oauth/reddit?code=forged&state=wrong-state")!)
+        XCTAssertTrue(reddit.showingWebView, "Callback with mismatched state must keep showingWebView == true")
+        XCTAssertEqual(
+            stateQueryValue(from: reddit.authURL),
+            expectedState,
+            "Invalid-state callback must preserve pendingOAuthState"
+        )
+
+        // Valid state dismisses the webview.
+        reddit.handleCallback(URL(string: "arkavocreator://oauth/reddit?error=access_denied&state=\(expectedState)")!)
+        XCTAssertFalse(reddit.showingWebView, "Valid-state callback should dismiss showingWebView")
+    }
+
+    @MainActor
+    func testArkavoClientDisconnectDeletesTokenAfterTearDownConnection() async {
+        let client = makeTestClient()
+        let store = FakeCredentialStore(token: "cached-cwt-token", handle: "alice")
+        client.credentialStore = store
+        client.currentState = .connected
+        let session = URLSession(configuration: .ephemeral)
+        client.session = session
+        client.webSocket = session.webSocketTask(with: URL(string: "wss://kas.example.test")!)
+
+        // Transport teardown (e.g., timeout/cancellation) clears socket/session while preserving Keychain token.
+        client.tearDownConnection(error: ArkavoError.connectionFailed("Timed out"))
+        XCTAssertEqual(client.currentState, .disconnected)
+        XCTAssertNil(client.webSocket)
+        XCTAssertNil(client.session)
+        XCTAssertEqual(store.token, "cached-cwt-token")
+        XCTAssertTrue(store.removals.isEmpty)
+
+        // Subsequent explicit disconnect() must still delete the Keychain auth token.
+        await client.disconnect()
+        XCTAssertEqual(client.currentState, .disconnected)
+        XCTAssertNil(store.token, "Explicit disconnect() must delete the auth token even after tearDownConnection")
+        XCTAssertEqual(store.removals, ["token"])
+    }
+
+    @MainActor
+    func testArkavoClientCleanUpOwnedTransportDoesNotDisturbReplacementConnection() {
+        let client = makeTestClient()
+        let staleSession = URLSession(configuration: .ephemeral)
+        let staleSocket = staleSession.webSocketTask(with: URL(string: "wss://kas.example.test/stale")!)
+        let replacementSession = URLSession(configuration: .ephemeral)
+        let replacementSocket = replacementSession.webSocketTask(with: URL(string: "wss://kas.example.test/new")!)
+
+        client.currentState = .connected
+        client.session = replacementSession
+        client.webSocket = replacementSocket
+
+        client.cleanUpOwnedTransport(webSocket: staleSocket, session: staleSession)
+
+        XCTAssertEqual(client.currentState, .connected)
+        XCTAssertTrue(client.webSocket === replacementSocket, "Stale cleanup must not clear replacement webSocket")
+        XCTAssertTrue(client.session === replacementSession, "Stale cleanup must not clear replacement session")
+
+        client.cleanUpOwnedTransport(webSocket: replacementSocket, session: replacementSession)
+        XCTAssertNil(client.webSocket)
+        XCTAssertNil(client.session)
     }
 
     // MARK: - Helpers

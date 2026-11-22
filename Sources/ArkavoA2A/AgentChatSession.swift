@@ -318,8 +318,8 @@ public final class AgentChatSessionManager: ObservableObject, AgentNotificationH
         let previousCallback = deltaCallbacks[sessionId]
         deltaCallbacks[sessionId] = onDelta
 
-        // Set ourselves as the notification handler on the connection
-        await connection.setNotificationHandler(self)
+        // Register as a notification handler on the connection without displacing other handlers
+        await connection.addNotificationHandler(self)
 
         // Subscribe to chat_stream via JSON-RPC subscription
         // Note: jsonrpsee uses positional (array) params for subscriptions
@@ -334,6 +334,9 @@ public final class AgentChatSessionManager: ObservableObject, AgentNotificationH
                 deltaCallbacks[sessionId] = previousCallback
             } else {
                 deltaCallbacks.removeValue(forKey: sessionId)
+            }
+            if !hasSubscribedSessions(for: agentId) {
+                await connection.removeNotificationHandler(self)
             }
             throw error
         }
@@ -351,6 +354,9 @@ public final class AgentChatSessionManager: ObservableObject, AgentNotificationH
                 deltaCallbacks[sessionId] = previousCallback
             } else {
                 deltaCallbacks.removeValue(forKey: sessionId)
+            }
+            if !hasSubscribedSessions(for: agentId) {
+                await connection.removeNotificationHandler(self)
             }
             print("[AgentChatSessionManager] ERROR: Failed to subscribe: \(code) - \(message)")
             throw AgentError.jsonRpcError(code: code, message: message)
@@ -402,6 +408,10 @@ public final class AgentChatSessionManager: ObservableObject, AgentNotificationH
         agentSessionMap[agentId]?.remove(sessionId)
         if agentSessionMap[agentId]?.isEmpty == true {
             agentSessionMap.removeValue(forKey: agentId)
+        }
+
+        if !hasSubscribedSessions(for: agentId) {
+            await connection.removeNotificationHandler(self)
         }
 
         // Unsubscribe from chat_stream using positional server subscription ID (preserving Int vs String type)
@@ -479,8 +489,8 @@ public final class AgentChatSessionManager: ObservableObject, AgentNotificationH
         // Store the callback
         deltaCallbacks[sessionId] = callback
 
-        // Set ourselves as the notification handler
-        await connection.setNotificationHandler(self)
+        // Register as a notification handler without displacing other handlers
+        await connection.addNotificationHandler(self)
 
         // Re-subscribe to chat_stream
         let response = try await connection.call(
@@ -497,6 +507,13 @@ public final class AgentChatSessionManager: ObservableObject, AgentNotificationH
         case .error(_, let code, let message):
             throw AgentError.jsonRpcError(code: code, message: message)
         }
+    }
+
+    private func hasSubscribedSessions(for agentId: String) -> Bool {
+        guard let sessionIds = agentSessionMap[agentId] else {
+            return false
+        }
+        return sessionIds.contains { deltaCallbacks[$0] != nil }
     }
 
     // MARK: - Helpers

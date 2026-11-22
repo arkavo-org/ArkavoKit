@@ -100,7 +100,6 @@ public class RedditClient: ObservableObject {
 
     @MainActor
     public func handleCallback(_ url: URL) {
-        showingWebView = false
         guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
             handleError(RedditError.invalidCallback)
             return
@@ -115,6 +114,7 @@ public class RedditClient: ObservableObject {
             return
         }
         pendingOAuthState = nil
+        showingWebView = false
 
         if queryItems.contains(where: { $0.name == "error" }) {
             handleError(RedditError.invalidCallback)

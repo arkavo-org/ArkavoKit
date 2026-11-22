@@ -351,13 +351,13 @@ public final class OAuthCallbackServer: @unchecked Sendable {
 
         // Validate state parameter (CSRF protection) FIRST — MUST be present and match expectedState
         // before handling `error=` or `code=`, so an attacker without state cannot abort sign-in
-        // or inject error text into the app UI.
+        // or inject error text into the app UI. Respond with 400 and ignore the forged request
+        // without failing the active continuation or stopping the listener.
         guard let expectedState = self.expectedState,
               let state = queryItems.first(where: { $0.name == "state" })?.value,
               state == expectedState
         else {
             sendErrorResponse(to: connection, message: "Invalid or missing state parameter")
-            finishLocked(with: .failure(OAuthError.stateMismatch), delayConnectionCleanup: true)
             return
         }
 

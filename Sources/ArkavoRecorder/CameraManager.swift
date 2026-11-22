@@ -17,8 +17,14 @@ public final class CameraManager: NSObject, Sendable {
         set { onFrameLock.withLock { $0 = newValue } }
     }
 
+    /// Called on the main actor when `startCapture(with:)` cannot attach its input asynchronously
+    /// on the session queue (e.g. `RecorderError.cannotAddInput`). The previously attached input,
+    /// if any, keeps capturing. `startCaptureAndWaitForFirstFrame` throws instead.
+    public var onCaptureError: (@MainActor (any Error) -> Void)?
+
     private struct FrameDeliveryState: Sendable {
         var pendingCaptureID: UUID? = nil
+        var cancelledPendingCaptureID: UUID? = nil
         var activeCaptureID: UUID? = nil
         var activeInput: ObjectIdentifier? = nil
         var acceptingFrames: Bool = false
@@ -76,16 +82,18 @@ public final class CameraManager: NSObject, Sendable {
         try startCapture(with: nil)
     }
 
-    /// Starts camera capture with a specific device
+    /// Starts camera capture with a specific device.
+    ///
+    /// Device lookup and `AVCaptureDeviceInput` creation run synchronously (throwing
+    /// `RecorderError.cameraUnavailable` or an `AVError` immediately). Session reconfiguration
+    /// and `startRunning()` run asynchronously on `graph.queue` so the main actor never blocks
+    /// on `AVCaptureSession`; if attaching the input fails asynchronously (e.g.
+    /// `RecorderError.cannotAddInput`), the previously attached input keeps capturing and
+    /// `onCaptureError` receives the error.
     public func startCapture(with deviceID: String?) throws {
         #if os(macOS) || os(iOS)
         let request = try prepareStartRequest(with: deviceID)
-        try Self.attachInputSynchronously(request, graph: graph, frameStateLock: frameStateLock)
-        let graph = graph
-        let captureID = request.captureID
-        graph.queue.async {
-            graph.startRunningIfAttached(captureID: captureID)
-        }
+        enqueueStart(request, reportsFailure: true)
         #else
         throw RecorderError.cameraUnavailable
         #endif
@@ -98,10 +106,12 @@ public final class CameraManager: NSObject, Sendable {
         try Task.checkCancellation()
         let request = try prepareStartRequest(with: deviceID)
         let captureID = request.captureID
+        let frameStateLock = frameStateLock
 
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
                 if Task.isCancelled {
+                    restorePendingSwitch(captureID: captureID)
                     continuation.resume(throwing: CancellationError())
                     return
                 }
@@ -109,7 +119,7 @@ public final class CameraManager: NSObject, Sendable {
                 endFirstFrameWait()
                 firstFrameWaiter = (captureID, continuation)
 
-                enqueueStart(request) { [weak self] result in
+                enqueueStart(request, reportsFailure: false) { [weak self] result in
                     guard case .failure(let error) = result else { return }
                     Task { @MainActor [weak self] in
                         self?.endFirstFrameWait(of: captureID, throwing: error)
@@ -117,6 +127,11 @@ public final class CameraManager: NSObject, Sendable {
                 }
             }
         } onCancel: { [weak self] in
+            frameStateLock.withLock { state in
+                if state.pendingCaptureID == captureID, state.activeCaptureID == nil {
+                    state.cancelledPendingCaptureID = captureID
+                }
+            }
             Task { @MainActor [weak self] in
                 self?.endFirstFrameWait(of: captureID)
             }
@@ -239,37 +254,53 @@ public final class CameraManager: NSObject, Sendable {
         return StartRequest(input: input, captureID: captureID)
     }
 
-    private nonisolated static func attachInputSynchronously(
-        _ request: StartRequest,
-        graph: CameraSessionGraph,
-        frameStateLock: OSAllocatedUnfairLock<FrameDeliveryState>
-    ) throws {
-        try graph.queue.sync {
-            do {
-                try graph.attachInput(request.input, captureID: request.captureID)
-                activateCapture(
-                    captureID: request.captureID,
-                    inputID: ObjectIdentifier(request.input),
-                    in: frameStateLock
-                )
-            } catch {
-                restoreCaptureAfterFailure(
-                    failedCaptureID: request.captureID,
-                    restored: graph.attachedCapture,
-                    in: frameStateLock
-                )
-                throw error
-            }
+    private enum PendingStartStatus {
+        case proceed
+        case cancelled
+        case superseded
+    }
+
+    private func restorePendingSwitch(captureID: UUID) {
+        let graph = graph
+        let frameStateLock = frameStateLock
+        graph.queue.async {
+            _ = Self.restoreCaptureAfterFailure(
+                failedCaptureID: captureID,
+                restored: graph.attachedCapture,
+                in: frameStateLock
+            )
         }
     }
 
     private func enqueueStart(
         _ request: StartRequest,
+        reportsFailure: Bool,
         completion: @escaping @Sendable (Result<Void, any Error>) -> Void = { _ in }
     ) {
         let graph = graph
         let frameStateLock = frameStateLock
-        graph.queue.async {
+        graph.queue.async { [weak self] in
+            let status: PendingStartStatus = frameStateLock.withLock { state in
+                guard state.pendingCaptureID == request.captureID else { return .superseded }
+                if state.cancelledPendingCaptureID == request.captureID { return .cancelled }
+                return .proceed
+            }
+            switch status {
+            case .superseded:
+                completion(.failure(CancellationError()))
+                return
+            case .cancelled:
+                _ = Self.restoreCaptureAfterFailure(
+                    failedCaptureID: request.captureID,
+                    restored: graph.attachedCapture,
+                    in: frameStateLock
+                )
+                completion(.failure(CancellationError()))
+                return
+            case .proceed:
+                break
+            }
+
             do {
                 try graph.attachInput(request.input, captureID: request.captureID)
                 Self.activateCapture(
@@ -280,16 +311,29 @@ public final class CameraManager: NSObject, Sendable {
                 graph.startRunningIfAttached(captureID: request.captureID)
                 completion(.success(()))
             } catch {
-                Self.restoreCaptureAfterFailure(
+                let wasCurrent = Self.restoreCaptureAfterFailure(
                     failedCaptureID: request.captureID,
                     restored: graph.attachedCapture,
                     in: frameStateLock
                 )
+                if wasCurrent && reportsFailure {
+                    Task { @MainActor [weak self] in
+                        self?.onCaptureError?(error)
+                    }
+                }
                 completion(.failure(error))
             }
         }
     }
     #endif
+
+    /// Returns once every session change requested before the call has run on the session queue.
+    func waitForSessionQueue() async {
+        let queue = graph.queue
+        await withCheckedContinuation { continuation in
+            queue.async { continuation.resume() }
+        }
+    }
 
     /// Disables frame acceptance and clears any previous waiter while switching to `captureID`.
     func beginInputSwitch(captureID: UUID) {
@@ -298,6 +342,7 @@ public final class CameraManager: NSObject, Sendable {
         frameStateLock.withLock {
             $0 = FrameDeliveryState(
                 pendingCaptureID: captureID,
+                cancelledPendingCaptureID: nil,
                 activeCaptureID: nil,
                 activeInput: nil,
                 acceptingFrames: false,
@@ -318,6 +363,7 @@ public final class CameraManager: NSObject, Sendable {
     ) {
         frameStateLock.withLock { state in
             guard state.pendingCaptureID == captureID else { return }
+            state.cancelledPendingCaptureID = nil
             state.activeCaptureID = captureID
             state.activeInput = inputID
             state.acceptingFrames = true
@@ -325,16 +371,18 @@ public final class CameraManager: NSObject, Sendable {
         }
     }
 
+    @discardableResult
     private nonisolated static func restoreCaptureAfterFailure(
         failedCaptureID: UUID,
         restored: (input: ObjectIdentifier, captureID: UUID)?,
         in frameStateLock: OSAllocatedUnfairLock<FrameDeliveryState>
-    ) {
+    ) -> Bool {
         frameStateLock.withLock { state in
-            guard state.pendingCaptureID == failedCaptureID else { return }
+            guard state.pendingCaptureID == failedCaptureID else { return false }
             if let restored {
                 state = FrameDeliveryState(
                     pendingCaptureID: restored.captureID,
+                    cancelledPendingCaptureID: nil,
                     activeCaptureID: restored.captureID,
                     activeInput: restored.input,
                     acceptingFrames: true,
@@ -343,6 +391,7 @@ public final class CameraManager: NSObject, Sendable {
             } else {
                 state = FrameDeliveryState()
             }
+            return true
         }
     }
 
@@ -385,7 +434,9 @@ public final class CameraManager: NSObject, Sendable {
             guard state.acceptingFrames, let captureID = state.activeCaptureID else {
                 return (false, nil)
             }
-            if let expectedInput = state.activeInput, let inputID, inputID != expectedInput {
+            // Reject both mismatched inputs and nil inputID (empty inputPorts on a torn-down
+            // AVCaptureConnection) whenever a concrete activeInput is expected.
+            if let expectedInput = state.activeInput, inputID != expectedInput {
                 return (false, nil)
             }
             if !state.firstFrameDelivered {

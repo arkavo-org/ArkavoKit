@@ -30,10 +30,27 @@ public final class LocalAIAgent: NSObject, ObservableObject {
     private let writingTools: WritingToolsIntegration
     private let imagePlayground: ImagePlaygroundIntegration
     private var connections: [UUID: NWConnection] = [:]
+    private var connectionMetadata: [UUID: ConnectionMetadata] = [:]
     private var partialMessages: [UUID: Data] = [:]
+    private var configuredAuthToken: String?
 
     /// Maximum WebSocket message size (16 MiB)
     static let maxMessageSize = 16 * 1024 * 1024
+
+    /// Read-only discovery and health RPC methods permitted from unauthenticated non-loopback peers
+    nonisolated static let unauthenticatedDiscoveryMethods: Set<String> = [
+        "agent_card",
+        "agent_info",
+        "ping",
+        "capabilities",
+        "rpc.discover",
+        "agent.discover",
+    ]
+
+    private struct ConnectionMetadata: Sendable {
+        let isLoopback: Bool
+        let isAuthenticated: Bool
+    }
 
     // Unique agent ID based on device
     private let agentId: String
@@ -202,34 +219,15 @@ public final class LocalAIAgent: NSObject, ObservableObject {
             )
         }
 
-        // Configure WebSocket options with client request handler
+        // Configure WebSocket options with client request handler and message size cap
         // Without this handler, NWListener rejects URLSession WebSocket clients
         // with "client request doesn't match expected value" error
-        let expectedToken = authToken
-        let options = NWProtocolWebSocket.Options()
-        options.autoReplyPing = true
-        options.setClientRequestHandler(DispatchQueue.main) { subprotocols, headers in
-            if let expectedToken, !expectedToken.isEmpty {
-                let authHeader = headers.first {
-                    $0.name.caseInsensitiveCompare("Authorization") == .orderedSame
-                }?.value
-                guard authHeader == "Bearer \(expectedToken)" else {
-                    return NWProtocolWebSocket.Response(
-                        status: .reject,
-                        subprotocol: nil,
-                        additionalHeaders: nil
-                    )
-                }
-            }
-
-            // Return the first requested subprotocol if any, otherwise accept with no subprotocol
-            let selectedSubprotocol = subprotocols.first
-            return NWProtocolWebSocket.Response(
-                status: .accept,
-                subprotocol: selectedSubprotocol,
-                additionalHeaders: nil
-            )
+        let normalizedToken: String? = if let authToken, !authToken.isEmpty {
+            authToken
+        } else {
+            nil
         }
+        let options = Self.makeWebSocketOptions(authToken: normalizedToken)
         params.defaultProtocolStack.applicationProtocols.insert(options, at: 0)
 
         if allowLAN {
@@ -242,6 +240,8 @@ public final class LocalAIAgent: NSObject, ObservableObject {
         } else {
             listener = try NWListener(using: params)
         }
+
+        configuredAuthToken = normalizedToken
 
         listener?.stateUpdateHandler = { [weak self] state in
             Task { @MainActor [weak self] in
@@ -261,6 +261,162 @@ public final class LocalAIAgent: NSObject, ObservableObject {
         print("[LocalAIAgent] Started publishing on port \(port) (allowLAN: \(allowLAN))")
     }
 
+    /// Build `NWProtocolWebSocket.Options` enforcing `maxMessageSize` and optional Bearer auth
+    static func makeWebSocketOptions(authToken: String?) -> NWProtocolWebSocket.Options {
+        let expectedToken = authToken
+        let options = NWProtocolWebSocket.Options()
+        options.autoReplyPing = true
+        options.maximumMessageSize = Self.maxMessageSize
+        options.setClientRequestHandler(DispatchQueue.main) { subprotocols, headers in
+            if let expectedToken, !expectedToken.isEmpty {
+                let authHeader = headers.first {
+                    $0.name.caseInsensitiveCompare("Authorization") == .orderedSame
+                }?.value
+                guard Self.verifyBearerAuthorization(authHeader, expectedToken: expectedToken) else {
+                    return NWProtocolWebSocket.Response(
+                        status: .reject,
+                        subprotocol: nil,
+                        additionalHeaders: nil
+                    )
+                }
+            }
+
+            // Return the first requested subprotocol if any, otherwise accept with no subprotocol
+            let selectedSubprotocol = subprotocols.first
+            return NWProtocolWebSocket.Response(
+                status: .accept,
+                subprotocol: selectedSubprotocol,
+                additionalHeaders: nil
+            )
+        }
+        return options
+    }
+
+    /// Verify an HTTP `Authorization` header against `expectedToken` using case-insensitive
+    /// `"Bearer "` scheme matching (RFC 7235 / 6750) and constant-time byte comparison.
+    nonisolated static func verifyBearerAuthorization(
+        _ headerValue: String?,
+        expectedToken: String
+    ) -> Bool {
+        guard !expectedToken.isEmpty, let headerValue else {
+            return false
+        }
+        let bytes = Array(headerValue.utf8)
+        // "Bearer " is 7 ASCII bytes ("bearer" + single space)
+        guard bytes.count > 7 else {
+            return false
+        }
+        let scheme: [UInt8] = [0x62, 0x65, 0x61, 0x72, 0x65, 0x72] // "bearer"
+        for i in 0..<6 {
+            let lower = (bytes[i] >= 0x41 && bytes[i] <= 0x5A) ? (bytes[i] + 32) : bytes[i]
+            if lower != scheme[i] {
+                return false
+            }
+        }
+        guard bytes[6] == 0x20 else {
+            return false
+        }
+        return constantTimeBytesEqual(Array(bytes[7...]), Array(expectedToken.utf8))
+    }
+
+    /// Constant-time byte-by-byte XOR comparison (never short-circuits on mismatched bytes).
+    nonisolated static func constantTimeBytesEqual(_ lhs: [UInt8], _ rhs: [UInt8]) -> Bool {
+        let maxLen = max(lhs.count, rhs.count)
+        var diff: UInt8 = lhs.count == rhs.count ? 0 : 1
+        for i in 0..<maxLen {
+            let a: UInt8 = i < lhs.count ? lhs[i] : 0
+            let b: UInt8 = i < rhs.count ? rhs[i] : 0
+            diff |= a ^ b
+        }
+        return diff == 0
+    }
+
+    /// Determine whether a peer endpoint refers to the local loopback interface.
+    /// Recognizes IPv4 `127.0.0.0/8`, IPv6 `::1`, IPv4-mapped `::ffff:127.0.0.0/104`,
+    /// and host names `"localhost"`, `"127.0.0.1"`, `"::1"` (or equivalent loopback literals).
+    nonisolated static func isLoopbackEndpoint(_ endpoint: NWEndpoint) -> Bool {
+        switch endpoint {
+        case .hostPort(let host, _):
+            switch host {
+            case .ipv4(let address):
+                return isLoopbackIPv4(address)
+            case .ipv6(let address):
+                return isLoopbackIPv6(address)
+            case .name(let name, _):
+                var normalized = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if normalized.hasPrefix("[") && normalized.hasSuffix("]") {
+                    normalized = String(normalized.dropFirst().dropLast())
+                }
+                if let percentIndex = normalized.firstIndex(of: "%") {
+                    normalized = String(normalized[..<percentIndex])
+                }
+                if normalized == "localhost" {
+                    return true
+                }
+                if let ipv4 = IPv4Address(normalized) {
+                    return isLoopbackIPv4(ipv4)
+                }
+                if let ipv6 = IPv6Address(normalized) {
+                    return isLoopbackIPv6(ipv6)
+                }
+                return false
+            @unknown default:
+                return false
+            }
+        default:
+            return false
+        }
+    }
+
+    nonisolated private static func isLoopbackIPv4(_ address: IPv4Address) -> Bool {
+        if address.isLoopback {
+            return true
+        }
+        let bytes = Array(address.rawValue)
+        return bytes.first == 127
+    }
+
+    nonisolated private static func isLoopbackIPv6(_ address: IPv6Address) -> Bool {
+        if address.isLoopback {
+            return true
+        }
+        if address.isIPv4Mapped, let mapped = address.asIPv4 {
+            return isLoopbackIPv4(mapped)
+        }
+        let bytes = Array(address.rawValue)
+        if bytes.count == 16,
+           bytes[0] == 0, bytes[1] == 0, bytes[2] == 0, bytes[3] == 0, bytes[4] == 0,
+           bytes[5] == 0, bytes[6] == 0, bytes[7] == 0, bytes[8] == 0, bytes[9] == 0,
+           bytes[10] == 0xff, bytes[11] == 0xff, bytes[12] == 127 {
+            return true
+        }
+        return false
+    }
+
+    /// Returns `true` for any RPC method outside the read-only discovery/health allowlist.
+    nonisolated static func requiresAuthentication(forMethod method: String) -> Bool {
+        !unauthenticatedDiscoveryMethods.contains(method)
+    }
+
+    /// Authorization policy for incoming RPC calls.
+    /// - When `authTokenRequired` is `true`, every connection must have authenticated with the token.
+    /// - When `authTokenRequired` is `false`, loopback peers are permitted for all methods while
+    ///   unauthenticated non-loopback peers are restricted to read-only discovery/health methods.
+    nonisolated static func isAuthorized(
+        method: String,
+        isLoopback: Bool,
+        isAuthenticated: Bool,
+        authTokenRequired: Bool = false
+    ) -> Bool {
+        if authTokenRequired {
+            return isAuthenticated
+        }
+        if isAuthenticated || isLoopback {
+            return true
+        }
+        return !requiresAuthentication(forMethod: method)
+    }
+
     /// Stop publishing the A2A service
     public func stopPublishing() {
         listener?.cancel()
@@ -270,7 +426,9 @@ public final class LocalAIAgent: NSObject, ObservableObject {
             connection.cancel()
         }
         connections.removeAll()
+        connectionMetadata.removeAll()
         partialMessages.removeAll()
+        configuredAuthToken = nil
 
         isPublishing = false
         print("[LocalAIAgent] Stopped publishing")
@@ -310,6 +468,12 @@ public final class LocalAIAgent: NSObject, ObservableObject {
         let connectionId = UUID()
         connections[connectionId] = connection
 
+        let remoteEndpoint = connection.currentPath?.remoteEndpoint ?? connection.endpoint
+        connectionMetadata[connectionId] = ConnectionMetadata(
+            isLoopback: Self.isLoopbackEndpoint(remoteEndpoint),
+            isAuthenticated: configuredAuthToken != nil
+        )
+
         connection.stateUpdateHandler = { [weak self] state in
             Task { @MainActor [weak self] in
                 self?.handleConnectionState(connectionId, state: state)
@@ -326,14 +490,24 @@ public final class LocalAIAgent: NSObject, ObservableObject {
     private func handleConnectionState(_ connectionId: UUID, state: NWConnection.State) {
         switch state {
         case .ready:
+            if let connection = connections[connectionId],
+               let remoteEndpoint = connection.currentPath?.remoteEndpoint,
+               let existing = connectionMetadata[connectionId] {
+                connectionMetadata[connectionId] = ConnectionMetadata(
+                    isLoopback: Self.isLoopbackEndpoint(remoteEndpoint),
+                    isAuthenticated: existing.isAuthenticated
+                )
+            }
             print("[LocalAIAgent] Connection ready: \(connectionId)")
         case let .failed(error):
             print("[LocalAIAgent] Connection failed: \(connectionId), error: \(error)")
             connections.removeValue(forKey: connectionId)
+            connectionMetadata.removeValue(forKey: connectionId)
             partialMessages.removeValue(forKey: connectionId)
         case .cancelled:
             print("[LocalAIAgent] Connection cancelled: \(connectionId)")
             connections.removeValue(forKey: connectionId)
+            connectionMetadata.removeValue(forKey: connectionId)
             partialMessages.removeValue(forKey: connectionId)
         default:
             break
@@ -342,6 +516,7 @@ public final class LocalAIAgent: NSObject, ObservableObject {
 
     private func cleanupConnection(_ connectionId: UUID, connection: NWConnection) {
         connections.removeValue(forKey: connectionId)
+        connectionMetadata.removeValue(forKey: connectionId)
         partialMessages.removeValue(forKey: connectionId)
         connection.cancel()
     }
@@ -464,7 +639,17 @@ public final class LocalAIAgent: NSObject, ObservableObject {
 
             print("[LocalAIAgent] Received request: \(request.method) (connection: \(connectionId))")
 
-            let response = try await processRequest(request)
+            let metadata = connectionMetadata[connectionId] ?? ConnectionMetadata(
+                isLoopback: Self.isLoopbackEndpoint(connection.currentPath?.remoteEndpoint ?? connection.endpoint),
+                isAuthenticated: configuredAuthToken != nil
+            )
+
+            let response = try await processRequest(
+                request,
+                isLoopback: metadata.isLoopback,
+                isAuthenticated: metadata.isAuthenticated,
+                authTokenRequired: configuredAuthToken != nil
+            )
 
             try await sendResponse(response, rpcId: request.rpcId, to: connection)
         } catch {
@@ -479,6 +664,27 @@ public final class LocalAIAgent: NSObject, ObservableObject {
 
             try? await sendResponse(errorResponse, rpcId: effectiveRpcId, to: connection)
         }
+    }
+
+    func processRequest(
+        _ request: AgentRequest,
+        isLoopback: Bool,
+        isAuthenticated: Bool,
+        authTokenRequired: Bool = false
+    ) async throws -> AgentResponse {
+        guard Self.isAuthorized(
+            method: request.method,
+            isLoopback: isLoopback,
+            isAuthenticated: isAuthenticated,
+            authTokenRequired: authTokenRequired
+        ) else {
+            return AgentResponse.error(
+                id: request.id,
+                code: -32001,
+                message: "Unauthorized: authentication token required for non-loopback requests"
+            )
+        }
+        return try await processRequest(request)
     }
 
     func processRequest(_ request: AgentRequest) async throws -> AgentResponse {

@@ -21,8 +21,15 @@ public actor AgentWebSocketTransport {
     // Request/response correlation
     private var pendingRequests: [JSONRPCID: CheckedContinuation<AgentResponse, Error>] = [:]
 
-    // Notification handler
+    private struct WeakNotificationHandler {
+        weak var handler: (any AgentNotificationHandler)?
+    }
+
+    // Legacy single notification handler slot (kept for backwards compatibility)
     private weak var notificationHandler: (any AgentNotificationHandler)?
+
+    // Multiplexed notification handlers keyed by ObjectIdentifier
+    private var notificationHandlers: [ObjectIdentifier: WeakNotificationHandler] = [:]
 
     // Connection state delegate
     private weak var delegate: (any AgentWebSocketTransportDelegate)?
@@ -201,22 +208,67 @@ public actor AgentWebSocketTransport {
         isConnected
     }
 
-    /// Set the notification handler
+    /// Set the legacy primary notification handler
     public func setNotificationHandler(_ handler: (any AgentNotificationHandler)?) {
         self.notificationHandler = handler
     }
 
     /// Clear the notification handler only if it matches the given handler instance
     public func clearNotificationHandler(ifMatching handler: any AgentNotificationHandler) {
+        let targetId = ObjectIdentifier(handler as AnyObject)
         if let current = notificationHandler,
-           ObjectIdentifier(current as AnyObject) == ObjectIdentifier(handler as AnyObject) {
+           ObjectIdentifier(current as AnyObject) == targetId {
+            notificationHandler = nil
+        }
+        notificationHandlers.removeValue(forKey: targetId)
+    }
+
+    /// Register a notification handler without displacing other registered handlers
+    public func addNotificationHandler(_ handler: any AgentNotificationHandler) {
+        pruneDeadNotificationHandlers()
+        let id = ObjectIdentifier(handler as AnyObject)
+        notificationHandlers[id] = WeakNotificationHandler(handler: handler)
+    }
+
+    /// Unregister a previously registered notification handler
+    public func removeNotificationHandler(_ handler: any AgentNotificationHandler) {
+        let id = ObjectIdentifier(handler as AnyObject)
+        notificationHandlers.removeValue(forKey: id)
+        if let current = notificationHandler,
+           ObjectIdentifier(current as AnyObject) == id {
             notificationHandler = nil
         }
     }
 
-    /// Current notification handler (internal for testing)
+    /// Current legacy primary notification handler (internal for testing)
     func getNotificationHandler() -> (any AgentNotificationHandler)? {
         notificationHandler
+    }
+
+    /// Current active notification handlers across legacy and multiplexed slots (internal for testing)
+    func getNotificationHandlers() -> [any AgentNotificationHandler] {
+        pruneDeadNotificationHandlers()
+        var active: [any AgentNotificationHandler] = []
+        var seen = Set<ObjectIdentifier>()
+
+        if let primary = notificationHandler {
+            let id = ObjectIdentifier(primary as AnyObject)
+            seen.insert(id)
+            active.append(primary)
+        }
+
+        for (id, box) in notificationHandlers {
+            if let handler = box.handler, !seen.contains(id) {
+                seen.insert(id)
+                active.append(handler)
+            }
+        }
+
+        return active
+    }
+
+    private func pruneDeadNotificationHandlers() {
+        notificationHandlers = notificationHandlers.filter { $0.value.handler != nil }
     }
 
     /// Build a WebSocket upgrade `URLRequest` with optional bearer token auth
@@ -392,13 +444,15 @@ public actor AgentWebSocketTransport {
         }
     }
 
-    private func handleNotification(_ notification: AgentNotification) async {
-        // Dispatch to handler on MainActor
-        if let handler = notificationHandler {
-            print("[AgentWebSocketTransport] 📤 Dispatching notification to handler: \(notification.method)")
-            await handler.handleNotification(method: notification.method, params: notification.params)
-        } else {
+    func handleNotification(_ notification: AgentNotification) async {
+        let handlers = getNotificationHandlers()
+        guard !handlers.isEmpty else {
             print("[AgentWebSocketTransport] ⚠️ No notification handler set for: \(notification.method)")
+            return
+        }
+        print("[AgentWebSocketTransport] 📤 Dispatching notification to \(handlers.count) handler(s): \(notification.method)")
+        for handler in handlers {
+            await handler.handleNotification(method: notification.method, params: notification.params)
         }
     }
 

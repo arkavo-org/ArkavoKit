@@ -49,6 +49,9 @@ public actor BlueskyClient: ObservableObject {
 
     @MainActor
     public func login(identifier: String, password: String) async {
+        // Capture session generation synchronously on entry before hopping to the actor
+        // so a logout() during the actor hop invalidates this in-flight login.
+        let generation = currentSessionGeneration()
         isLoading = true
         error = nil
         defer { isLoading = false }
@@ -56,15 +59,24 @@ public actor BlueskyClient: ObservableObject {
             let response = try await createSession(
                 identifier: identifier,
                 password: password,
+                expectedGeneration: generation,
             )
             print("Logged in as: \(response.handle)")
         } catch {
-            self.error = BlueskyError(error: "Failed to login", message: error.localizedDescription)
+            if currentSessionGeneration() == generation {
+                self.error = BlueskyError(error: "Failed to login", message: error.localizedDescription)
+            }
         }
     }
 
-    private func createSession(identifier: String, password: String) async throws -> CreateSessionResponse {
-        let generation = currentSessionGeneration()
+    private func createSession(
+        identifier: String,
+        password: String,
+        expectedGeneration generation: UInt64
+    ) async throws -> CreateSessionResponse {
+        guard currentSessionGeneration() == generation else {
+            throw BlueskyError(error: "session_ended", message: "Session ended while signing in")
+        }
         let endpoint = baseURL.appendingPathComponent("/xrpc/com.atproto.server.createSession")
         let request = CreateSessionRequest(identifier: identifier, password: password)
 
@@ -288,12 +300,27 @@ public actor BlueskyClient: ObservableObject {
         error = nil
         defer { isLoading = false }
         do {
+            guard let currentDID = didProvider() else {
+                throw BlueskyError(error: "auth_required", message: "No account DID available")
+            }
             guard let parsed = Self.parseATURI(uri) else {
                 throw BlueskyError(error: "InvalidURI", message: "Invalid AT-URI: \(uri)")
             }
+            guard parsed.collection == "app.bsky.feed.post" else {
+                throw BlueskyError(
+                    error: "InvalidURI",
+                    message: "Refusing to delete record in unsupported collection: \(parsed.collection)",
+                )
+            }
+            guard parsed.repo == currentDID else {
+                throw BlueskyError(
+                    error: "Unauthorized",
+                    message: "Refusing to delete record outside current user's app.bsky.feed.post collection",
+                )
+            }
             let payload = DeleteRecordRequest(
                 repo: parsed.repo,
-                collection: parsed.collection,
+                collection: "app.bsky.feed.post",
                 rkey: parsed.rkey,
             )
             let _: EmptyResponse = try await authenticatedRequest(

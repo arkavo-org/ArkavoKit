@@ -161,6 +161,12 @@ public final class RecordingSession: Sendable {
     private var recordingStarting = false
     /// Set when `stopRecording()` is invoked while `startRecording()` is still in flight.
     private var stopRequestedDuringStart = false
+    /// Set when `stopRecording()` stopped captures/audio while `recordingStarting` was true.
+    private var sourcesStoppedDuringStart = false
+    /// Incremented whenever `stopStreaming()` (or stopping the last destination) ends streaming,
+    /// so an in-flight `startStreaming`/`startNTDFStreaming` resuming on `@MainActor` never
+    /// re-enables `_streamingActive` after a concurrent stop.
+    private var streamStopGeneration: UInt64 = 0
     /// `startRecording()` calls waiting for an in-flight `stopRecording()` to finish.
     private var stopWaiters: [CheckedContinuation<Void, Never>] = []
     /// Serializes `pauseRecording()` / `resumeRecording()` actor hops to `encoder`.
@@ -440,20 +446,30 @@ public final class RecordingSession: Sendable {
         routerSourceIDs.isEmpty ? [] : [AudioMixer.outputSourceID]
     }
 
-    /// Router sources the current settings no longer want. The microphone and screen audio
-    /// follow the settings; other sources (the Muse voice) belong to whoever added them.
+    /// Router sources the current settings no longer want. The microphone, remote camera audio,
+    /// and screen audio follow the settings; other sources (the Muse voice) belong to whoever added them.
     nonisolated static func unwantedAudioSourceIDs(in routerSourceIDs: [String], microphone: Bool, screenAudio: Bool) -> [String] {
-        routerSourceIDs.filter { ($0 == "microphone" && !microphone) || ($0 == "screen" && !screenAudio) }
+        routerSourceIDs.filter {
+            ($0 == "microphone" && !microphone)
+                || ($0.hasPrefix(Self.remoteCameraAudioPrefix) && !microphone)
+                || ($0 == "screen" && !screenAudio)
+        }
     }
 
-    /// Stops and removes the microphone or screen audio when the settings turned it off.
-    /// A session is reused, so a source added for an earlier recording or stream would
-    /// otherwise be started again and captured.
+    /// Stops and removes the microphone, remote camera audio, or screen audio when the settings
+    /// turned it off. A session is reused, so a source added for an earlier recording or stream
+    /// would otherwise be started again and captured.
     private func removeUnwantedAudioSources(microphone: Bool) async {
         let unwanted = Self.unwantedAudioSourceIDs(
             in: audioRouter.allSourceIDs, microphone: microphone, screenAudio: enableScreenAudio
         )
         for sourceID in unwanted {
+            if sourceID.hasPrefix(Self.remoteCameraAudioPrefix) {
+                let remoteID = String(sourceID.dropFirst(Self.remoteCameraAudioPrefix.count))
+                if let remote = remoteAudioSources.removeValue(forKey: remoteID) {
+                    remote.onSample = nil
+                }
+            }
             await audioRouter.stopAndRemoveSource(sourceID)
             audioMixer.unregisterSource(sourceID)
         }
@@ -652,6 +668,7 @@ public final class RecordingSession: Sendable {
     private func startRecordingOnce(outputURL: URL, title: String) async throws {
         recordingStarting = true
         stopRequestedDuringStart = false
+        sourcesStoppedDuringStart = false
         do {
             try await beginRecording(outputURL: outputURL, title: title)
         } catch {
@@ -660,9 +677,11 @@ public final class RecordingSession: Sendable {
             // starts doesn't see this start's claim on them. (A startRecording made meanwhile
             // joins this start and gets its failure.)
             let streamLeftSources = streamLeftSourcesToStartingRecording
+            let stoppedDuringStart = sourcesStoppedDuringStart
             recordingStarting = false
             stopRequestedDuringStart = false
             streamLeftSourcesToStartingRecording = false
+            sourcesStoppedDuringStart = false
             // A stream that ended meanwhile left its sources to this recording; nothing owns them now.
             if streamLeftSources && !_streamingActive.withLock({ $0 }) {
                 await stopSources()
@@ -675,12 +694,15 @@ public final class RecordingSession: Sendable {
                 } else {
                     resetAudioMixer()
                 }
+            } else if stoppedDuringStart && _streamingActive.withLock({ $0 }) {
+                restartSourcesForStream(includingFrames: false)
             }
             throw error
         }
         recordingStarting = false
         stopRequestedDuringStart = false
         streamLeftSourcesToStartingRecording = false
+        sourcesStoppedDuringStart = false
     }
 
     private func beginRecording(outputURL: URL, title: String) async throws {
@@ -720,7 +742,7 @@ public final class RecordingSession: Sendable {
 
         // Register camera captures - check enableCamera directly, not mode.needsCamera
         // This allows camera+avatar to work together in the multi-source architecture
-        var newlyAddedCameras: Set<String> = []
+        var newlyAddedCameras: [String: CameraManager] = [:]
         if enableCamera {
             newlyAddedCameras = try await registerCameraSources()
         }
@@ -792,15 +814,18 @@ public final class RecordingSession: Sendable {
         case .partialReady(let failed):
             for (id, error) in failed {
                 print("⚠️ [RecordingSession] Source '\(id)' failed: \(error)")
-                // Remove failed camera managers so they don't linger unstarted in cameraCaptures.
+                // Remove failed camera managers so they don't linger unstarted in cameraCaptures,
+                // without ever tearing down a pre-existing or stream-owned camera while streaming.
                 if id.hasPrefix("camera-") {
                     let identifier = String(id.dropFirst("camera-".count))
-                    newlyAddedCameras.remove(identifier)
-                    if let manager = cameraCaptures.removeValue(forKey: identifier) {
+                    let newlyAdded = newlyAddedCameras.removeValue(forKey: identifier)
+                    if let manager = cameraCaptures[identifier],
+                       newlyAdded === manager || !_streamingActive.withLock({ $0 }) {
+                        cameraCaptures.removeValue(forKey: identifier)
                         manager.stopCapture()
+                        latestCameraBuffers.removeValue(forKey: identifier)
+                        latestCameraMetadata.removeValue(forKey: identifier)
                     }
-                    latestCameraBuffers.removeValue(forKey: identifier)
-                    latestCameraMetadata.removeValue(forKey: identifier)
                 }
             }
             // Continue with available sources (graceful degradation)
@@ -814,12 +839,17 @@ public final class RecordingSession: Sendable {
             if !_streamingActive.withLock({ $0 }) {
                 await stopSources()
                 if _streamingActive.withLock({ $0 }) {
+                    sourcesStoppedDuringStart = false
                     restartSourcesForStream(includingFrames: false)
                 } else {
                     resetAudioMixer()
                 }
             } else {
                 cleanupNewlyAddedCameras(newlyAddedCameras)
+                if sourcesStoppedDuringStart {
+                    sourcesStoppedDuringStart = false
+                    restartSourcesForStream(includingFrames: false)
+                }
             }
             _ = try? await encoder.finishRecording()
             throw CancellationError()
@@ -842,11 +872,16 @@ public final class RecordingSession: Sendable {
         print("🎙️ RecordingSession: Audio sources started. Active sources: \(audioRouter.activeSourceIDs)")
 
         guard !stopRequestedDuringStart, _isRecording, !recordingStopping, audioStartStops == audioStopCount else {
-            if !_streamingActive.withLock({ $0 }) && !_isRecording {
+            if !_streamingActive.withLock({ $0 }) {
                 audioStopCount &+= 1
                 try? await audioRouter.stopAll()
+                if _streamingActive.withLock({ $0 }) {
+                    restartSourcesForStream(includingFrames: false)
+                } else if !_isRecording && !recordingStopping {
+                    resetAudioMixer()
+                }
             }
-            return
+            throw CancellationError()
         }
 
         // Start camera/avatar frame driver if not using desktop (no screen capture to drive timing)
@@ -857,20 +892,20 @@ public final class RecordingSession: Sendable {
         print("🎬 [RecordingSession] Recording started successfully!")
     }
 
-    private func cleanupNewlyAddedCameras(_ identifiers: Set<String>) {
-        for identifier in identifiers {
-            if let manager = cameraCaptures.removeValue(forKey: identifier) {
-                manager.stopCapture()
-            }
+    private func cleanupNewlyAddedCameras(_ cameras: [String: CameraManager]) {
+        for (identifier, manager) in cameras {
+            guard cameraCaptures[identifier] === manager else { continue }
+            cameraCaptures.removeValue(forKey: identifier)
+            manager.stopCapture()
             latestCameraBuffers.removeValue(forKey: identifier)
             latestCameraMetadata.removeValue(forKey: identifier)
         }
     }
 
-    /// Register camera sources with the registry. Returns the newly created camera identifiers.
-    private func registerCameraSources() async throws -> Set<String> {
+    /// Register camera sources with the registry. Returns the newly created camera managers by ID.
+    private func registerCameraSources() async throws -> [String: CameraManager] {
         let identifiers = effectiveCameraIdentifiers()
-        guard enableCamera, !identifiers.isEmpty else { return [] }
+        guard enableCamera, !identifiers.isEmpty else { return [:] }
 
         // Determine which cameras to stop and which to start
         let currentIDs = Set(cameraCaptures.keys)
@@ -889,6 +924,7 @@ public final class RecordingSession: Sendable {
         }
 
         // Create new camera managers
+        var newlyAdded: [String: CameraManager] = [:]
         for identifier in toStart {
             let manager = CameraManager()
             manager.onFrame = { [weak self] buffer in
@@ -900,6 +936,7 @@ public final class RecordingSession: Sendable {
                 }
             }
             cameraCaptures[identifier] = manager
+            newlyAdded[identifier] = manager
         }
 
         // Register all active cameras with the registry
@@ -914,7 +951,7 @@ public final class RecordingSession: Sendable {
             await sourceRegistry.register(cameraSource)
         }
 
-        return toStart
+        return newlyAdded
     }
 
     /// Stops the current recording session.
@@ -934,11 +971,13 @@ public final class RecordingSession: Sendable {
             // Interrupt opening captures and audio sources so startup unblocks immediately
             // rather than hanging behind a capture wait or screen-audio consent prompt.
             if !_streamingActive.withLock({ $0 }) {
+                sourcesStoppedDuringStart = true
                 screenCapture.stopCapture()
                 stopCameraCaptures()
                 audioStopCount &+= 1
                 try? await audioRouter.stopAll()
                 if _streamingActive.withLock({ $0 }) {
+                    sourcesStoppedDuringStart = false
                     restartSourcesForStream(includingFrames: false)
                 }
             }
@@ -1486,7 +1525,11 @@ public final class RecordingSession: Sendable {
 
     /// Start streaming to a single RTMP destination
     public func startStreaming(to destination: RTMPPublisher.Destination, streamKey: String) async throws {
+        let stopGeneration = streamStopGeneration
         try await encoder.startStreaming(to: destination, streamKey: streamKey)
+        guard streamStopGeneration == stopGeneration else {
+            throw CancellationError()
+        }
         _streamingActive.withLock { $0 = true }
         if !_isRecording {
             startStreamingFrameGeneration()
@@ -1495,7 +1538,11 @@ public final class RecordingSession: Sendable {
 
     /// Start streaming to multiple RTMP destinations simultaneously (simulcast)
     public func startStreaming(destinations: [(id: String, destination: RTMPPublisher.Destination, streamKey: String)]) async throws {
+        let stopGeneration = streamStopGeneration
         try await encoder.startStreaming(to: destinations)
+        guard streamStopGeneration == stopGeneration else {
+            throw CancellationError()
+        }
         _streamingActive.withLock { $0 = true }
         if !_isRecording {
             startStreamingFrameGeneration()
@@ -1508,7 +1555,11 @@ public final class RecordingSession: Sendable {
     ///   - rtmpURL: RTMP server URL (e.g., rtmp://platform.arkavo.net:1935)
     ///   - streamKey: Stream key (e.g., live/test)
     public func startNTDFStreaming(kasURL: URL, rtmpURL: String, streamKey: String) async throws {
+        let stopGeneration = streamStopGeneration
         try await encoder.startNTDFStreaming(kasURL: kasURL, rtmpURL: rtmpURL, streamKey: streamKey)
+        guard streamStopGeneration == stopGeneration else {
+            throw CancellationError()
+        }
         _streamingActive.withLock { $0 = true }
         // Start frame generation if not already recording
         if !_isRecording {
@@ -1532,7 +1583,11 @@ public final class RecordingSession: Sendable {
     /// Tests: `startStreaming(to:streamKey:)` without RTMP. The encoder's stream output goes to
     /// `onEncodedVideo` instead of a destination; `stopStreaming()` ends it.
     func startStreamingForTesting(onEncodedVideo: @escaping @Sendable (EncodedVideoFrame) -> Void) async throws {
+        let stopGeneration = streamStopGeneration
         try await encoder.startStreamingForTesting(onEncodedVideo: onEncodedVideo)
+        guard streamStopGeneration == stopGeneration else {
+            throw CancellationError()
+        }
         _streamingActive.withLock { $0 = true }
         if !_isRecording {
             startStreamingFrameGeneration()
@@ -1544,6 +1599,7 @@ public final class RecordingSession: Sendable {
     /// With no recording running, this also stops the frame driver and the screen, camera and
     /// audio captures, as stopping a recording does with no stream. A recording keeps them.
     public func stopStreaming() async {
+        streamStopGeneration &+= 1
         _streamingActive.withLock { $0 = false }
         await encoder.stopStreaming()
         await encoder.stopNTDFStreaming()
@@ -1563,6 +1619,7 @@ public final class RecordingSession: Sendable {
                 return previous
             }
             if wasStreaming {
+                streamStopGeneration &+= 1
                 await streamDidEnd()
             }
         }
@@ -1639,6 +1696,16 @@ public final class RecordingSession: Sendable {
                     self.latestCameraBuffers[identifier] = frame.buffer
                     self.dispatchPreview(for: identifier, buffer: frame.buffer)
                 }
+            }
+            manager.onCaptureError = { [weak self, weak manager] error in
+                guard let self, let manager, self.cameraCaptures[identifier] === manager else { return }
+                self.cameraCaptures.removeValue(forKey: identifier)
+                manager.stopCapture()
+                self.latestCameraBuffers.removeValue(forKey: identifier)
+                self.latestCameraMetadata.removeValue(forKey: identifier)
+                let failure = CameraStartFailure(sourceID: identifier, error: error)
+                print("⚠️ [RecordingSession] Failed to start camera \(identifier): \(failure.message) (\(error))")
+                self.cameraStartFailureHandler?(failure)
             }
             do {
                 try manager.startCapture(with: identifier)
@@ -1797,6 +1864,8 @@ extension RecordingSession: RemoteCameraServerDelegate {
         // print("   └─ Metadata forwarded to handler")
     }
 
+    nonisolated static let remoteCameraAudioPrefix = "remote-camera-"
+
     public func remoteCameraServer(
         _: RemoteCameraServer,
         didReceiveAudio payload: RemoteCameraMessage.AudioPayload,
@@ -1804,11 +1873,20 @@ extension RecordingSession: RemoteCameraServerDelegate {
     ) {
         registerRemoteCamera(identifier: sourceID)
 
+        // Respect audio capture settings: only register/mix remote camera audio when microphone
+        // capture is enabled.
+        guard enableMicrophone else {
+            if let existing = remoteAudioSources.removeValue(forKey: sourceID) {
+                detachRemoteAudioSource(existing, sourceID: sourceID)
+            }
+            return
+        }
+
         let audioSource: RemoteCameraAudioSource
         if let existing = remoteAudioSources[sourceID] {
             audioSource = existing
         } else {
-            let routerSourceID = "remote-camera-\(sourceID)"
+            let routerSourceID = "\(Self.remoteCameraAudioPrefix)\(sourceID)"
             let created = audioRouter.addRemoteCameraAudio(
                 sourceID: routerSourceID,
                 sourceName: "Remote Camera (\(sourceID))"
@@ -1818,19 +1896,36 @@ extension RecordingSession: RemoteCameraServerDelegate {
             audioSource = created
         }
 
+        guard _isRecording || _streamingActive.withLock({ $0 }) else { return }
+
         if audioSource.isActive {
             audioSource.processAudioPayload(payload)
-        } else if _isRecording || _streamingActive.withLock({ $0 }) {
+        } else {
             Task { @MainActor [weak self, audioSource] in
-                guard let self, self.remoteAudioSources[sourceID] === audioSource else { return }
+                guard let self, self.enableMicrophone, self.remoteAudioSources[sourceID] === audioSource else { return }
                 try? await audioSource.start()
-                guard self.remoteAudioSources[sourceID] === audioSource,
+                guard self.enableMicrophone,
+                      self.remoteAudioSources[sourceID] === audioSource,
                       self._isRecording || self._streamingActive.withLock({ $0 }) else {
                     try? await audioSource.stop()
                     return
                 }
                 audioSource.processAudioPayload(payload)
             }
+        }
+    }
+
+    private func detachRemoteAudioSource(_ disconnectedSource: RemoteCameraAudioSource, sourceID: String) {
+        let routerID = disconnectedSource.sourceID
+        disconnectedSource.onSample = nil
+        audioMixer.unregisterSource(routerID)
+        audioRouter.removeSource(routerID)
+        Task { @MainActor [weak self, disconnectedSource] in
+            try? await disconnectedSource.stop()
+            guard let self, self.remoteAudioSources[sourceID] === disconnectedSource else { return }
+            self.remoteAudioSources.removeValue(forKey: sourceID)
+            self.audioMixer.unregisterSource(routerID)
+            await self.audioRouter.stopAndRemoveSource(routerID)
         }
     }
 
@@ -1849,13 +1944,8 @@ extension RecordingSession: RemoteCameraServerDelegate {
 
         let disconnectedAudioIDs = remoteAudioSources.keys.filter { !activeRemoteSources.contains($0) }
         for sourceID in disconnectedAudioIDs {
-            if let audioSource = remoteAudioSources.removeValue(forKey: sourceID) {
-                let routerID = audioSource.sourceID
-                audioSource.onSample = nil
-                audioMixer.unregisterSource(routerID)
-                Task { [audioRouter] in
-                    await audioRouter.stopAndRemoveSource(routerID)
-                }
+            if let disconnectedSource = remoteAudioSources.removeValue(forKey: sourceID) {
+                detachRemoteAudioSource(disconnectedSource, sourceID: sourceID)
             }
         }
 

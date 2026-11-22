@@ -24,6 +24,7 @@ public final class AgentManager: ObservableObject {
     private let discoveryService: AgentDiscoveryService
     private var cancellables = Set<AnyCancellable>()
     private var manualAgentIds: Set<String> = []
+    private var discoveryGeneration: UInt64 = 0
 
     // Configuration
     private let autoConnect: Bool
@@ -64,61 +65,101 @@ public final class AgentManager: ObservableObject {
     }
 
     private func connect(to agent: AgentEndpoint, isManual: Bool) async throws {
-        // Check if already connected
+        // Check existing connection state before deciding whether to reuse or replace
+        var previousConnection: AgentConnection?
         if let existingConnection = connections[agent.id] {
-            if await existingConnection.isConnected() {
-                if isManual {
-                    manualAgentIds.insert(agent.id)
+            let existingConnected = await existingConnection.isConnected()
+            let existingStatus = await existingConnection.getStatus()
+
+            if connections[agent.id] === existingConnection {
+                if existingConnected && existingConnection.endpoint.url == agent.url {
+                    if isManual {
+                        manualAgentIds.insert(agent.id)
+                    }
+                    print("Already connected to agent \(agent.id)")
+                    return
                 }
-                print("Already connected to agent \(agent.id)")
-                return
+
+                // Never disrupt an active connecting/reconnecting attempt from automatic discovery
+                if !isManual && existingConnection.endpoint.url == agent.url {
+                    switch existingStatus {
+                    case .connecting, .reconnecting:
+                        return
+                    default:
+                        break
+                    }
+                }
+
+                previousConnection = existingConnection
+            } else if let latestConnection = connections[agent.id] {
+                if !isManual {
+                    // Another connect call superseded us while we were checking status
+                    return
+                }
+                previousConnection = latestConnection
             }
-            // Disconnect stale connection before replacing
-            connections.removeValue(forKey: agent.id)
-            await existingConnection.disconnect()
         }
 
-        // Create new connection
+        // Install the replacement connection before disconnecting the old one so
+        // `connections[agent.id]` never has a nil window across suspension points
         let connection = AgentConnection(endpoint: agent)
         connections[agent.id] = connection
         if isManual {
             manualAgentIds.insert(agent.id)
         }
+        statuses[agent.id] = .connecting
 
-        // Observe real status transitions from the connection
-        await connection.setStatusObserver { [weak self, weak connection] newStatus in
-            await MainActor.run {
-                guard let self, let connection, self.connections[agent.id] === connection else {
-                    return
-                }
-                self.statuses[agent.id] = newStatus
+        if let previousConnection {
+            await previousConnection.disconnect()
+            // Abort cleanly if superseded while tearing down the old connection
+            guard connections[agent.id] === connection else {
+                await connection.disconnect()
+                return
             }
         }
-
-        // Update status
-        statuses[agent.id] = .connecting
 
         // Perform initial connection so unreachable agents are not falsely marked connected
         do {
             try await connection.connect()
-            if connections[agent.id] === connection {
-                statuses[agent.id] = .connected
-                if autoReconnect {
-                    await connection.setAutoReconnectionEnabled(true)
-                }
+            guard connections[agent.id] === connection else {
+                await connection.disconnect()
+                return
+            }
+
+            // Register status observer after initial handshake to avoid transient .failed flickers
+            await installStatusObserver(on: connection, for: agent.id)
+            statuses[agent.id] = .connected
+            if autoReconnect {
+                await connection.setAutoReconnectionEnabled(true)
             }
         } catch {
             if connections[agent.id] === connection {
                 if autoReconnect {
+                    await installStatusObserver(on: connection, for: agent.id)
                     statuses[agent.id] = .reconnecting(attempt: 1)
                     await connection.startWithReconnection(afterInitialFailure: true)
                 } else {
                     connections.removeValue(forKey: agent.id)
-                    manualAgentIds.remove(agent.id)
+                    if isManual {
+                        manualAgentIds.remove(agent.id)
+                    }
                     statuses[agent.id] = .failed(reason: error.localizedDescription)
                 }
+            } else {
+                await connection.disconnect()
             }
             throw error
+        }
+    }
+
+    private func installStatusObserver(on connection: AgentConnection, for agentId: String) async {
+        await connection.setStatusObserver { [weak self, weak connection] newStatus in
+            await MainActor.run {
+                guard let self, let connection, self.connections[agentId] === connection else {
+                    return
+                }
+                self.statuses[agentId] = newStatus
+            }
         }
     }
 
@@ -179,42 +220,54 @@ public final class AgentManager: ObservableObject {
                 guard let self = self else { return }
 
                 Task { @MainActor in
-                    // Update agents list
-                    self.agents = discoveredAgents
-
-                    // Auto-connect to new discovered agents
-                    // Note: This device's agent is NOT in mDNS discovery - it's added directly in AgentService
-                    // So all agents here are remote and need WebSocket connections
-                    if self.autoConnect {
-                        for agent in discoveredAgents {
-                            let shouldConnect: Bool
-                            if self.connections[agent.id] == nil {
-                                shouldConnect = true
-                            } else if case .failed? = self.statuses[agent.id] {
-                                shouldConnect = true
-                            } else {
-                                shouldConnect = false
-                            }
-                            if shouldConnect {
-                                print("Auto-connecting to discovered agent: \(agent.id)")
-                                try? await self.connect(to: agent, isManual: false)
-                            }
-                        }
-                    }
-
-                    // Remove connections for discovered agents that disappeared
-                    // Manually added endpoints are tracked separately and never disconnected by mDNS updates
-                    let discoveredIds = Set(discoveredAgents.map(\.id))
-                    let activeIds = Array(self.connections.keys)
-                    for agentId in activeIds {
-                        if !discoveredIds.contains(agentId) && !self.manualAgentIds.contains(agentId) {
-                            print("Agent \(agentId) disappeared, disconnecting")
-                            await self.disconnect(from: agentId)
-                        }
-                    }
+                    await self.reconcileDiscoveredAgents(discoveredAgents)
                 }
             }
             .store(in: &cancellables)
+    }
+
+    func reconcileDiscoveredAgents(_ discoveredAgents: [AgentEndpoint]) async {
+        discoveryGeneration &+= 1
+        let generation = discoveryGeneration
+
+        // Update agents list
+        self.agents = discoveredAgents
+
+        // Auto-connect to new discovered agents
+        // Note: This device's agent is NOT in mDNS discovery - it's added directly in AgentService
+        // So all agents here are remote and need WebSocket connections
+        if self.autoConnect {
+            for agent in discoveredAgents {
+                guard self.discoveryGeneration == generation else { return }
+                let shouldConnect: Bool
+                if self.connections[agent.id] == nil {
+                    shouldConnect = true
+                } else if case .failed? = self.statuses[agent.id] {
+                    shouldConnect = true
+                } else {
+                    shouldConnect = false
+                }
+                if shouldConnect {
+                    print("Auto-connecting to discovered agent: \(agent.id)")
+                    try? await self.connect(to: agent, isManual: false)
+                }
+            }
+        }
+
+        // Bail out if a newer discovery update arrived while awaiting connections
+        guard self.discoveryGeneration == generation else { return }
+
+        // Remove connections for discovered agents that disappeared
+        // Manually added endpoints are tracked separately and never disconnected by mDNS updates
+        let discoveredIds = Set(discoveredAgents.map(\.id))
+        let activeIds = Array(self.connections.keys)
+        for agentId in activeIds {
+            guard self.discoveryGeneration == generation else { return }
+            if !discoveredIds.contains(agentId) && !self.manualAgentIds.contains(agentId) {
+                print("Agent \(agentId) disappeared, disconnecting")
+                await self.disconnect(from: agentId)
+            }
+        }
     }
 
     // MARK: - Telemetry

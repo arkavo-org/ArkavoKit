@@ -54,47 +54,49 @@ public final class VideoEncoder: @unchecked Sendable {
         }
     }
 
+    /// Dedicated synchronization box for the `onFrame` handler, decoupled from
+    /// `sessionLock` so a synchronous VideoToolbox output callback invoked during
+    /// `VTCompressionSessionEncodeFrame` can safely read or mutate `onFrame`
+    /// without deadlocking.
+    private final class HandlerBox: Sendable {
+        private let handler = Mutex<(@Sendable (EncodedVideoFrame) -> Void)?>(nil)
+
+        var onFrame: (@Sendable (EncodedVideoFrame) -> Void)? {
+            get { handler.withLock { $0 } }
+            set {
+                let previous = handler.withLock { current -> (@Sendable (EncodedVideoFrame) -> Void)? in
+                    let old = current
+                    current = newValue
+                    return old
+                }
+                _ = previous
+            }
+        }
+    }
+
     /// Retained by the active `VTCompressionSession` as its `refcon` and released
     /// only after `VTCompressionSessionInvalidate` completes, eliminating any
     /// use-after-free hazard if `VideoEncoder` is stopped or deallocated while a
     /// VideoToolbox callback is in flight.
     private final class CallbackContext: Sendable {
-        private struct State {
-            var isActive: Bool
-            var onFrame: (@Sendable (EncodedVideoFrame) -> Void)?
-        }
+        private let isActiveMutex = Mutex<Bool>(true)
+        private let handlerBox: HandlerBox
 
-        private let state: Mutex<State>
-
-        init(onFrame: (@Sendable (EncodedVideoFrame) -> Void)?) {
-            self.state = Mutex(State(isActive: true, onFrame: onFrame))
+        init(handlerBox: HandlerBox) {
+            self.handlerBox = handlerBox
         }
 
         var isActive: Bool {
-            state.withLock { $0.isActive }
-        }
-
-        @discardableResult
-        func setOnFrame(_ handler: (@Sendable (EncodedVideoFrame) -> Void)?) -> (@Sendable (EncodedVideoFrame) -> Void)? {
-            state.withLock { state in
-                let previous = state.onFrame
-                state.onFrame = handler
-                return previous
-            }
+            isActiveMutex.withLock { $0 }
         }
 
         func deactivate() {
-            let previous = state.withLock { state -> (@Sendable (EncodedVideoFrame) -> Void)? in
-                state.isActive = false
-                let old = state.onFrame
-                state.onFrame = nil
-                return old
-            }
-            _ = previous
+            isActiveMutex.withLock { $0 = false }
         }
 
         func activeHandler() -> (@Sendable (EncodedVideoFrame) -> Void)? {
-            state.withLock { $0.isActive ? $0.onFrame : nil }
+            guard isActiveMutex.withLock({ $0 }) else { return nil }
+            return handlerBox.onFrame
         }
     }
 
@@ -102,7 +104,6 @@ public final class VideoEncoder: @unchecked Sendable {
         var compressionSession: VTCompressionSession?
         var callbackContextPtr: UnsafeMutableRawPointer?
         var activeContext: CallbackContext?
-        var onFrame: (@Sendable (EncodedVideoFrame) -> Void)?
         var isEncoding: Bool = false
         var sentSequenceHeader: Bool = false
     }
@@ -111,6 +112,7 @@ public final class VideoEncoder: @unchecked Sendable {
 
     private let sessionLock = NSLock()
     private var sessionState = SessionState()
+    private let handlerBox = HandlerBox()
 
     private let width: Int
     private let height: Int
@@ -120,20 +122,8 @@ public final class VideoEncoder: @unchecked Sendable {
 
     /// Callback invoked when an H.264 frame is ready
     public var onFrame: (@Sendable (EncodedVideoFrame) -> Void)? {
-        get {
-            sessionLock.lock()
-            defer { sessionLock.unlock() }
-            return sessionState.onFrame
-        }
-        set {
-            sessionLock.lock()
-            let previousHandler = sessionState.onFrame
-            sessionState.onFrame = newValue
-            let previousContextHandler = sessionState.activeContext?.setOnFrame(newValue)
-            sessionLock.unlock()
-            _ = previousHandler
-            _ = previousContextHandler
-        }
+        get { handlerBox.onFrame }
+        set { handlerBox.onFrame = newValue }
     }
 
     /// Internal test inspection of active session/callback context state.
@@ -145,9 +135,21 @@ public final class VideoEncoder: @unchecked Sendable {
 
     /// Internal test inspection of whether the active session's callback context is active.
     var hasActiveCallbackContext: Bool {
+        let context: CallbackContext? = {
+            sessionLock.lock()
+            defer { sessionLock.unlock() }
+            return sessionState.activeContext
+        }()
+        return context?.isActive ?? false
+    }
+
+    /// Internal test helper simulating a synchronous VideoToolbox output callback
+    /// invoked while `sessionLock` is held by `encode(_:timestamp:)`.
+    func invokeActiveCallbackWhileHoldingSessionLockForTesting(_ frame: EncodedVideoFrame) {
         sessionLock.lock()
         defer { sessionLock.unlock() }
-        return sessionState.activeContext?.isActive ?? false
+        guard let handler = sessionState.activeContext?.activeHandler() else { return }
+        handler(frame)
     }
 
     // MARK: - Initialization
@@ -176,7 +178,7 @@ public final class VideoEncoder: @unchecked Sendable {
 
         guard sessionState.compressionSession == nil else { return }
 
-        let context = CallbackContext(onFrame: sessionState.onFrame)
+        let context = CallbackContext(handlerBox: handlerBox)
         let retainedPtr = Unmanaged.passRetained(context).toOpaque()
 
         let enableHardwareAcceleration: CFBoolean = kCFBooleanTrue

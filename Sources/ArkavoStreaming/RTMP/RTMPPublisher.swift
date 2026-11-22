@@ -266,6 +266,7 @@ public actor RTMPPublisher {
         let newConnection = NWConnection(host: host, port: nwPort, using: parameters)
         connection = newConnection
         connectionGeneration &+= 1
+        let gen = connectionGeneration
 
         state = .connecting
         lastWaitingError = nil
@@ -298,15 +299,20 @@ public actor RTMPPublisher {
             newConnection.start(queue: .global(qos: .userInitiated))
         }
 
+        guard connectionGeneration == gen, connection === newConnection else {
+            newConnection.cancel()
+            throw RTMPError.connectionFailed("Connection superseded")
+        }
+
         do {
             // Perform RTMP handshake
-            try await performHandshake()
+            try await performHandshake(expectedGeneration: gen, expectedConnection: newConnection)
 
             // Connect to application
-            try await connectToApp(url, streamKey: streamKey)
+            try await connectToApp(url, streamKey: streamKey, expectedGeneration: gen, expectedConnection: newConnection)
         } catch {
             newConnection.cancel()
-            if connection === newConnection {
+            if connectionGeneration == gen && connection === newConnection {
                 connection = nil
                 connectionGeneration &+= 1
                 failStaleSendWaiters()
@@ -315,7 +321,7 @@ public actor RTMPPublisher {
             throw error
         }
 
-        guard connection === newConnection else {
+        guard connectionGeneration == gen, connection === newConnection else {
             throw RTMPError.connectionFailed("Connection superseded")
         }
 
@@ -326,16 +332,18 @@ public actor RTMPPublisher {
         // socket and accepts both .publishing and .connected as live states, so
         // server messages issued in the brief window around the state flip
         // can't be missed.
-        startServerMessageHandler()
+        startServerMessageHandler(expectedGeneration: gen, expectedConnection: newConnection)
 
         print("✅ RTMP publishing started")
     }
 
     /// Normalize a video or audio timestamp relative to the stream start.
-    /// Shares a common anchor (`min(timestamp, otherAnchor)`) when video and audio
-    /// are in the same clock domain (`abs(delta) <= 10s`) to preserve A/V sync,
-    /// and anchors each track independently when clock domains differ (e.g. 0-based
-    /// stream-relative video PTS vs host-clock audio PTS).
+    /// Once the first track establishes an anchor and emits at `0ms`, that anchor
+    /// is frozen (never moved backward) to prevent timeline jumps. When the second
+    /// track arrives within `<= 10s` (same clock domain), it adopts the first track's
+    /// anchor and clamps any pre-anchor timestamps to `0ms`. When skew exceeds `10s`
+    /// (incompatible clock domains, e.g. 0-based video PTS vs host-clock audio PTS),
+    /// each track is anchored independently.
     func normalizeTimestamp(_ timestamp: CMTime, for track: MediaTrack) -> UInt32 {
         guard timestamp.isNumeric, timestamp.seconds.isFinite else { return 0 }
 
@@ -348,10 +356,9 @@ public actor RTMPPublisher {
                 let diff = timestamp - audioAnchor
                 let skewSeconds = diff.isNumeric ? abs(diff.seconds) : abs(timestamp.seconds - audioAnchor.seconds)
                 if skewSeconds <= Self.sharedAnchorMaxSkewSeconds {
-                    let shared = timestamp.seconds < audioAnchor.seconds ? timestamp : audioAnchor
-                    firstVideoTimestamp = shared
-                    firstAudioTimestamp = shared
-                    anchor = shared
+                    // Freeze the already-emitted audio anchor; pre-anchor video frames clamp to 0ms.
+                    firstVideoTimestamp = audioAnchor
+                    anchor = audioAnchor
                 } else {
                     firstVideoTimestamp = timestamp
                     print("📊 Video clock domain differs from audio by \(Int(skewSeconds))s - anchoring video independently at 0ms")
@@ -370,10 +377,9 @@ public actor RTMPPublisher {
                 let diff = timestamp - videoAnchor
                 let skewSeconds = diff.isNumeric ? abs(diff.seconds) : abs(timestamp.seconds - videoAnchor.seconds)
                 if skewSeconds <= Self.sharedAnchorMaxSkewSeconds {
-                    let shared = timestamp.seconds < videoAnchor.seconds ? timestamp : videoAnchor
-                    firstVideoTimestamp = shared
-                    firstAudioTimestamp = shared
-                    anchor = shared
+                    // Freeze the already-emitted video anchor; pre-anchor audio frames clamp to 0ms.
+                    firstAudioTimestamp = videoAnchor
+                    anchor = videoAnchor
                 } else {
                     firstAudioTimestamp = timestamp
                     print("📊 Audio clock domain differs from video by \(Int(skewSeconds))s - anchoring audio independently at 0ms")
@@ -794,9 +800,11 @@ public actor RTMPPublisher {
         }
     }
 
-    private func performHandshake() async throws {
-        let gen = connectionGeneration
-        guard let targetConnection = connection else {
+    private func performHandshake(
+        expectedGeneration gen: UInt64,
+        expectedConnection targetConnection: NWConnection
+    ) async throws {
+        guard connectionGeneration == gen, connection === targetConnection else {
             throw RTMPError.notConnected
         }
 
@@ -820,8 +828,12 @@ public actor RTMPPublisher {
         // Receive S0 + S1 + S2 (must receive all 3073 bytes)
         let handshakeTimeout = Duration.seconds(max(5, connectTimeout))
         let responseLength = 1 + 1536 + 1536
-        guard let response = try await receiveDataExact(length: responseLength, timeout: handshakeTimeout),
-              response.count == responseLength else {
+        guard let response = try await receiveDataExact(
+            length: responseLength,
+            timeout: handshakeTimeout,
+            expectedGeneration: gen,
+            expectedConnection: targetConnection
+        ), response.count == responseLength else {
             throw RTMPError.handshakeFailed
         }
 
@@ -835,6 +847,10 @@ public actor RTMPPublisher {
         // Send C2 (echo of S1)
         let s1 = response.subdata(in: 1..<1537)
         try await sendData(s1, expectedGeneration: gen, expectedConnection: targetConnection)
+
+        guard connectionGeneration == gen, connection === targetConnection else {
+            throw RTMPError.notConnected
+        }
 
         isHandshakeComplete = true
         print("✅ RTMP handshake complete")
@@ -851,7 +867,16 @@ public actor RTMPPublisher {
         print("📥 Server Set Chunk Size: \(rawSize) (updated receiveChunkSize)")
     }
 
-    private func connectToApp(_ url: RTMPURL, streamKey: String) async throws {
+    private func connectToApp(
+        _ url: RTMPURL,
+        streamKey: String,
+        expectedGeneration gen: UInt64,
+        expectedConnection targetConnection: NWConnection
+    ) async throws {
+        guard connectionGeneration == gen, connection === targetConnection else {
+            throw RTMPError.notConnected
+        }
+
         let app = url.app
         print("📡 Connecting to app: \(app)")
 
@@ -868,6 +893,9 @@ public actor RTMPPublisher {
             messageStreamId: 0,
             payload: chunkSizeData
         )
+        guard connectionGeneration == gen, connection === targetConnection else {
+            throw RTMPError.notConnected
+        }
         sendChunkSize = Int(newChunkSize)
         print("✅ Sent SetChunkSize: \(newChunkSize)")
 
@@ -882,6 +910,9 @@ public actor RTMPPublisher {
             messageStreamId: 0,
             payload: windowAckData
         )
+        guard connectionGeneration == gen, connection === targetConnection else {
+            throw RTMPError.notConnected
+        }
         print("✅ Sent Window Acknowledgement Size: \(clientWindowSize)")
 
         // Reset transaction counter for new connection
@@ -908,7 +939,14 @@ public actor RTMPPublisher {
         print("⏳ Waiting for connect response...")
         var receivedConnectResult = false
         for _ in 0..<25 {
-            let (messageType, messageData, messageBytes) = try await receiveRTMPMessage(timeout: controlTimeout)
+            let (messageType, messageData, messageBytes) = try await receiveRTMPMessage(
+                timeout: controlTimeout,
+                expectedGeneration: gen,
+                expectedConnection: targetConnection
+            )
+            guard connectionGeneration == gen, connection === targetConnection else {
+                throw RTMPError.notConnected
+            }
             bytesReceived += UInt64(messageBytes)
 
             switch messageType {
@@ -948,6 +986,9 @@ public actor RTMPPublisher {
         guard receivedConnectResult else {
             throw RTMPError.connectionFailed("Did not receive connect _result from server")
         }
+        guard connectionGeneration == gen, connection === targetConnection else {
+            throw RTMPError.notConnected
+        }
         print("✅ Received connect response")
 
         // Release stream (transaction ID 2)
@@ -960,6 +1001,9 @@ public actor RTMPPublisher {
             messageStreamId: 0,
             payload: releaseStreamCommand
         )
+        guard connectionGeneration == gen, connection === targetConnection else {
+            throw RTMPError.notConnected
+        }
 
         // FCPublish (transaction ID 3)
         transactionId += 1  // = 3
@@ -971,6 +1015,9 @@ public actor RTMPPublisher {
             messageStreamId: 0,
             payload: fcPublishCommand
         )
+        guard connectionGeneration == gen, connection === targetConnection else {
+            throw RTMPError.notConnected
+        }
 
         // CreateStream (transaction ID 4)
         transactionId += 1  // = 4
@@ -988,7 +1035,14 @@ public actor RTMPPublisher {
         // Wait for createStream _result response (transaction ID 4)
         var receivedStreamId = false
         responseLoop: for _ in 0..<25 {
-            let (messageType, messageData, messageBytes) = try await receiveRTMPMessage(timeout: controlTimeout)
+            let (messageType, messageData, messageBytes) = try await receiveRTMPMessage(
+                timeout: controlTimeout,
+                expectedGeneration: gen,
+                expectedConnection: targetConnection
+            )
+            guard connectionGeneration == gen, connection === targetConnection else {
+                throw RTMPError.notConnected
+            }
             bytesReceived += UInt64(messageBytes)
 
             switch messageType {
@@ -1025,6 +1079,9 @@ public actor RTMPPublisher {
         guard receivedStreamId else {
             throw RTMPError.publishFailed("Did not receive createStream _result from server")
         }
+        guard connectionGeneration == gen, connection === targetConnection else {
+            throw RTMPError.notConnected
+        }
 
         // Send publish command to start streaming (transaction ID 5)
         transactionId += 1  // = 5
@@ -1047,7 +1104,14 @@ public actor RTMPPublisher {
         // Wait for explicit onStatus NetStream.Publish.Start (or error/denial)
         var receivedPublishStatus = false
         for _ in 0..<25 {
-            let (messageType, messageData, messageBytes) = try await receiveRTMPMessage(timeout: controlTimeout)
+            let (messageType, messageData, messageBytes) = try await receiveRTMPMessage(
+                timeout: controlTimeout,
+                expectedGeneration: gen,
+                expectedConnection: targetConnection
+            )
+            guard connectionGeneration == gen, connection === targetConnection else {
+                throw RTMPError.notConnected
+            }
             bytesReceived += UInt64(messageBytes)
 
             switch messageType {
@@ -1484,24 +1548,60 @@ public actor RTMPPublisher {
     }
 
     /// Receive RTMP message and return (messageType, payload, totalBytes)
-    private func receiveRTMPMessage(timeout: Duration? = .seconds(5)) async throws -> (UInt8, Data, Int) {
-        let (payload, totalBytes) = try await receiveRTMPChunk(firstByteTimeout: timeout)
+    private func receiveRTMPMessage(
+        timeout: Duration? = .seconds(5),
+        expectedGeneration: UInt64,
+        expectedConnection: NWConnection
+    ) async throws -> (UInt8, Data, Int) {
+        let (payload, totalBytes) = try await receiveRTMPChunk(
+            firstByteTimeout: timeout,
+            expectedGeneration: expectedGeneration,
+            expectedConnection: expectedConnection
+        )
         return (lastReceivedMessageType, payload, totalBytes)
+    }
+
+    private func isActiveConnection(generation: UInt64, connection target: NWConnection) -> Bool {
+        connectionGeneration == generation && connection === target
+    }
+
+    private func cancelConnectionIfCurrent(
+        expectedGeneration: UInt64,
+        expectedConnection: NWConnection
+    ) {
+        guard connectionGeneration == expectedGeneration,
+              connection === expectedConnection else {
+            return
+        }
+        expectedConnection.cancel()
     }
 
     /// Start background task to read and handle server messages during streaming
     /// (ping requests, ack requests, user control messages, etc.)
-    private func startServerMessageHandler() {
+    private func startServerMessageHandler(
+        expectedGeneration gen: UInt64,
+        expectedConnection targetConnection: NWConnection
+    ) {
         serverMessageTask = Task { [weak self] in
             guard let self = self else { return }
             print("📡 Server message handler started")
             while !Task.isCancelled {
                 do {
+                    guard await self.isActiveConnection(generation: gen, connection: targetConnection) else {
+                        break
+                    }
                     let connState = await self.state
                     guard connState == .publishing || connState == .connected else { break }
                     // Wait indefinitely for next incoming server message (cancellable on disconnect),
                     // while enforcing deadlines once the first byte of a message arrives.
-                    let (messageType, messageData, messageBytes) = try await self.receiveRTMPMessage(timeout: nil)
+                    let (messageType, messageData, messageBytes) = try await self.receiveRTMPMessage(
+                        timeout: nil,
+                        expectedGeneration: gen,
+                        expectedConnection: targetConnection
+                    )
+                    guard await self.isActiveConnection(generation: gen, connection: targetConnection) else {
+                        break
+                    }
                     await self.addBytesReceived(UInt64(messageBytes))
 
                     switch messageType {
@@ -1526,12 +1626,18 @@ public actor RTMPPublisher {
                         print("📥 [BG] Server message type \(messageType) (\(messageData.count) bytes)")
                     }
 
+                    guard await self.isActiveConnection(generation: gen, connection: targetConnection) else {
+                        break
+                    }
                     // Send acknowledgement if we've received enough bytes
                     let received = await self.getBytesReceived()
                     let ackSize = await self.getServerWindowAckSize()
                     let lastAck = await self.getLastAckSent()
                     if ackSize > 0 && received - lastAck >= UInt64(ackSize) {
                         try await self.sendWindowAcknowledgement(bytesReceived: UInt32(truncatingIfNeeded: received))
+                        guard await self.isActiveConnection(generation: gen, connection: targetConnection) else {
+                            break
+                        }
                         await self.setLastAckSent(received)
                     }
                 } catch is CancellationError {
@@ -1563,17 +1669,30 @@ public actor RTMPPublisher {
     /// Receive and reassemble a complete RTMP message from one or more chunks.
     /// Supports 1/2/3-byte chunk stream IDs (`UInt32`), extended timestamps,
     /// Type 0/1/2/3 headers, and interleaved chunk streams.
-    private func receiveRTMPChunk(firstByteTimeout: Duration? = .seconds(5)) async throws -> (Data, Int) {
+    private func receiveRTMPChunk(
+        firstByteTimeout: Duration? = .seconds(5),
+        expectedGeneration: UInt64,
+        expectedConnection: NWConnection
+    ) async throws -> (Data, Int) {
         var totalBytesRead = 0
         let inMessageTimeout: Duration = firstByteTimeout ?? .seconds(5)
         var isFirstChunk = true
 
         while true {
+            guard connectionGeneration == expectedGeneration,
+                  connection === expectedConnection else {
+                throw RTMPError.notConnected
+            }
+
             let basicTimeout = isFirstChunk ? firstByteTimeout : inMessageTimeout
             isFirstChunk = false
 
-            guard let basicHeaderData = try await receiveDataExact(length: 1, timeout: basicTimeout),
-                  basicHeaderData.count == 1 else {
+            guard let basicHeaderData = try await receiveDataExact(
+                length: 1,
+                timeout: basicTimeout,
+                expectedGeneration: expectedGeneration,
+                expectedConnection: expectedConnection
+            ), basicHeaderData.count == 1 else {
                 throw RTMPError.connectionFailed("Failed to receive chunk basic header")
             }
             totalBytesRead += 1
@@ -1583,15 +1702,23 @@ public actor RTMPPublisher {
 
             // Handle extended basic header for csid 0 and 1 (RTMP spec section 5.3.1.1)
             if chunkStreamId == 0 {
-                guard let extendedByte = try await receiveDataExact(length: 1, timeout: inMessageTimeout),
-                      extendedByte.count == 1 else {
+                guard let extendedByte = try await receiveDataExact(
+                    length: 1,
+                    timeout: inMessageTimeout,
+                    expectedGeneration: expectedGeneration,
+                    expectedConnection: expectedConnection
+                ), extendedByte.count == 1 else {
                     throw RTMPError.connectionFailed("Failed to receive extended basic header (csid=0)")
                 }
                 chunkStreamId = UInt32(extendedByte[0]) + 64
                 totalBytesRead += 1
             } else if chunkStreamId == 1 {
-                guard let extendedBytes = try await receiveDataExact(length: 2, timeout: inMessageTimeout),
-                      extendedBytes.count == 2 else {
+                guard let extendedBytes = try await receiveDataExact(
+                    length: 2,
+                    timeout: inMessageTimeout,
+                    expectedGeneration: expectedGeneration,
+                    expectedConnection: expectedConnection
+                ), extendedBytes.count == 2 else {
                     throw RTMPError.connectionFailed("Failed to receive extended basic header (csid=1)")
                 }
                 chunkStreamId = (UInt32(extendedBytes[1]) << 8) + UInt32(extendedBytes[0]) + 64
@@ -1609,12 +1736,21 @@ public actor RTMPPublisher {
 
             var messageHeader = Data()
             if headerSize > 0 {
-                guard let header = try await receiveDataExact(length: headerSize, timeout: inMessageTimeout),
-                      header.count == headerSize else {
+                guard let header = try await receiveDataExact(
+                    length: headerSize,
+                    timeout: inMessageTimeout,
+                    expectedGeneration: expectedGeneration,
+                    expectedConnection: expectedConnection
+                ), header.count == headerSize else {
                     throw RTMPError.connectionFailed("Failed to receive message header")
                 }
                 messageHeader = header
                 totalBytesRead += headerSize
+            }
+
+            guard connectionGeneration == expectedGeneration,
+                  connection === expectedConnection else {
+                throw RTMPError.notConnected
             }
 
             let csState: ChunkStreamState
@@ -1683,8 +1819,12 @@ public actor RTMPPublisher {
             let needsExtendedTimestamp = (format != 3 && rawTimestampField == 0xFF_FFFF) ||
                                          (format == 3 && csState.hasExtendedTimestamp)
             if needsExtendedTimestamp {
-                guard let extTs = try await receiveDataExact(length: 4, timeout: inMessageTimeout),
-                      extTs.count == 4 else {
+                guard let extTs = try await receiveDataExact(
+                    length: 4,
+                    timeout: inMessageTimeout,
+                    expectedGeneration: expectedGeneration,
+                    expectedConnection: expectedConnection
+                ), extTs.count == 4 else {
                     throw RTMPError.connectionFailed("Failed to receive extended timestamp")
                 }
                 totalBytesRead += 4
@@ -1710,13 +1850,22 @@ public actor RTMPPublisher {
             // Read one chunk's worth of payload for this chunk stream
             let chunkSize = min(Int(csState.remainingBytes), max(1, receiveChunkSize))
             if chunkSize > 0 {
-                guard let chunk = try await receiveDataExact(length: chunkSize, timeout: inMessageTimeout),
-                      chunk.count == chunkSize else {
+                guard let chunk = try await receiveDataExact(
+                    length: chunkSize,
+                    timeout: inMessageTimeout,
+                    expectedGeneration: expectedGeneration,
+                    expectedConnection: expectedConnection
+                ), chunk.count == chunkSize else {
                     throw RTMPError.connectionFailed("Failed to receive chunk payload")
                 }
                 csState.payloadBuffer.append(chunk)
                 csState.remainingBytes -= UInt32(chunkSize)
                 totalBytesRead += chunkSize
+            }
+
+            guard connectionGeneration == expectedGeneration,
+                  connection === expectedConnection else {
+                throw RTMPError.notConnected
             }
 
             if csState.remainingBytes == 0 {
@@ -1728,8 +1877,18 @@ public actor RTMPPublisher {
         }
     }
 
-    /// Receive exact amount of data, enforcing an actual deadline even when the peer sends 0 bytes.
-    private func receiveDataExact(length: Int, timeout: Duration? = .seconds(5)) async throws -> Data? {
+    /// Receive exact amount of data, enforcing an actual deadline even when the peer sends 0 bytes,
+    /// pinned to `(expectedGeneration, expectedConnection)` across every iteration.
+    private func receiveDataExact(
+        length: Int,
+        timeout: Duration? = .seconds(5),
+        expectedGeneration: UInt64,
+        expectedConnection: NWConnection
+    ) async throws -> Data? {
+        guard connectionGeneration == expectedGeneration,
+              connection === expectedConnection else {
+            throw RTMPError.notConnected
+        }
         guard length > 0 else { return Data() }
 
         var accumulated = Data()
@@ -1738,11 +1897,19 @@ public actor RTMPPublisher {
         let deadline = timeout.map { ContinuousClock.now.advanced(by: $0) }
 
         while remaining > 0 {
+            guard connectionGeneration == expectedGeneration,
+                  connection === expectedConnection else {
+                throw RTMPError.notConnected
+            }
+
             let stepTimeout: Duration?
             if let deadline {
                 let remainingTime = ContinuousClock.now.duration(to: deadline)
                 if remainingTime <= .zero {
-                    connection?.cancel()
+                    cancelConnectionIfCurrent(
+                        expectedGeneration: expectedGeneration,
+                        expectedConnection: expectedConnection
+                    )
                     throw RTMPError.connectionFailed("Timeout reading \(length) bytes (got \(accumulated.count) bytes)")
                 }
                 stepTimeout = remainingTime
@@ -1750,11 +1917,21 @@ public actor RTMPPublisher {
                 stepTimeout = nil
             }
 
-            guard let chunk = try await receiveData(length: remaining, timeout: stepTimeout) else {
+            guard let chunk = try await receiveData(
+                length: remaining,
+                timeout: stepTimeout,
+                expectedGeneration: expectedGeneration,
+                expectedConnection: expectedConnection
+            ) else {
                 if accumulated.isEmpty {
                     return nil
                 }
                 throw RTMPError.connectionFailed("Connection closed mid-read (got \(accumulated.count)/\(length) bytes)")
+            }
+
+            guard connectionGeneration == expectedGeneration,
+                  connection === expectedConnection else {
+                throw RTMPError.notConnected
             }
 
             accumulated.append(chunk)
@@ -1796,18 +1973,30 @@ public actor RTMPPublisher {
         return parsedStreamId
     }
 
-    private func receiveData(length: Int, timeout: Duration?) async throws -> Data? {
-        guard let connection = connection else {
+    private func receiveData(
+        length: Int,
+        timeout: Duration?,
+        expectedGeneration: UInt64,
+        expectedConnection: NWConnection
+    ) async throws -> Data? {
+        try Task.checkCancellation()
+        guard connectionGeneration == expectedGeneration,
+              connection === expectedConnection else {
             throw RTMPError.notConnected
         }
 
-        return try await withTaskCancellationHandler {
+        let received = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data?, Error>) in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+
                 let settled = OSAllocatedUnfairLock(initialState: false)
                 let timeoutTask: Task<Void, Never>?
 
                 if let timeout {
-                    timeoutTask = Task {
+                    timeoutTask = Task { [weak self] in
                         do {
                             try await Task.sleep(for: timeout)
                         } catch {
@@ -1820,7 +2009,10 @@ public actor RTMPPublisher {
                             return true
                         }
                         if shouldFail {
-                            connection.cancel()
+                            await self?.cancelConnectionIfCurrent(
+                                expectedGeneration: expectedGeneration,
+                                expectedConnection: expectedConnection
+                            )
                             continuation.resume(throwing: RTMPError.connectionFailed("Receive timed out"))
                         }
                     }
@@ -1828,7 +2020,7 @@ public actor RTMPPublisher {
                     timeoutTask = nil
                 }
 
-                connection.receive(minimumIncompleteLength: 1, maximumLength: length) { data, _, isComplete, error in
+                expectedConnection.receive(minimumIncompleteLength: 1, maximumLength: length) { data, _, isComplete, error in
                     let shouldResume = settled.withLock { already -> Bool in
                         if already { return false }
                         already = true
@@ -1858,9 +2050,20 @@ public actor RTMPPublisher {
                     continuation.resume(returning: nil)
                 }
             }
-        } onCancel: {
-            connection.cancel()
+        } onCancel: { [weak self] in
+            Task { [weak self] in
+                await self?.cancelConnectionIfCurrent(
+                    expectedGeneration: expectedGeneration,
+                    expectedConnection: expectedConnection
+                )
+            }
         }
+
+        guard connectionGeneration == expectedGeneration,
+              connection === expectedConnection else {
+            throw RTMPError.notConnected
+        }
+        return received
     }
 
     private func calculateBitrate() -> Double {

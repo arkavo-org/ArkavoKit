@@ -281,13 +281,11 @@ public actor NTDFTokenBuilder {
             curve: .secp256r1
         )
 
-        // 3. Create NanoTDF with a minimal non-sensitive policy header so
-        // authentication claims remain encrypted in the NanoTDF payload only.
-        let policyUUID = UUID().uuidString.lowercased()
-        let policyJSON = "{\"uuid\":\"\(policyUUID)\",\"body\":{\"dataAttributes\":[],\"dissem\":[]}}"
+        // 3. Create NanoTDF with embedded plaintext policy containing the serialized claims
+        // (required for wire compatibility with the Rust KAS token validator).
         var policy = Policy(
             type: .embeddedPlaintext,
-            body: EmbeddedPolicyBody(body: Data(policyJSON.utf8)),
+            body: EmbeddedPolicyBody(body: plaintext),
             remote: nil
         )
 

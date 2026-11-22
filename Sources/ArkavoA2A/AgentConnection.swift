@@ -274,9 +274,29 @@ public actor AgentConnection: AgentWebSocketTransportDelegate {
         await transport.clearNotificationHandler(ifMatching: handler)
     }
 
+    /// Add a notification handler for this connection (supports multiple concurrent handlers)
+    public func addNotificationHandler(_ handler: any AgentNotificationHandler) async {
+        await transport.addNotificationHandler(handler)
+    }
+
+    /// Remove a previously registered notification handler from this connection
+    public func removeNotificationHandler(_ handler: any AgentNotificationHandler) async {
+        await transport.removeNotificationHandler(handler)
+    }
+
     /// Current notification handler (internal for testing)
     func getNotificationHandler() async -> (any AgentNotificationHandler)? {
         await transport.getNotificationHandler()
+    }
+
+    /// Current registered notification handlers (internal for testing)
+    func getNotificationHandlers() async -> [any AgentNotificationHandler] {
+        await transport.getNotificationHandlers()
+    }
+
+    /// Dispatch a notification through the underlying transport (internal for testing)
+    func dispatchNotification(_ notification: AgentNotification) async {
+        await transport.handleNotification(notification)
     }
 
     // MARK: - AgentWebSocketTransportDelegate
