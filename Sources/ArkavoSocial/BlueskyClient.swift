@@ -2,12 +2,16 @@
     import FoundationNetworking
 #endif
 import Foundation
+import Synchronization
 
 // MARK: - Bluesky Client
 
 public actor BlueskyClient: ObservableObject {
     private let httpClient: HTTPClient
     private let baseURL: URL
+    private let sessionGeneration = Mutex<UInt64>(0)
+    private var activeRefreshTask: Task<CreateSessionResponse, Error>?
+
     @MainActor @Published public private(set) var profile: ProfileViewResponse?
     @MainActor @Published public private(set) var timeline: TimelineResponse?
     @MainActor @Published public var isAuthenticated = false
@@ -20,6 +24,14 @@ public actor BlueskyClient: ObservableObject {
         Task { @MainActor in
             checkExistingAuth()
         }
+    }
+
+    private nonisolated func currentSessionGeneration() -> UInt64 {
+        sessionGeneration.withLock { $0 }
+    }
+
+    private nonisolated func incrementSessionGeneration() {
+        sessionGeneration.withLock { $0 &+= 1 }
     }
 
     @MainActor
@@ -39,6 +51,7 @@ public actor BlueskyClient: ObservableObject {
     }
 
     private func createSession(identifier: String, password: String) async throws -> CreateSessionResponse {
+        let generation = currentSessionGeneration()
         let endpoint = baseURL.appendingPathComponent("/xrpc/com.atproto.server.createSession")
         let request = CreateSessionRequest(identifier: identifier, password: password)
 
@@ -48,6 +61,11 @@ public actor BlueskyClient: ObservableObject {
             body: request,
             headers: [:],
         )
+
+        guard currentSessionGeneration() == generation else {
+            throw BlueskyError(error: "session_ended", message: "Session ended while signing in")
+        }
+
         try KeychainManager.saveBlueskyHandle(response.handle)
         try KeychainManager.saveBlueskyDID(response.did)
         try KeychainManager.saveBlueskyTokens(accessToken: response.accessJwt, refreshToken: response.refreshJwt)
@@ -102,22 +120,38 @@ public actor BlueskyClient: ObservableObject {
 
     @MainActor
     public func logout() {
+        incrementSessionGeneration()
         KeychainManager.deleteBlueskyTokens()
         isAuthenticated = false
+        profile = nil
+        timeline = nil
         error = nil
+        Task {
+            await self.cancelInFlightRefresh()
+        }
+    }
+
+    private func cancelInFlightRefresh() {
+        activeRefreshTask?.cancel()
+        activeRefreshTask = nil
     }
 
     // MARK: - Timeline Methods
 
     @MainActor
-    public func getTimeline(limit _: Int = 50, cursor _: String? = nil) async -> TimelineResponse? {
+    public func getTimeline(limit: Int = 50, cursor: String? = nil) async -> TimelineResponse? {
         isLoading = true
         error = nil
         defer { isLoading = false }
         do {
+            var queryItems = [URLQueryItem(name: "limit", value: String(limit))]
+            if let cursor, !cursor.isEmpty {
+                queryItems.append(URLQueryItem(name: "cursor", value: cursor))
+            }
             let timeline: TimelineResponse = try await authenticatedRequest(
                 endpoint: "app.bsky.feed.getTimeline",
                 method: "GET",
+                queryItems: queryItems,
             )
             self.timeline = timeline
             print("Fetched \(timeline.feed.count) posts")
@@ -170,6 +204,34 @@ public actor BlueskyClient: ObservableObject {
 
     // MARK: - Post Methods
 
+    private static func parseATURI(_ uri: String) -> (repo: String, collection: String, rkey: String)? {
+        guard uri.hasPrefix("at://") else { return nil }
+        let remainder = uri.dropFirst("at://".count)
+        let parts = remainder.split(separator: "/", omittingEmptySubsequences: false)
+        guard parts.count == 3, !parts[0].isEmpty, !parts[1].isEmpty, !parts[2].isEmpty else {
+            return nil
+        }
+        return (String(parts[0]), String(parts[1]), String(parts[2]))
+    }
+
+    private func resolveReplyRef(for replyToURI: String) async -> PostReply? {
+        struct GetPostsResponse: Decodable, Sendable {
+            let posts: [PostModelView]
+        }
+        guard let response: GetPostsResponse = try? await authenticatedRequest(
+            endpoint: "app.bsky.feed.getPosts",
+            method: "GET",
+            queryItems: [URLQueryItem(name: "uris", value: replyToURI)],
+        ),
+            let parentPost = response.posts.first
+        else {
+            return nil
+        }
+        let parentRef = StrongRef(uri: parentPost.uri, cid: parentPost.cid)
+        let rootRef = parentPost.record.reply?.root ?? parentRef
+        return PostReply(root: rootRef, parent: parentRef)
+    }
+
     @MainActor
     public func createPost(text: String, replyTo: String? = nil) async {
         guard let did = KeychainManager.getBlueskyHDID() else {
@@ -182,7 +244,11 @@ public actor BlueskyClient: ObservableObject {
         defer { isLoading = false }
 
         do {
-            let request = try CreatePostRequest(did: did, text: text, replyTo: replyTo)
+            var resolvedReply: PostReply?
+            if let replyTo, !replyTo.isEmpty {
+                resolvedReply = await resolveReplyRef(for: replyTo)
+            }
+            let request = try CreatePostRequest(did: did, text: text, replyTo: replyTo, reply: resolvedReply)
             let response: CreatePostResponse = try await authenticatedRequest(
                 endpoint: "com.atproto.repo.createRecord",
                 method: "POST",
@@ -205,10 +271,18 @@ public actor BlueskyClient: ObservableObject {
         error = nil
         defer { isLoading = false }
         do {
+            guard let parsed = Self.parseATURI(uri) else {
+                throw BlueskyError(error: "InvalidURI", message: "Invalid AT-URI: \(uri)")
+            }
+            let payload = DeleteRecordRequest(
+                repo: parsed.repo,
+                collection: parsed.collection,
+                rkey: parsed.rkey,
+            )
             let _: EmptyResponse = try await authenticatedRequest(
-                endpoint: "app.bsky.feed.deletePost",
+                endpoint: "com.atproto.repo.deleteRecord",
                 method: "POST",
-                body: ["uri": uri],
+                body: payload,
             )
             print("Deleted post: \(uri)")
         } catch {
@@ -224,10 +298,21 @@ public actor BlueskyClient: ObservableObject {
         error = nil
         defer { isLoading = false }
         do {
-            let _: EmptyResponse = try await authenticatedRequest(
-                endpoint: "app.bsky.feed.like",
+            guard let did = KeychainManager.getBlueskyHDID() else {
+                throw BlueskyError(error: "auth_required", message: "No account DID available")
+            }
+            let payload = CreateLikeRequest(
+                repo: did,
+                collection: "app.bsky.feed.like",
+                record: LikeRecord(
+                    subject: StrongRef(uri: uri, cid: cid),
+                    createdAt: ISO8601DateFormatter().string(from: Date()),
+                ),
+            )
+            let _: CreatePostResponse = try await authenticatedRequest(
+                endpoint: "com.atproto.repo.createRecord",
                 method: "POST",
-                body: ["uri": uri, "cid": cid],
+                body: payload,
             )
             print("Liked post: \(uri)")
         } catch {
@@ -241,10 +326,18 @@ public actor BlueskyClient: ObservableObject {
         error = nil
         defer { isLoading = false }
         do {
+            guard let parsed = Self.parseATURI(uri) else {
+                throw BlueskyError(error: "InvalidURI", message: "Invalid like record AT-URI: \(uri)")
+            }
+            let payload = DeleteRecordRequest(
+                repo: parsed.repo,
+                collection: parsed.collection,
+                rkey: parsed.rkey,
+            )
             let _: EmptyResponse = try await authenticatedRequest(
-                endpoint: "app.bsky.feed.unlike",
+                endpoint: "com.atproto.repo.deleteRecord",
                 method: "POST",
-                body: ["uri": uri],
+                body: payload,
             )
             print("Unliked post: \(uri)")
         } catch {
@@ -253,22 +346,41 @@ public actor BlueskyClient: ObservableObject {
     }
 
     private func refreshSession() async throws -> CreateSessionResponse {
+        if let existingTask = activeRefreshTask {
+            return try await existingTask.value
+        }
+
+        let generation = currentSessionGeneration()
         guard let refreshToken = KeychainManager.getBlueskyRefreshToken() else {
             throw BlueskyError(error: "auth_required", message: "No refresh token available")
         }
 
         let endpoint = baseURL.appendingPathComponent("/xrpc/com.atproto.server.refreshSession")
+        let client = httpClient
 
-        let response: CreateSessionResponse = try await httpClient.sendRequest(
-            endpoint,
-            method: "POST",
-            body: nil,
-            headers: ["Authorization": "Bearer \(refreshToken)"],
-        )
+        let task = Task<CreateSessionResponse, Error> {
+            let response: CreateSessionResponse = try await client.sendRequest(
+                endpoint,
+                method: "POST",
+                body: nil,
+                headers: ["Authorization": "Bearer \(refreshToken)"],
+            )
 
-        // Save new tokens
-        try KeychainManager.saveBlueskyTokens(accessToken: response.accessJwt, refreshToken: response.refreshJwt)
-        return response
+            guard self.currentSessionGeneration() == generation else {
+                throw BlueskyError(error: "session_ended", message: "Session ended while refreshing token")
+            }
+
+            try KeychainManager.saveBlueskyTokens(accessToken: response.accessJwt, refreshToken: response.refreshJwt)
+            return response
+        }
+
+        activeRefreshTask = task
+        defer {
+            if activeRefreshTask == task {
+                activeRefreshTask = nil
+            }
+        }
+        return try await task.value
     }
 }
 
@@ -353,6 +465,10 @@ public struct URLSessionHTTPClient: HTTPClient {
             throw URLError(.badServerResponse)
         }
 
+        if data.isEmpty, let empty = EmptyResponse() as? T {
+            return empty
+        }
+
         return try decoder.decode(T.self, from: data)
     }
 }
@@ -374,8 +490,8 @@ public struct PostModelView: Codable, Sendable {
     public let cid: String
     public let author: ActorProfile
     public let record: PostRecord
-    public let likeCount: Int
-    public let repostCount: Int
+    public let likeCount: Int?
+    public let repostCount: Int?
     public let indexedAt: String
 }
 
@@ -388,8 +504,21 @@ public struct ActorProfile: Codable, Sendable {
 }
 
 public struct ReplyRef: Codable, Sendable {
-    public let parent: PostModelView
-    public let root: PostModelView
+    public let parent: PostModelView?
+    public let root: PostModelView?
+
+    public init(parent: PostModelView?, root: PostModelView?) {
+        self.parent = parent
+        self.root = root
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        // ATProto reply union values can be postView, notFoundPost, or blockedPost.
+        // Non-post variants decode as nil instead of failing the entire timeline.
+        parent = try? container.decode(PostModelView.self, forKey: .parent)
+        root = try? container.decode(PostModelView.self, forKey: .root)
+    }
 }
 
 // MARK: - Profile Models
@@ -400,38 +529,106 @@ public struct ProfileViewResponse: Codable, Sendable {
     public let displayName: String?
     public let description: String?
     public let avatar: String?
-    public let followersCount: Int
-    public let followsCount: Int
-    public let postsCount: Int
+    public let followersCount: Int?
+    public let followsCount: Int?
+    public let postsCount: Int?
 }
 
 // MARK: - Post Models
+
+public struct StrongRef: Codable, Sendable, Equatable {
+    public let uri: String
+    public let cid: String
+
+    public init(uri: String, cid: String) {
+        self.uri = uri
+        self.cid = cid
+    }
+}
+
+public struct PostReply: Codable, Sendable, Equatable {
+    public let root: StrongRef
+    public let parent: StrongRef
+
+    public init(root: StrongRef, parent: StrongRef) {
+        self.root = root
+        self.parent = parent
+    }
+}
 
 public struct CreatePostRequest: Codable, Sendable {
     let repo: String
     let collection: String
     let record: PostRecord
 
-    public init(did: String, text: String, replyTo _: String? = nil) throws {
+    public init(did: String, text: String, replyTo: String? = nil, reply: PostReply? = nil) throws {
         // Validate text length before creating request
         guard text.count <= 300 else {
             throw BlueskyError(error: "InvalidText", message: "Post text must not exceed 300 characters")
         }
         collection = "app.bsky.feed.post"
         repo = did
-        record = PostRecord(text: text, createdAt: ISO8601DateFormatter().string(from: Date()))
+
+        let resolvedReply: PostReply?
+        if let reply {
+            resolvedReply = reply
+        } else if let replyTo, !replyTo.isEmpty {
+            let parts = replyTo.split(separator: "|", maxSplits: 1)
+            let uri = String(parts[0])
+            let cid = parts.count > 1 ? String(parts[1]) : ""
+            let ref = StrongRef(uri: uri, cid: cid)
+            resolvedReply = PostReply(root: ref, parent: ref)
+        } else {
+            resolvedReply = nil
+        }
+
+        record = PostRecord(
+            text: text,
+            createdAt: ISO8601DateFormatter().string(from: Date()),
+            reply: resolvedReply,
+        )
     }
 }
 
 public struct PostRecord: Codable, Sendable {
     public let text: String
     public let createdAt: String
-    // Add other optional fields like reply, embed, etc. as needed
+    public let reply: PostReply?
+
+    public init(text: String, createdAt: String, reply: PostReply? = nil) {
+        self.text = text
+        self.createdAt = createdAt
+        self.reply = reply
+    }
 }
 
 public struct CreatePostResponse: Codable, Sendable {
     public let uri: String
     public let cid: String
+}
+
+private struct DeleteRecordRequest: Encodable, Sendable {
+    let repo: String
+    let collection: String
+    let rkey: String
+}
+
+private struct LikeRecord: Encodable, Sendable {
+    let type: String = "app.bsky.feed.like"
+    let subject: StrongRef
+    let createdAt: String
+
+    private enum CodingKeys: String, CodingKey {
+        case type = "$type"
+        case subject
+        case createdAt
+    }
+}
+
+private struct CreateLikeRequest: Encodable, Sendable {
+    let repo: String
+    let collection: String
+    let record: LikeRecord
 }
 
 private struct EmptyResponse: Codable, Sendable {}

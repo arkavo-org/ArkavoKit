@@ -11,13 +11,13 @@ public class VideoClassificationProcessor {
 
     // MARK: - Types
 
-    public struct ClassificationResult {
+    public struct ClassificationResult: Sendable {
         public let timestamp: TimeInterval
         public let label: String
         public let confidence: Float
     }
 
-    public enum VideoProcessingError: Error {
+    public enum VideoProcessingError: Error, Sendable {
         case invalidVideoFile
         case modelLoadError
         case processingError(String)
@@ -26,10 +26,14 @@ public class VideoClassificationProcessor {
     // MARK: - Initialization
 
     public init(videoPath: String) throws {
-        guard let url = URL(string: videoPath) else {
+        guard !videoPath.isEmpty else {
             throw VideoProcessingError.invalidVideoFile
         }
-        videoURL = url
+        if let parsed = URL(string: videoPath), parsed.isFileURL {
+            videoURL = parsed
+        } else {
+            videoURL = URL(fileURLWithPath: videoPath)
+        }
     }
 
     // MARK: - Public Methods
@@ -48,26 +52,46 @@ public class VideoClassificationProcessor {
         }
     }
 
-    @MainActor
     public func processVideo(every frameInterval: Int = 30) async throws -> [ClassificationResult] {
+        guard frameInterval > 0, frameInterval <= Int(Int32.max) else {
+            throw VideoProcessingError.processingError("frameInterval must be between 1 and \(Int32.max)")
+        }
         guard let request = classificationRequest else {
             throw VideoProcessingError.modelLoadError
         }
 
         let asset = AVURLAsset(url: videoURL)
+        let duration: CMTime
+        do {
+            duration = try await asset.load(.duration)
+        } catch {
+            throw VideoProcessingError.invalidVideoFile
+        }
+        guard duration.isValid, !duration.isIndefinite, duration > .zero else {
+            return []
+        }
+
+        let nominalFPS: Double
+        if let videoTrack = try? await asset.loadTracks(withMediaType: .video).first,
+           let rate = try? await videoTrack.load(.nominalFrameRate),
+           rate.isFinite, rate > 0 {
+            nominalFPS = Double(rate)
+        } else {
+            nominalFPS = 30.0
+        }
+        let stepSeconds = Double(frameInterval) / nominalFPS
+        let stepTime = CMTime(seconds: stepSeconds, preferredTimescale: 600)
+        let frameDuration = (stepTime.isValid && stepTime > .zero) ? stepTime : CMTime(value: 1, timescale: 600)
+
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
 
         var results: [ClassificationResult] = []
         var frameNumber = 0
-
-        let frameDuration = CMTimeMake(value: 1, timescale: Int32(frameInterval))
         var currentTime = CMTime.zero
-        // A video whose duration can't load has none to process (zero, as the synchronous
-        // `duration` reports it).
-        let duration = (try? await asset.load(.duration)) ?? .zero
 
         while currentTime < duration {
+            try Task.checkCancellation()
             do {
                 let imageRef = try await generator.image(at: currentTime).image
                 let requestHandler = VNImageRequestHandler(cgImage: imageRef)
@@ -78,7 +102,7 @@ public class VideoClassificationProcessor {
                         ClassificationResult(
                             timestamp: CMTimeGetSeconds(currentTime),
                             label: observation.identifier,
-                            confidence: observation.confidence,
+                            confidence: observation.confidence
                         )
                     }
                     results.append(contentsOf: frameResults)
@@ -86,6 +110,8 @@ public class VideoClassificationProcessor {
 
                 currentTime = CMTimeAdd(currentTime, frameDuration)
                 frameNumber += 1
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 throw VideoProcessingError.processingError("Error processing frame \(frameNumber)")
             }

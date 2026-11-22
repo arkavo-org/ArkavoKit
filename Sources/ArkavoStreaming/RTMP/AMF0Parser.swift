@@ -10,18 +10,29 @@ import Foundation
 /// - RTMP Specification Section 3.1.1.2
 struct AMF0Parser {
 
+    // MARK: - Limits
+
+    /// Maximum allowed nesting depth for objects/arrays to prevent stack overflow on crafted input.
+    static let maxDepth = 32
+
     // MARK: - AMF0 Type Markers
 
     private enum Marker: UInt8 {
         case number = 0x00        // Double precision IEEE-754
         case boolean = 0x01       // Boolean value
-        case string = 0x02        // UTF-8 string
+        case string = 0x02        // UTF-8 string (16-bit length)
         case object = 0x03        // Object with properties
         case null = 0x05          // Null value
         case undefined = 0x06     // Undefined value
-        case objectEnd = 0x09     // Object end marker (0x00 0x00 0x09)
+        case reference = 0x07     // Reference (16-bit index)
         case array = 0x08         // ECMA array
+        case objectEnd = 0x09     // Object end marker (0x00 0x00 0x09)
         case strictArray = 0x0A   // Strict array
+        case date = 0x0B          // Date (double ms + int16 tz offset)
+        case longString = 0x0C    // Long UTF-8 string (32-bit length)
+        case unsupported = 0x0D   // Unsupported marker
+        case xmlDocument = 0x0F   // XML document (same wire format as longString)
+        case typedObject = 0x10   // Typed object (class name + object properties)
     }
 
     // MARK: - AMF0 Value Types
@@ -33,6 +44,8 @@ struct AMF0Parser {
         case string(String)
         case object([String: Value])
         case array([Value])
+        case date(Double)
+        case reference(UInt16)
         case null
         case undefined
 
@@ -84,6 +97,7 @@ struct AMF0Parser {
         case invalidMarker(UInt8)
         case invalidString(offset: Int)
         case unexpectedEndOfObject
+        case maxDepthExceeded
         case malformedData(String)
 
         var description: String {
@@ -96,6 +110,8 @@ struct AMF0Parser {
                 return "Invalid UTF-8 string at offset \(offset)"
             case .unexpectedEndOfObject:
                 return "Unexpected end of object"
+            case .maxDepthExceeded:
+                return "Maximum AMF0 nesting depth (\(AMF0Parser.maxDepth)) exceeded"
             case .malformedData(let reason):
                 return "Malformed AMF0 data: \(reason)"
             }
@@ -106,23 +122,25 @@ struct AMF0Parser {
 
     private let data: Data
     private var offset: Int
+    private var depth: Int = 0
 
     // MARK: - Initialization
 
     /// Create a parser for the given AMF0-encoded data
-    /// - Parameter data: AMF0-encoded binary data
+    /// - Parameter data: AMF0-encoded binary data (slices with non-zero startIndex are normalized)
     init(data: Data) {
-        self.data = data
+        self.data = data.startIndex == 0 ? data : Data(data)
         self.offset = 0
     }
 
     /// Create a parser starting at a specific offset
     /// - Parameters:
-    ///   - data: AMF0-encoded binary data
-    ///   - offset: Starting offset in the data
+    ///   - data: AMF0-encoded binary data (slices with non-zero startIndex are normalized)
+    ///   - offset: Starting offset relative to the start of `data`
     init(data: Data, offset: Int) {
-        self.data = data
-        self.offset = offset
+        let normalized = data.startIndex == 0 ? data : Data(data)
+        self.data = normalized
+        self.offset = max(0, min(offset, normalized.count))
     }
 
     // MARK: - Public Parsing Methods
@@ -166,9 +184,17 @@ struct AMF0Parser {
             return try .object(readECMAArray())
         case .strictArray:
             return try .array(readStrictArray())
+        case .reference:
+            return try .reference(readReference())
+        case .date:
+            return try .date(readDate())
+        case .longString, .xmlDocument:
+            return try .string(readLongString())
+        case .typedObject:
+            return try .object(readTypedObject())
         case .null:
             return .null
-        case .undefined:
+        case .undefined, .unsupported:
             return .undefined
         case .objectEnd:
             throw ParseError.unexpectedEndOfObject
@@ -179,8 +205,8 @@ struct AMF0Parser {
     /// - Returns: The parsed number
     /// - Throws: ParseError if data is insufficient
     mutating func readNumber() throws -> Double {
-        guard offset + 8 <= data.count else {
-            throw ParseError.insufficientData(need: 8, have: data.count - offset)
+        guard bytesRemaining >= 8 else {
+            throw ParseError.insufficientData(need: 8, have: bytesRemaining)
         }
 
         var bits: UInt64 = 0
@@ -196,8 +222,8 @@ struct AMF0Parser {
     /// - Returns: The parsed boolean
     /// - Throws: ParseError if data is insufficient
     mutating func readBoolean() throws -> Bool {
-        guard offset + 1 <= data.count else {
-            throw ParseError.insufficientData(need: 1, have: data.count - offset)
+        guard bytesRemaining >= 1 else {
+            throw ParseError.insufficientData(need: 1, have: bytesRemaining)
         }
 
         let value = data[offset] != 0
@@ -205,20 +231,69 @@ struct AMF0Parser {
         return value
     }
 
-    /// Read a UTF-8 string without reading the marker
+    /// Read a 16-bit reference index without reading the marker
+    mutating func readReference() throws -> UInt16 {
+        guard bytesRemaining >= 2 else {
+            throw ParseError.insufficientData(need: 2, have: bytesRemaining)
+        }
+
+        let index = UInt16(data[offset]) << 8 | UInt16(data[offset + 1])
+        offset += 2
+        return index
+    }
+
+    /// Read an AMF0 Date (8-byte IEEE-754 ms timestamp + 2-byte timezone offset) without reading the marker
+    mutating func readDate() throws -> Double {
+        guard bytesRemaining >= 10 else {
+            throw ParseError.insufficientData(need: 10, have: bytesRemaining)
+        }
+        let milliseconds = try readNumber()
+        // Consume 2-byte reserved/timezone offset
+        offset += 2
+        return milliseconds
+    }
+
+    /// Read a UTF-8 string (16-bit length) without reading the marker
     /// - Returns: The parsed string
     /// - Throws: ParseError if data is insufficient or string is invalid
     mutating func readString() throws -> String {
-        guard offset + 2 <= data.count else {
-            throw ParseError.insufficientData(need: 2, have: data.count - offset)
+        guard bytesRemaining >= 2 else {
+            throw ParseError.insufficientData(need: 2, have: bytesRemaining)
         }
 
         // Read 16-bit length (big endian)
         let length = Int(data[offset]) << 8 | Int(data[offset + 1])
         offset += 2
 
-        guard offset + length <= data.count else {
-            throw ParseError.insufficientData(need: length, have: data.count - offset)
+        guard length <= bytesRemaining else {
+            throw ParseError.insufficientData(need: length, have: bytesRemaining)
+        }
+
+        let stringData = data.subdata(in: offset..<(offset + length))
+        offset += length
+
+        guard let string = String(data: stringData, encoding: .utf8) else {
+            throw ParseError.invalidString(offset: offset - length)
+        }
+
+        return string
+    }
+
+    /// Read a long UTF-8 string or XML document (32-bit length) without reading the marker
+    mutating func readLongString() throws -> String {
+        guard bytesRemaining >= 4 else {
+            throw ParseError.insufficientData(need: 4, have: bytesRemaining)
+        }
+
+        let lengthU32 = UInt32(data[offset]) << 24 | UInt32(data[offset + 1]) << 16 |
+                        UInt32(data[offset + 2]) << 8 | UInt32(data[offset + 3])
+        offset += 4
+
+        guard let length = Int(exactly: lengthU32), length <= bytesRemaining else {
+            throw ParseError.insufficientData(
+                need: Int(min(UInt64(lengthU32), UInt64(Int.max))),
+                have: bytesRemaining
+            )
         }
 
         let stringData = data.subdata(in: offset..<(offset + length))
@@ -235,12 +310,18 @@ struct AMF0Parser {
     /// - Returns: The parsed object as a dictionary
     /// - Throws: ParseError if data is malformed
     mutating func readObject() throws -> [String: Value] {
+        guard depth < Self.maxDepth else {
+            throw ParseError.maxDepthExceeded
+        }
+        depth += 1
+        defer { depth -= 1 }
+
         var properties: [String: Value] = [:]
 
         while true {
             // Check for object end marker (0x00 0x00 0x09)
-            guard offset + 3 <= data.count else {
-                throw ParseError.insufficientData(need: 3, have: data.count - offset)
+            guard bytesRemaining >= 3 else {
+                throw ParseError.insufficientData(need: 3, have: bytesRemaining)
             }
 
             // Check if we hit the end marker
@@ -261,16 +342,22 @@ struct AMF0Parser {
         return properties
     }
 
+    /// Read a typed object (class name + object properties) without reading the marker
+    mutating func readTypedObject() throws -> [String: Value] {
+        _ = try readString() // Class name
+        return try readObject()
+    }
+
     /// Read an ECMA array without reading the marker
     /// - Returns: The parsed object (ECMA arrays have string keys, not numeric indices)
     /// - Throws: ParseError if data is malformed
     mutating func readECMAArray() throws -> [String: Value] {
-        // ECMA arrays start with a 32-bit count (usually ignored)
-        guard offset + 4 <= data.count else {
-            throw ParseError.insufficientData(need: 4, have: data.count - offset)
+        // ECMA arrays start with a 32-bit count hint (terminated by object end marker)
+        guard bytesRemaining >= 4 else {
+            throw ParseError.insufficientData(need: 4, have: bytesRemaining)
         }
-        let count = Int(data[offset]) << 24 | Int(data[offset + 1]) << 16 |
-                    Int(data[offset + 2]) << 8 | Int(data[offset + 3])
+        let count = UInt32(data[offset]) << 24 | UInt32(data[offset + 1]) << 16 |
+                    UInt32(data[offset + 2]) << 8 | UInt32(data[offset + 3])
         offset += 4
         print("🔍 [AMF0] Reading ECMA array with count: \(count)")
 
@@ -284,14 +371,28 @@ struct AMF0Parser {
     /// - Returns: The parsed array
     /// - Throws: ParseError if data is malformed
     mutating func readStrictArray() throws -> [Value] {
+        guard depth < Self.maxDepth else {
+            throw ParseError.maxDepthExceeded
+        }
+        depth += 1
+        defer { depth -= 1 }
+
         // Read 32-bit count
-        guard offset + 4 <= data.count else {
-            throw ParseError.insufficientData(need: 4, have: data.count - offset)
+        guard bytesRemaining >= 4 else {
+            throw ParseError.insufficientData(need: 4, have: bytesRemaining)
         }
 
-        let count = Int(data[offset]) << 24 | Int(data[offset + 1]) << 16 |
-                    Int(data[offset + 2]) << 8 | Int(data[offset + 3])
+        let countU32 = UInt32(data[offset]) << 24 | UInt32(data[offset + 1]) << 16 |
+                       UInt32(data[offset + 2]) << 8 | UInt32(data[offset + 3])
         offset += 4
+
+        // Each AMF0 element occupies at least 1 byte, so count cannot exceed bytesRemaining.
+        guard let count = Int(exactly: countU32), count >= 0, count <= bytesRemaining else {
+            throw ParseError.insufficientData(
+                need: Int(min(UInt64(countU32), UInt64(Int.max))),
+                have: bytesRemaining
+            )
+        }
 
         var values: [Value] = []
         values.reserveCapacity(count)
@@ -312,10 +413,16 @@ struct AMF0Parser {
     /// Skip an object without parsing property values
     /// - Throws: ParseError if data is insufficient
     mutating func skipObject() throws {
+        guard depth < Self.maxDepth else {
+            throw ParseError.maxDepthExceeded
+        }
+        depth += 1
+        defer { depth -= 1 }
+
         while true {
             // Check for object end marker
-            guard offset + 3 <= data.count else {
-                throw ParseError.insufficientData(need: 3, have: data.count - offset)
+            guard bytesRemaining >= 3 else {
+                throw ParseError.insufficientData(need: 3, have: bytesRemaining)
             }
 
             if data[offset] == 0x00 && data[offset + 1] == 0x00 && data[offset + 2] == 0x09 {
@@ -338,6 +445,13 @@ struct AMF0Parser {
     /// - Returns: Array of parsed values
     /// - Throws: ParseError if any value fails to parse
     mutating func readValues(count: Int) throws -> [Value] {
+        guard count >= 0 else {
+            throw ParseError.malformedData("Negative value count: \(count)")
+        }
+        guard count <= bytesRemaining else {
+            throw ParseError.insufficientData(need: count, have: bytesRemaining)
+        }
+
         var values: [Value] = []
         values.reserveCapacity(count)
 

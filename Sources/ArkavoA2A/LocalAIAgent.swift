@@ -30,6 +30,10 @@ public final class LocalAIAgent: NSObject, ObservableObject {
     private let writingTools: WritingToolsIntegration
     private let imagePlayground: ImagePlaygroundIntegration
     private var connections: [UUID: NWConnection] = [:]
+    private var partialMessages: [UUID: Data] = [:]
+
+    /// Maximum accumulated fragmented WebSocket message size (16 MiB)
+    private static let maxWebSocketMessageBytes = 16 * 1024 * 1024
 
     // Unique agent ID based on device
     private let agentId: String
@@ -101,27 +105,33 @@ public final class LocalAIAgent: NSObject, ObservableObject {
 
     /// Send a message and get response (in-process, no WebSocket)
     public func sendDirectMessage(sessionId: String, content: String) async throws -> String {
-        guard var session = inProcessSessions[sessionId] else {
+        guard inProcessSessions[sessionId] != nil else {
             throw LocalAIAgentError.sessionNotFound
         }
 
         print("[LocalAIAgent] Processing direct message in session: \(sessionId)")
 
-        // Add user message
+        // Mutate live session directly before awaiting to prevent actor-reentrancy message loss
         let userMessage = ChatMessage(role: "user", content: content)
-        session.messages.append(userMessage)
+        inProcessSessions[sessionId]?.messages.append(userMessage)
+
+        guard let sessionSnapshot = inProcessSessions[sessionId] else {
+            throw LocalAIAgentError.sessionNotFound
+        }
 
         // Generate response using Foundation Models
-        let response = try await generateResponse(for: content, session: session)
+        let response = try await generateResponse(for: content, session: sessionSnapshot)
 
         print("[LocalAIAgent] Generated response: \(response)")
 
-        // Add assistant message
-        let assistantMessage = ChatMessage(role: "assistant", content: response)
-        session.messages.append(assistantMessage)
+        // Re-verify session still exists after suspension so closed sessions are never resurrected
+        guard inProcessSessions[sessionId] != nil else {
+            throw LocalAIAgentError.sessionNotFound
+        }
 
-        // Update session
-        inProcessSessions[sessionId] = session
+        // Append assistant message directly to live session
+        let assistantMessage = ChatMessage(role: "assistant", content: response)
+        inProcessSessions[sessionId]?.messages.append(assistantMessage)
 
         print("[LocalAIAgent] Returning response of length: \(response.count)")
         return response
@@ -158,14 +168,23 @@ public final class LocalAIAgent: NSObject, ObservableObject {
                 locality: .local
             )
             let result = try await executeLocalToolCall(toolCall)
+            guard result.success else {
+                throw LocalAIAgentError.toolExecutionFailed(result.error ?? "Tool '\(name)' failed")
+            }
             return result.result?.value as? [String: Any] ?? [:]
         }
     }
 
     // MARK: - WebSocket Server (for cross-device A2A)
 
-    /// Start publishing the LocalAIAgent as an A2A service
-    public func startPublishing(port: UInt16 = 0) throws {
+    /// Start publishing the LocalAIAgent as an A2A service.
+    /// Defaults to loopback (`127.0.0.1`) to avoid exposing an unauthenticated LAN control service;
+    /// pass `allowLAN: true` (ideally with an `authToken`) to advertise over LAN/mDNS.
+    public func startPublishing(
+        port: UInt16 = 0,
+        allowLAN: Bool = false,
+        authToken: String? = nil
+    ) throws {
         guard !isPublishing else {
             print("[LocalAIAgent] Already publishing")
             return
@@ -173,15 +192,36 @@ public final class LocalAIAgent: NSObject, ObservableObject {
 
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
-        params.includePeerToPeer = true
+        params.includePeerToPeer = allowLAN
+
+        let nwPort: NWEndpoint.Port = port == 0 ? .any : NWEndpoint.Port(integerLiteral: port)
+        if !allowLAN {
+            params.requiredLocalEndpoint = NWEndpoint.hostPort(
+                host: NWEndpoint.Host("127.0.0.1"),
+                port: nwPort
+            )
+        }
 
         // Configure WebSocket options with client request handler
         // Without this handler, NWListener rejects URLSession WebSocket clients
         // with "client request doesn't match expected value" error
+        let expectedToken = authToken
         let options = NWProtocolWebSocket.Options()
         options.autoReplyPing = true
-        options.setClientRequestHandler(DispatchQueue.main) { subprotocols, _ in
-            // Accept all valid WebSocket upgrade requests
+        options.setClientRequestHandler(DispatchQueue.main) { subprotocols, headers in
+            if let expectedToken, !expectedToken.isEmpty {
+                let authHeader = headers.first {
+                    $0.name.caseInsensitiveCompare("Authorization") == .orderedSame
+                }?.value
+                guard authHeader == "Bearer \(expectedToken)" else {
+                    return NWProtocolWebSocket.Response(
+                        status: .reject,
+                        subprotocol: nil,
+                        additionalHeaders: nil
+                    )
+                }
+            }
+
             // Return the first requested subprotocol if any, otherwise accept with no subprotocol
             let selectedSubprotocol = subprotocols.first
             return NWProtocolWebSocket.Response(
@@ -192,13 +232,16 @@ public final class LocalAIAgent: NSObject, ObservableObject {
         }
         params.defaultProtocolStack.applicationProtocols.insert(options, at: 0)
 
-        listener = try NWListener(using: params, on: NWEndpoint.Port(integerLiteral: port))
-
-        listener?.service = NWListener.Service(
-            name: agentName,
-            type: "_a2a._tcp",
-            txtRecord: buildTxtRecord()
-        )
+        if allowLAN {
+            listener = try NWListener(using: params, on: nwPort)
+            listener?.service = NWListener.Service(
+                name: agentName,
+                type: "_a2a._tcp",
+                txtRecord: buildTxtRecord()
+            )
+        } else {
+            listener = try NWListener(using: params)
+        }
 
         listener?.stateUpdateHandler = { [weak self] state in
             Task { @MainActor [weak self] in
@@ -215,7 +258,7 @@ public final class LocalAIAgent: NSObject, ObservableObject {
         listener?.start(queue: .main)
         isPublishing = true
 
-        print("[LocalAIAgent] Started publishing on port \(port)")
+        print("[LocalAIAgent] Started publishing on port \(port) (allowLAN: \(allowLAN))")
     }
 
     /// Stop publishing the A2A service
@@ -227,6 +270,7 @@ public final class LocalAIAgent: NSObject, ObservableObject {
             connection.cancel()
         }
         connections.removeAll()
+        partialMessages.removeAll()
 
         isPublishing = false
         print("[LocalAIAgent] Stopped publishing")
@@ -286,12 +330,20 @@ public final class LocalAIAgent: NSObject, ObservableObject {
         case let .failed(error):
             print("[LocalAIAgent] Connection failed: \(connectionId), error: \(error)")
             connections.removeValue(forKey: connectionId)
+            partialMessages.removeValue(forKey: connectionId)
         case .cancelled:
             print("[LocalAIAgent] Connection cancelled: \(connectionId)")
             connections.removeValue(forKey: connectionId)
+            partialMessages.removeValue(forKey: connectionId)
         default:
             break
         }
+    }
+
+    private func cleanupConnection(_ connectionId: UUID, connection: NWConnection) {
+        connections.removeValue(forKey: connectionId)
+        partialMessages.removeValue(forKey: connectionId)
+        connection.cancel()
     }
 
     private func receiveMessage(from connection: NWConnection, connectionId: UUID) {
@@ -301,14 +353,60 @@ public final class LocalAIAgent: NSObject, ObservableObject {
 
                 if let error {
                     print("[LocalAIAgent] Receive error: \(error)")
+                    self.cleanupConnection(connectionId, connection: connection)
                     return
                 }
 
-                if let data = completeContent {
-                    await self.handleMessage(data, from: connection, connectionId: connectionId)
+                // Close cleanly on WebSocket close opcode
+                if let metadata = contentContext?.protocolMetadata(definition: NWProtocolWebSocket.definition) as? NWProtocolWebSocket.Metadata,
+                   metadata.opcode == .close {
+                    print("[LocalAIAgent] WebSocket close frame received: \(connectionId)")
+                    self.cleanupConnection(connectionId, connection: connection)
+                    return
                 }
 
-                if !isComplete {
+                // Close cleanly on EOF
+                if contentContext?.isFinal == true && (completeContent == nil || completeContent?.isEmpty == true) {
+                    print("[LocalAIAgent] Connection EOF: \(connectionId)")
+                    self.cleanupConnection(connectionId, connection: connection)
+                    return
+                }
+
+                if let data = completeContent, !data.isEmpty {
+                    if isComplete {
+                        let fullMessage: Data
+                        if var buffered = self.partialMessages.removeValue(forKey: connectionId) {
+                            guard buffered.count + data.count <= Self.maxWebSocketMessageBytes else {
+                                print("[LocalAIAgent] Message exceeded size limit on connection: \(connectionId)")
+                                self.cleanupConnection(connectionId, connection: connection)
+                                return
+                            }
+                            buffered.append(data)
+                            fullMessage = buffered
+                        } else {
+                            fullMessage = data
+                        }
+                        await self.handleMessage(fullMessage, from: connection, connectionId: connectionId)
+                    } else {
+                        var buffer = self.partialMessages[connectionId] ?? Data()
+                        guard buffer.count + data.count <= Self.maxWebSocketMessageBytes else {
+                            print("[LocalAIAgent] Fragmented message exceeded size limit on connection: \(connectionId)")
+                            self.cleanupConnection(connectionId, connection: connection)
+                            return
+                        }
+                        buffer.append(data)
+                        self.partialMessages[connectionId] = buffer
+                    }
+                } else if isComplete,
+                          let buffered = self.partialMessages.removeValue(forKey: connectionId),
+                          !buffered.isEmpty {
+                    await self.handleMessage(buffered, from: connection, connectionId: connectionId)
+                }
+
+                // Always schedule next read while connection remains open
+                if contentContext?.isFinal == true {
+                    self.cleanupConnection(connectionId, connection: connection)
+                } else if self.connections[connectionId] != nil {
                     self.receiveMessage(from: connection, connectionId: connectionId)
                 }
             }
@@ -316,14 +414,25 @@ public final class LocalAIAgent: NSObject, ObservableObject {
     }
 
     private func handleMessage(_ data: Data, from connection: NWConnection, connectionId: UUID) async {
+        var requestId: String?
         do {
             guard let jsonString = String(data: data, encoding: .utf8) else {
                 throw LocalAIAgentError.invalidMessageEncoding
             }
 
-            let request = try JSONDecoder().decode(AgentRequest.self, from: Data(jsonString.utf8))
+            let requestData = Data(jsonString.utf8)
+            if let rawJSON = try? JSONSerialization.jsonObject(with: requestData) as? [String: Any] {
+                if let idString = rawJSON["id"] as? String {
+                    requestId = idString
+                } else if let idInt = rawJSON["id"] as? Int {
+                    requestId = String(idInt)
+                }
+            }
 
-            print("[LocalAIAgent] Received request: \(request.method)")
+            let request = try JSONDecoder().decode(AgentRequest.self, from: requestData)
+            requestId = request.id
+
+            print("[LocalAIAgent] Received request: \(request.method) (connection: \(connectionId))")
 
             let response = try await processRequest(request)
 
@@ -332,7 +441,7 @@ public final class LocalAIAgent: NSObject, ObservableObject {
             print("[LocalAIAgent] Error handling message: \(error)")
 
             let errorResponse = AgentResponse.error(
-                id: UUID().uuidString,
+                id: requestId ?? UUID().uuidString,
                 code: -32603,
                 message: error.localizedDescription
             )
@@ -341,7 +450,7 @@ public final class LocalAIAgent: NSObject, ObservableObject {
         }
     }
 
-    private func processRequest(_ request: AgentRequest) async throws -> AgentResponse {
+    func processRequest(_ request: AgentRequest) async throws -> AgentResponse {
         switch request.method {
         case "sensor_request":
             return try await handleSensorRequest(request)
@@ -360,10 +469,11 @@ public final class LocalAIAgent: NSObject, ObservableObject {
         let sensorRequest = try decodeParams(SensorRequest.self, from: request.params)
 
         let sensorResponse = try await sensorBridge.requestSensorData(sensorRequest)
+        let encodedResult = try encodeToAnyCodable(sensorResponse)
 
         return AgentResponse.success(
             id: request.id,
-            result: AnyCodable(sensorResponse)
+            result: encodedResult
         )
     }
 
@@ -375,10 +485,11 @@ public final class LocalAIAgent: NSObject, ObservableObject {
         }
 
         let result = try await executeLocalToolCall(toolCall)
+        let encodedResult = try encodeToAnyCodable(result)
 
         return AgentResponse.success(
             id: request.id,
-            result: AnyCodable(result)
+            result: encodedResult
         )
     }
 
@@ -418,11 +529,20 @@ public final class LocalAIAgent: NSObject, ObservableObject {
             capabilities: capabilities,
             createdAt: Date()
         )
+        let encodedSession = try encodeToAnyCodable(session)
 
         return AgentResponse.success(
             id: request.id,
-            result: AnyCodable(session)
+            result: encodedSession
         )
+    }
+
+    /// Encode any `Encodable` value into a JSON-backed `AnyCodable` so structs never serialize as `null`
+    func encodeToAnyCodable<T: Encodable>(_ value: T) throws -> AnyCodable {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(value)
+        return try JSONDecoder().decode(AnyCodable.self, from: data)
     }
 
     private func sendResponse(_ response: AgentResponse, to connection: NWConnection) async throws {
@@ -430,15 +550,25 @@ public final class LocalAIAgent: NSObject, ObservableObject {
         encoder.dateEncodingStrategy = .iso8601
 
         let data = try encoder.encode(response)
+        let metadata = NWProtocolWebSocket.Metadata(opcode: .text)
+        let context = NWConnection.ContentContext(
+            identifier: "textMessage",
+            metadata: [metadata]
+        )
 
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            connection.send(content: data, completion: .contentProcessed { error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume()
+            connection.send(
+                content: data,
+                contentContext: context,
+                isComplete: true,
+                completion: .contentProcessed { error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                    } else {
+                        continuation.resume()
+                    }
                 }
-            })
+            )
         }
     }
 
@@ -624,18 +754,23 @@ public final class LocalAIAgent: NSObject, ObservableObject {
 
         let length = args["length"] as? String ?? "medium"
 
-        // Use Writing Tools if available
-        let toolCall = ToolCall(
-            toolCallId: UUID().uuidString,
-            name: "writing_tools_summarize",
-            args: AnyCodable(["text": text, "length": length]),
-            locality: .local
-        )
+        // Use Writing Tools if available; fall back gracefully when unavailable
+        if writingTools.isAvailable {
+            let toolCall = ToolCall(
+                toolCallId: UUID().uuidString,
+                name: "writing_tools_summarize",
+                args: AnyCodable(["text": text, "length": length]),
+                locality: .local
+            )
 
-        let result = try await writingTools.executeToolCall(toolCall)
-
-        if result.success, let summary = result.result?.value as? [String: Any] {
-            return summary
+            do {
+                let result = try await writingTools.executeToolCall(toolCall)
+                if result.success, let summary = result.result?.value as? [String: Any] {
+                    return summary
+                }
+            } catch WritingToolsError.notAvailable {
+                // Fall through to sentence extraction fallback
+            }
         }
 
         // Fallback: Simple sentence extraction
@@ -656,21 +791,33 @@ public final class LocalAIAgent: NSObject, ObservableObject {
             throw LocalAIAgentError.invalidArguments("Missing 'text' parameter")
         }
 
-        // Use Writing Tools
-        let toolCall = ToolCall(
-            toolCallId: UUID().uuidString,
-            name: "writing_tools_proofread",
-            args: AnyCodable(["text": text]),
-            locality: .local
-        )
+        // Use Writing Tools if available; fall back gracefully when unavailable
+        if writingTools.isAvailable {
+            let toolCall = ToolCall(
+                toolCallId: UUID().uuidString,
+                name: "writing_tools_proofread",
+                args: AnyCodable(["text": text]),
+                locality: .local
+            )
 
-        let result = try await writingTools.executeToolCall(toolCall)
-
-        if result.success, let proofread = result.result?.value as? [String: Any] {
-            return proofread
+            do {
+                let result = try await writingTools.executeToolCall(toolCall)
+                if result.success, var proofread = result.result?.value as? [String: Any] {
+                    // Ensure consistent key schema ("corrected_text" and "text")
+                    if proofread["corrected_text"] == nil, let textValue = proofread["text"] as? String {
+                        proofread["corrected_text"] = textValue
+                    }
+                    if proofread["text"] == nil, let correctedValue = proofread["corrected_text"] as? String {
+                        proofread["text"] = correctedValue
+                    }
+                    return proofread
+                }
+            } catch WritingToolsError.notAvailable {
+                // Fall through to passthrough fallback
+            }
         }
 
-        return ["corrected_text": text, "corrections": []]
+        return ["corrected_text": text, "text": text, "corrections": []]
     }
 }
 
@@ -699,6 +846,7 @@ public enum LocalAIAgentError: Error, LocalizedError {
     case unknownMethod(String)
     case remoteToolCallNotSupported
     case toolNotImplemented(String)
+    case toolExecutionFailed(String)
     case orchestratorRequired
     case notImplemented
     case sessionNotFound
@@ -714,6 +862,8 @@ public enum LocalAIAgentError: Error, LocalizedError {
             return "Remote tool calls must be sent to Orchestrator"
         case let .toolNotImplemented(name):
             return "Tool not yet implemented: \(name)"
+        case let .toolExecutionFailed(detail):
+            return "Tool execution failed: \(detail)"
         case .orchestratorRequired:
             return "Task offers must be sent to Orchestrator for planning"
         case .notImplemented:

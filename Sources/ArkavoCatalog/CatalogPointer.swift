@@ -21,8 +21,8 @@ public struct CatalogPointer: Sendable, Equatable {
     public static let schema1 = "arkavo.catalog-pointer/1"
     public static let maxBytes = 1_024
     public static let maxSeq: UInt64 = 9_007_199_254_740_991
-    private static let keys1: Set<String> = ["schema", "owner", "seq", "catalogHash", "catalogSize", "issuedAt"]
-    private static let keys: Set<String> = keys1.union(["indexHash"])
+    private static let keys1: Set<StrictJSON.Key> = ["schema", "owner", "seq", "catalogHash", "catalogSize", "issuedAt"]
+    private static let keys: Set<StrictJSON.Key> = keys1.union(["indexHash"])
 
     /// The signed bytes.
     public let bytes: Data

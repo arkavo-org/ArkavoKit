@@ -30,7 +30,7 @@ public final class ScreenAudioSource: NSObject, AudioSource, @unchecked Sendable
         AudioFormat(sampleRate: 48000.0, channels: 2, bitDepth: 16, formatID: kAudioFormatLinearPCM)
     }
 
-    /// Whether a capture is running. False while one is still opening, and as soon as it is
+    /// Whether a capture is running. False while one is still opening or stopping, and as soon as it is
     /// stopped or stops by itself.
     public var isActive: Bool {
         state.withLockUnchecked { state in
@@ -39,15 +39,25 @@ public final class ScreenAudioSource: NSObject, AudioSource, @unchecked Sendable
         }
     }
 
-    nonisolated(unsafe) public var onSample: ((CMSampleBuffer) -> Void)?
+    private let sampleHandler = OSAllocatedUnfairLock<((CMSampleBuffer) -> Void)?>(uncheckedState: nil)
+    public var onSample: ((CMSampleBuffer) -> Void)? {
+        get { sampleHandler.withLockUnchecked { $0 } }
+        set { sampleHandler.withLockUnchecked { $0 = newValue } }
+    }
 
     // MARK: - Properties
+
+    private enum StartStep {
+        case done
+        case open
+        case waitForStop
+    }
 
     /// A capture that is opening. Each capture has a token its own stop reports with.
     private struct Opening {
         let token: UUID
-        /// Starts made while it opens: they get its outcome (`false`: they don't open one).
-        var joiners: [CheckedContinuation<Bool, any Error>] = []
+        /// Starts made while it opens: they get its outcome (`.done`: they don't open one).
+        var joiners: [CheckedContinuation<StartStep, any Error>] = []
         /// A stop came after the last start: the capture is stopped as soon as it opens.
         var stopRequested = false
         /// Stops made while it opens, by id. Each returns once the opening has ended (after the
@@ -59,10 +69,18 @@ public final class ScreenAudioSource: NSObject, AudioSource, @unchecked Sendable
         var stoppedByItself = false
     }
 
+    /// A capture whose `stop()` is in flight. Keeps new starts from opening an overlapping
+    /// `SCStream` until the previous capture finishes stopping.
+    private struct Stopping {
+        var startWaiters: [CheckedContinuation<StartStep, any Error>] = []
+        var stopWaiters: [CheckedContinuation<Void, Never>] = []
+    }
+
     private enum State {
         case idle
         case opening(Opening)
         case running(capture: any ScreenAudioCapture, token: UUID)
+        case stopping(Stopping)
     }
 
     /// How an opening that produced a capture ended.
@@ -76,8 +94,8 @@ public final class ScreenAudioSource: NSObject, AudioSource, @unchecked Sendable
     }
 
     /// One state for the source's start, its stop and the capture stopping by itself, which come
-    /// from different threads. Holding the opening state here is what keeps two starts from
-    /// opening two captures, and a stop during a start from missing the capture it opens.
+    /// from different threads. Holding the opening/stopping state here is what keeps two starts
+    /// from opening overlapping captures, and a stop during a start from missing the capture it opens.
     private let state = OSAllocatedUnfairLock<State>(uncheckedState: .idle)
     private let openCapture: OpenScreenAudioCapture
 
@@ -119,24 +137,38 @@ public final class ScreenAudioSource: NSObject, AudioSource, @unchecked Sendable
     /// for any stop during an opening.
     public func start() async throws {
         let token = UUID()
-        let opens = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Bool, any Error>) in
-            let joined = state.withLockUnchecked { state -> Bool? in
-                switch state {
-                case .running:
-                    return false
-                case .idle:
-                    state = .opening(Opening(token: token))
-                    return true
-                case .opening(var opening):
-                    opening.stopRequested = false
-                    opening.joiners.append(continuation)
-                    state = .opening(opening)
-                    return nil
+        while true {
+            let step = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<StartStep, any Error>) in
+                let immediate = state.withLockUnchecked { state -> StartStep? in
+                    switch state {
+                    case .running:
+                        return .done
+                    case .idle:
+                        state = .opening(Opening(token: token))
+                        return .open
+                    case .opening(var opening):
+                        opening.stopRequested = false
+                        opening.joiners.append(continuation)
+                        state = .opening(opening)
+                        return nil
+                    case .stopping(var stopping):
+                        stopping.startWaiters.append(continuation)
+                        state = .stopping(stopping)
+                        return nil
+                    }
                 }
+                if let immediate { continuation.resume(returning: immediate) }
             }
-            if let joined { continuation.resume(returning: joined) }
+            switch step {
+            case .done:
+                return
+            case .waitForStop:
+                continue
+            case .open:
+                break
+            }
+            break
         }
-        guard opens else { return }
 
         let capture: any ScreenAudioCapture
         do {
@@ -155,32 +187,32 @@ public final class ScreenAudioSource: NSObject, AudioSource, @unchecked Sendable
         let (end, joiners, stops) = finishOpening(token, keeping: capture)
         switch end {
         case .kept:
-            for joiner in joiners { joiner.resume(returning: false) }
+            for joiner in joiners { joiner.resume(returning: .done) }
             for stop in stops { stop.resume() }   // a later start cancelled these stops
             print("🔊 ScreenAudioSource [\(sourceID)] started")
         case .stopped:
-            for joiner in joiners { joiner.resume(returning: false) }
+            for joiner in joiners { joiner.resume(returning: .done) }
             try? await capture.stop()
+            finishStopping()
             for stop in stops { stop.resume() }
             print("🔊 ScreenAudioSource [\(sourceID)] stopped as it started")
         case .stoppedByItself:
             for joiner in joiners { joiner.resume(throwing: RecorderError.screenCaptureUnavailable) }
             try? await capture.stop()
+            finishStopping()
             for stop in stops { stop.resume() }
             throw RecorderError.screenCaptureUnavailable
         }
     }
 
     /// Ends the opening of the capture with `token`: the source runs `capture` unless a stop
-    /// came meanwhile or it stopped by itself, and is idle otherwise; a stop wins over stopping by
-    /// itself. Returns how it ended, the starts that joined the opening and the stops waiting for
-    /// it; the caller resumes them all, outside the lock. For an open that failed (`capture` nil)
-    /// only the joiners and the stops count: the joiners get the open's error.
+    /// came meanwhile or it stopped by itself. When a produced capture must be stopped immediately,
+    /// transitions to `.stopping` until `capture.stop()` completes so no overlapping capture opens.
     private func finishOpening(
         _ token: UUID, keeping capture: (any ScreenAudioCapture)?
     ) -> (
         end: OpeningEnd,
-        joiners: [CheckedContinuation<Bool, any Error>],
+        joiners: [CheckedContinuation<StartStep, any Error>],
         stopWaiters: [CheckedContinuation<Void, Never>]
     ) {
         state.withLockUnchecked { state in
@@ -190,14 +222,30 @@ public final class ScreenAudioSource: NSObject, AudioSource, @unchecked Sendable
                 state = .running(capture: capture, token: token)
                 return (.kept, opening.joiners, stops)
             }
-            state = .idle
+            if capture != nil {
+                state = .stopping(Stopping())
+            } else {
+                state = .idle
+            }
             let end: OpeningEnd = opening.stoppedByItself && !opening.stopRequested ? .stoppedByItself : .stopped
             return (end, opening.joiners, stops)
         }
     }
 
-    /// Forgets the capture before stopping it: one that already stopped by itself throws here,
-    /// and the source must read as stopped either way, so the next start opens a fresh one.
+    /// Transitions `.stopping` back to `.idle` and resumes any starts/stops that waited on it.
+    private func finishStopping() {
+        let (starts, stops) = state.withLockUnchecked { state -> ([CheckedContinuation<StartStep, any Error>], [CheckedContinuation<Void, Never>]) in
+            guard case .stopping(let stopping) = state else { return ([], []) }
+            state = .idle
+            return (stopping.startWaiters, stopping.stopWaiters)
+        }
+        for waiter in starts { waiter.resume(returning: .waitForStop) }
+        for waiter in stops { waiter.resume() }
+    }
+
+    /// Transitions the capture to `.stopping` before stopping it: one that already stopped by itself
+    /// throws here, and the source always finishes in `.idle` either way so the next start opens a
+    /// fresh one without overlapping the outgoing stream.
     ///
     /// A capture still opening is stopped by its start as soon as it opens, and this returns once
     /// it has been, so a caller that awaits this gets no more audio from it. It also returns when
@@ -205,38 +253,75 @@ public final class ScreenAudioSource: NSObject, AudioSource, @unchecked Sendable
     /// It waits for the opening at most `openingStopWaitLimit`: past that it returns, and the
     /// start still stops the capture once it opens, which may deliver audio until then.
     public func stop() async throws {
-        var running: (any ScreenAudioCapture)?
-        var timeLimit: Task<Void, Never>?
+        enum StopAction {
+            case immediate
+            case waitOnOpening
+            case waitOnStopping
+        }
+
+        let runningBox = OSAllocatedUnfairLock<(any ScreenAudioCapture)?>(uncheckedState: nil)
+        let timeoutBox = OSAllocatedUnfairLock<(task: Task<Void, Never>?, cancelled: Bool)>(
+            initialState: (nil, false)
+        )
         let waiterID = UUID()
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            let waits = state.withLockUnchecked { state -> Bool in
+            let action = state.withLockUnchecked { state -> StopAction in
                 switch state {
                 case .idle:
-                    return false
+                    return .immediate
                 case .opening(var opening):
                     opening.stopRequested = true
                     opening.stopWaiters[waiterID] = continuation
                     state = .opening(opening)
-                    return true
+                    return .waitOnOpening
                 case .running(let capture, _):
-                    state = .idle
-                    running = capture
-                    return false
+                    state = .stopping(Stopping())
+                    runningBox.withLockUnchecked { $0 = capture }
+                    return .immediate
+                case .stopping(var stopping):
+                    stopping.stopWaiters.append(continuation)
+                    state = .stopping(stopping)
+                    return .waitOnStopping
                 }
             }
-            guard waits else { return continuation.resume() }
-            let limit = stopWaitLimit
-            timeLimit = Task { [weak self] in
-                try? await Task.sleep(for: limit)
-                guard !Task.isCancelled else { return }
-                self?.stopWaitTimedOut(waiterID)
+            switch action {
+            case .immediate:
+                continuation.resume()
+            case .waitOnStopping:
+                break
+            case .waitOnOpening:
+                let limit = stopWaitLimit
+                let task = Task { [weak self] in
+                    try? await Task.sleep(for: limit)
+                    guard !Task.isCancelled else { return }
+                    self?.stopWaitTimedOut(waiterID)
+                }
+                let alreadyCancelled = timeoutBox.withLock { box -> Bool in
+                    if box.cancelled { return true }
+                    box.task = task
+                    return false
+                }
+                if alreadyCancelled { task.cancel() }
             }
         }
-        // Resumed by the opening's end or by the time limit: the limit has nothing left to do.
-        timeLimit?.cancel()
-        guard let capture = running else { return }
+        // Resumed by the opening's end or by the time limit: cancel the timeout safely under lock.
+        let taskToCancel = timeoutBox.withLock { box -> Task<Void, Never>? in
+            box.cancelled = true
+            let task = box.task
+            box.task = nil
+            return task
+        }
+        taskToCancel?.cancel()
 
-        try await capture.stop()
+        guard let capture = runningBox.withLockUnchecked({ $0 }) else { return }
+
+        do {
+            try await capture.stop()
+        } catch {
+            finishStopping()
+            throw error
+        }
+        finishStopping()
 
         print("🔊 ScreenAudioSource [\(sourceID)] stopped")
     }
@@ -421,4 +506,3 @@ public final class ScreenAudioSource: AudioSource {
 }
 
 #endif
-

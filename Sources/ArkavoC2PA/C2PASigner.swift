@@ -5,7 +5,7 @@ import Foundation
 
 /// How to provide signing credentials
 public enum SigningMode: Sendable {
-    /// Auto-generate a self-signed certificate chain (dev/testing)
+    /// Reserved for self-signed certificate generation (not yet implemented; throws `missingSigningCertificate`)
     case selfSigned
     /// Explicit PEM-encoded certificate chain and private key
     case pemFiles(certPEM: String, keyPEM: String)
@@ -42,9 +42,12 @@ public actor C2PASigner {
         }
     }
 
-    public init(signingMode: SigningMode = .selfSigned) throws {
+    public init(signingMode: SigningMode) throws {
         switch signingMode {
         case .pemFiles(let certPEM, let keyPEM):
+            guard !certPEM.isEmpty, !keyPEM.isEmpty else {
+                throw SigningError.missingSigningCertificate
+            }
             self.certPEM = certPEM
             self.keyPEM = keyPEM
         case .selfSigned:
@@ -104,11 +107,12 @@ public actor C2PASigner {
         let (resultCode, resultPtr, errorPtr) = Self.callVerify(filePath: filePath)
 
         let errorMessage = consumeFFIString(errorPtr)
+        let resultJSON = consumeFFIString(resultPtr)
         guard resultCode == SUCCESS else {
             throw SigningError.sdkError(errorMessage ?? "unknown error")
         }
 
-        guard let resultJSON = consumeFFIString(resultPtr) else {
+        guard let resultJSON else {
             throw SigningError.sdkError("verify returned no result")
         }
 
@@ -152,12 +156,12 @@ public actor C2PASigner {
         let (resultCode, infoPtr, errorPtr) = Self.callInfo(filePath: filePath)
 
         let errorMessage = consumeFFIString(errorPtr)
+        let infoJSON = consumeFFIString(infoPtr)
         guard resultCode == SUCCESS else {
             throw SigningError.sdkError(errorMessage ?? "unknown error")
         }
 
-        let infoJSON = consumeFFIString(infoPtr) ?? ""
-        return C2PAInfo(rawOutput: infoJSON)
+        return C2PAInfo(rawOutput: infoJSON ?? "")
         #else
         throw SigningError.frameworkNotAvailable
         #endif

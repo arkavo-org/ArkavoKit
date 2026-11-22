@@ -13,16 +13,21 @@ public final class StoreKitManager: ObservableObject {
 
     // MARK: - Private Properties
 
-    private var transactionListener: Task<Void, Error>?
+    private var transactionListener: Task<Void, Never>?
+    private var initialEntitlementsTask: Task<Void, Never>?
 
     // MARK: - Initialization
 
     public init() {
         transactionListener = listenForTransactions()
+        initialEntitlementsTask = Task { [weak self] in
+            await self?.updatePurchasedProducts()
+        }
     }
 
     deinit {
         transactionListener?.cancel()
+        initialEntitlementsTask?.cancel()
     }
 
     // MARK: - Product Loading
@@ -35,11 +40,11 @@ public final class StoreKitManager: ObservableObject {
         do {
             let storeProducts = try await Product.products(for: ProductIdentifier.allProducts)
             products = storeProducts.sorted { $0.price < $1.price }
-            await updatePurchasedProducts()
         } catch {
             errorMessage = "Failed to load products: \(error.localizedDescription)"
         }
 
+        await updatePurchasedProducts()
         isLoadingProducts = false
     }
 
@@ -73,8 +78,8 @@ public final class StoreKitManager: ObservableObject {
         switch result {
         case let .success(verification):
             let transaction = try checkVerified(verification)
-            await transaction.finish()
             await updatePurchasedProducts()
+            await transaction.finish()
             return transaction
 
         case .userCancelled:
@@ -120,12 +125,14 @@ public final class StoreKitManager: ObservableObject {
 
     // MARK: - Private Methods
 
-    private func listenForTransactions() -> Task<Void, Error> {
-        Task.detached {
+    private func listenForTransactions() -> Task<Void, Never> {
+        Task.detached { [weak self] in
             for await result in Transaction.updates {
+                guard !Task.isCancelled else { break }
+                guard let self else { break }
                 if case let .verified(transaction) = result {
-                    await transaction.finish()
                     await self.updatePurchasedProducts()
+                    await transaction.finish()
                 }
             }
         }

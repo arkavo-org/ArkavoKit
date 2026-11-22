@@ -470,20 +470,11 @@ extension NTDFTestCLI {
 
         print("\n  Step 5: Performing KAS rewrap (simulating subscriber)...")
 
-        // Generate client ephemeral key pair
+        // Generate client ephemeral key pair (33-byte compressed P-256 public key for KAS)
         let clientPrivateKey = P256.KeyAgreement.PrivateKey()
         let clientKeyPair = EphemeralKeyPair(
             privateKey: clientPrivateKey.rawRepresentation,
             publicKey: clientPrivateKey.publicKey.compressedRepresentation,
-            curve: .secp256r1
-        )
-
-        // Convert to PEM for KAS
-        let clientPubUncompressed = clientPrivateKey.publicKey.x963Representation
-        let clientPubPEM = "-----BEGIN PUBLIC KEY-----\n\(clientPubUncompressed.base64EncodedString(options: [.lineLength64Characters, .endLineWithLineFeed]))-----END PUBLIC KEY-----"
-        let pemKeyPair = EphemeralKeyPair(
-            privateKey: clientKeyPair.privateKey,
-            publicKey: clientPubPEM.data(using: .utf8)!,
             curve: .secp256r1
         )
 
@@ -496,7 +487,7 @@ extension NTDFTestCLI {
         let (wrappedKey, sessionPublicKey) = try await kasClient.rewrapNanoTDF(
             header: headerBytes,
             parsedHeader: parsedHeader,
-            clientKeyPair: pemKeyPair
+            clientKeyPair: clientKeyPair
         )
         print("  KAS rewrap successful: wrapped key \(wrappedKey.count) bytes, session key \(sessionPublicKey.count) bytes")
 

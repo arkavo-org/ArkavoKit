@@ -110,6 +110,29 @@ struct CreatorCatalogTests {
         #expect(catalog.entries.map(\.contentID) == ["rec-a", "rec-c"])
     }
 
+    @Test func removeAndUpsertDropAllDuplicateContentIDs() {
+        var catalog = CreatorCatalog(owner: Self.owner, entries: [
+            Self.entry("rec-a", version: 1),
+            Self.entry("rec-a", version: 2, payload: "3"),
+            Self.entry("rec-b", payload: "5"),
+        ])
+        let removedFirst = catalog.remove(contentID: "rec-a")
+        #expect(removedFirst)
+        #expect(catalog.entries.map(\.contentID) == ["rec-b"])
+        let removedSecond = catalog.remove(contentID: "rec-a")
+        #expect(!removedSecond)
+
+        var duplicated = CreatorCatalog(owner: Self.owner, entries: [
+            Self.entry("rec-a", version: 1),
+            Self.entry("rec-a", version: 2, payload: "3"),
+            Self.entry("rec-b", payload: "5"),
+        ])
+        duplicated.upsert(Self.entry("rec-a", version: 3, payload: "7"))
+        #expect(duplicated.entries.map(\.contentID) == ["rec-a", "rec-b"])
+        #expect(duplicated.entry(contentID: "rec-a")?.version == 3)
+        #expect(throws: Never.self) { _ = try duplicated.encoded() }
+    }
+
     // MARK: Decoding errors
 
     @Test func decodingNamesWhatIsWrong() {

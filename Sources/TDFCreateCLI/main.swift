@@ -2,9 +2,11 @@ import ArkavoMediaKit
 import ArkavoSocial
 import CryptoKit
 import Darwin
+import Dispatch
 import Foundation
 import IrohSwift
 import OpenTDFKit
+import os
 
 /// TDF Create CLI - Creates TDF-protected content and publishes to Iroh
 ///
@@ -257,14 +259,26 @@ struct TDFCreateCLI {
                 print("\nServing content... Press Ctrl+C to stop.")
                 print("Node is available via relay for remote downloads.")
 
-                // Keep running until interrupted using async sleep
-                signal(SIGINT) { _ in
-                    print("\nShutting down...")
-                    exit(0)
+                // Wait for SIGINT via DispatchSource instead of calling non-async-signal-safe APIs in signal()
+                signal(SIGINT, SIG_IGN)
+                let signalSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+                let resumed = OSAllocatedUnfairLock(initialState: false)
+                await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                    signalSource.setEventHandler {
+                        let shouldResume = resumed.withLock { already in
+                            guard !already else { return false }
+                            already = true
+                            return true
+                        }
+                        if shouldResume {
+                            continuation.resume()
+                        }
+                    }
+                    signalSource.resume()
                 }
-                while true {
-                    try await Task.sleep(for: .seconds(60))
-                }
+                signalSource.cancel()
+                print("\nShutting down...")
+                try await node.close()
             } else {
                 try await node.close()
             }
@@ -330,8 +344,28 @@ struct TDFCreateCLI {
 
     /// Fetch KAS RSA public key for key wrapping
     static func fetchKASRSAPublicKey(kasURL: URL) async throws -> String {
-        var components = URLComponents(url: kasURL, resolvingAgainstBaseURL: true)!
-        components.path = "/kas/v2/kas_public_key"
+        guard var components = URLComponents(url: kasURL, resolvingAgainstBaseURL: true),
+              let scheme = components.scheme?.lowercased(),
+              let host = components.host?.lowercased(), !host.isEmpty
+        else {
+            throw CLIError.invalidArgument("Invalid KAS URL: \(kasURL.absoluteString)")
+        }
+        let isLoopback = host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]"
+        guard scheme == "https" || (scheme == "http" && isLoopback) else {
+            throw CLIError.invalidArgument(
+                "KAS URL must use https (or http for localhost/loopback): \(kasURL.absoluteString)"
+            )
+        }
+
+        var basePath = components.path
+        while basePath.hasSuffix("/") {
+            basePath.removeLast()
+        }
+        if basePath.hasSuffix("/kas") {
+            components.path = basePath + "/v2/kas_public_key"
+        } else {
+            components.path = basePath + "/kas/v2/kas_public_key"
+        }
         components.queryItems = [URLQueryItem(name: "algorithm", value: "rsa")]
 
         guard let url = components.url else {

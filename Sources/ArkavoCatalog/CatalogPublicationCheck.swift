@@ -14,7 +14,17 @@ public struct CatalogTDFManifest: Sendable, Equatable, CustomStringConvertible, 
         return id
     }
     public let kasURLs: Set<String>
-    let policy: [String: StrictJSON]
+    let kasURLBytes: Set<[UInt8]>
+    let policy: [StrictJSON.Key: StrictJSON]
+
+    public static func == (lhs: CatalogTDFManifest, rhs: CatalogTDFManifest) -> Bool {
+        let sameMime: Bool = switch (lhs.mimeType, rhs.mimeType) {
+        case (nil, nil): true
+        case (let a?, let b?): a.utf8.elementsEqual(b.utf8)
+        default: false
+        }
+        return sameMime && lhs.kasURLBytes == rhs.kasURLBytes && lhs.policy == rhs.policy
+    }
 
     /// The manifest of a ZTDF archive, read with OpenTDFKit's `TDFArchiveReader` (`manifest.json`, or the legacy
     /// `0.manifest.json`), as `init?(manifestJSON:)` reads it. Nil when the archive or its manifest can't be read.
@@ -33,13 +43,16 @@ public struct CatalogTDFManifest: Sendable, Equatable, CustomStringConvertible, 
               let policy = StrictJSON.parse(decoded)?.object,
               let keyAccess = information["keyAccess"]?.array else { return nil }
         var kasURLs = Set<String>()
+        var kasURLBytes = Set<[UInt8]>()
         for object in keyAccess {
             guard let url = object.object?["url"]?.string else { return nil }
             kasURLs.insert(url)
+            kasURLBytes.insert(Array(url.utf8))
         }
         self.mimeType = manifest["payload"]?.object?["mimeType"]?.string
         self.policy = policy
         self.kasURLs = kasURLs
+        self.kasURLBytes = kasURLBytes
     }
 
     public var description: String { "TDF manifest" }
@@ -48,7 +61,7 @@ public struct CatalogTDFManifest: Sendable, Equatable, CustomStringConvertible, 
 
     /// `body.<key>` as a list, as the node reads it: absent, `null` or a `body` that is not an object give an empty list;
     /// any other value that is not an array gives nil, which matches nothing.
-    func list(_ key: String) -> [StrictJSON]? {
+    func list(_ key: StrictJSON.Key) -> [StrictJSON]? {
         guard let body = policy["body"]?.object else { return [] }
         switch body[key] {
         case nil, .null?: return []
@@ -126,7 +139,7 @@ public enum CatalogPublicationCheck {
         } catch {
             throw .envelope(error)
         }
-        var policyIDs: [String: Int] = [:]
+        var policyIDs: [[UInt8]: Int] = [:]
         for (index, entry) in catalog.entries.enumerated() {
             guard let recordingJSON = recordings[entry.payloadHash] else { throw .missingManifest(index) }
             guard let recording = CatalogTDFManifest(manifestJSON: recordingJSON),
@@ -138,9 +151,10 @@ public enum CatalogPublicationCheck {
             }
             // check(metadata:recording:) passed, so the policy id is a non-empty string.
             guard let id = metadata.policyID else { throw .metadata(index, .noPolicyID) }
-            if let first = policyIDs[id] { throw .duplicatePolicyID(index, first: first) }
+            let idBytes = Array(id.utf8)
+            if let first = policyIDs[idBytes] { throw .duplicatePolicyID(index, first: first) }
             if id.utf8.elementsEqual((envelope.policyID ?? "").utf8) { throw .reusesEnvelopePolicyID(index) }
-            policyIDs[id] = index
+            policyIDs[idBytes] = index
             guard recording.list("dataAttributes")?.contains(where: {
                 $0.object?["attribute"]?.string?.utf8.elementsEqual(attribute.utf8) == true
             }) == true else { throw .lacksCatalogAttribute(index) }
@@ -174,7 +188,7 @@ public enum CatalogPublicationCheck {
         guard let mimeType = metadata.mimeType, mimeType.utf8.elementsEqual(CatalogEntryMetadata.mimeType.utf8) else {
             throw .notCatalogMetadata
         }
-        guard metadata.kasURLs == recording.kasURLs,
+        guard metadata.kasURLBytes == recording.kasURLBytes,
               sameSet(metadata.list("dataAttributes"), recording.list("dataAttributes")),
               sameSet(metadata.list("dissem"), recording.list("dissem")) else { throw .policyMismatch }
         if let recordingID = recording.policyID, recordingID.utf8.elementsEqual(id.utf8) {

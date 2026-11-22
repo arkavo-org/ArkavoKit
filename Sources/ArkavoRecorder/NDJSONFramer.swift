@@ -8,7 +8,9 @@ struct NDJSONFramer {
 
     let maxMessageSize: Int
     private var buffer = Data()
-    /// Bytes at the start of `buffer` already searched for a newline
+    /// Byte offset from `buffer.startIndex` to the start of the next unread message
+    private var readOffset = 0
+    /// Bytes from `readOffset` already searched for a newline
     private var searched = 0
 
     init(maxMessageSize: Int) {
@@ -19,15 +21,36 @@ struct NDJSONFramer {
     mutating func append(_ data: Data) throws -> [Data] {
         buffer.append(data)
         var messages: [Data] = []
-        while let newline = buffer[(buffer.startIndex + searched)...].firstIndex(of: 0x0A) {
-            let message = buffer[buffer.startIndex..<newline]
-            guard message.count <= maxMessageSize else { throw MessageTooLarge() }
-            messages.append(Data(message))
-            buffer.removeSubrange(buffer.startIndex...newline)
+        let base = buffer.startIndex
+        while let newline = buffer[(base + readOffset + searched)...].firstIndex(of: 0x0A) {
+            let messageStart = base + readOffset
+            let messageLength = newline - messageStart
+            guard messageLength <= maxMessageSize else {
+                compact()
+                throw MessageTooLarge()
+            }
+            messages.append(Data(buffer[messageStart..<newline]))
+            readOffset = (newline - base) + 1
             searched = 0
         }
-        guard buffer.count <= maxMessageSize else { throw MessageTooLarge() }
-        searched = buffer.count
+        let remaining = buffer.count - readOffset
+        guard remaining <= maxMessageSize else {
+            compact()
+            throw MessageTooLarge()
+        }
+        searched = remaining
+        compact()
         return messages
+    }
+
+    /// Compacts consumed prefix bytes once per `append` call so framing stays O(N).
+    private mutating func compact() {
+        guard readOffset > 0 else { return }
+        if readOffset >= buffer.count {
+            buffer.removeAll(keepingCapacity: buffer.count <= maxMessageSize)
+        } else {
+            buffer.removeSubrange(buffer.startIndex..<(buffer.startIndex + readOffset))
+        }
+        readOffset = 0
     }
 }

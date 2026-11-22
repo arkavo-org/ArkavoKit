@@ -21,8 +21,8 @@ public enum CatalogBundleError: Error, Sendable, Equatable {
 public struct CatalogBundle: Sendable, Equatable, CustomStringConvertible, CustomDebugStringConvertible,
     CustomReflectable {
     public static let maxBytes = 32_768
-    private static let topKeys: Set<String> = ["pointer", "assertion", "credential"]
-    private static let assertionKeys: Set<String> = ["credentialId", "authenticatorData", "clientDataJSON", "signature"]
+    private static let topKeys: Set<StrictJSON.Key> = ["pointer", "assertion", "credential"]
+    private static let assertionKeys: Set<StrictJSON.Key> = ["credentialId", "authenticatorData", "clientDataJSON", "signature"]
     private static let pointerSizes = 1...CatalogPointer.maxBytes
     private static let credentialIDSizes = 1...1_023
     private static let authenticatorDataSizes = 1...4_096

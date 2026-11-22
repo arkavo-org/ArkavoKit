@@ -22,6 +22,46 @@ public struct FLVMuxer: Sendable {
         return header
     }
 
+    // MARK: - Helpers
+
+    /// Safely copies all bytes from a `CMBlockBuffer`, handling non-contiguous buffers.
+    private static func copyBlockBufferData(_ dataBuffer: CMBlockBuffer) throws -> Data {
+        let length = CMBlockBufferGetDataLength(dataBuffer)
+        guard length > 0 else {
+            return Data()
+        }
+        var data = Data(count: length)
+        let status = data.withUnsafeMutableBytes { raw -> OSStatus in
+            guard let base = raw.baseAddress else {
+                return kCMBlockBufferBadPointerParameterErr
+            }
+            return CMBlockBufferCopyDataBytes(dataBuffer, atOffset: 0, dataLength: length, destination: base)
+        }
+        guard status == kCMBlockBufferNoErr else {
+            throw FLVError.bufferAccessFailed
+        }
+        return data
+    }
+
+    /// Safely converts a `CMTime` to FLV timestamp milliseconds without trapping on
+    /// invalid, NaN, infinite, negative, or out-of-range values.
+    static func timestampMilliseconds(from timestamp: CMTime) -> UInt32 {
+        guard timestamp.isNumeric else { return 0 }
+        let seconds = timestamp.seconds
+        guard seconds.isFinite, seconds >= 0 else { return 0 }
+        let ms = seconds * 1000.0
+        guard ms.isFinite else { return 0 }
+        if ms >= Double(UInt32.max) {
+            return UInt32.max
+        }
+        return UInt32(ms)
+    }
+
+    private static func avcLengthSizeMinusOneByte(from nalUnitHeaderLength: Int32) -> UInt8 {
+        let validLength = (1...4).contains(nalUnitHeaderLength) ? nalUnitHeaderLength : 4
+        return 0xFC | UInt8((validLength - 1) & 0x03)
+    }
+
     // MARK: - Video Tags
 
     public enum VideoFrameType: UInt8 {
@@ -45,26 +85,12 @@ public struct FLVMuxer: Sendable {
         sampleBuffer: CMSampleBuffer,
         isKeyframe: Bool
     ) throws -> Data {
-        // Extract H.264 data from sample buffer
+        // Extract H.264 data from sample buffer (safe for non-contiguous CMBlockBuffers)
         guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else {
             throw FLVError.invalidSampleBuffer
         }
 
-        var length: Int = 0
-        var dataPointer: UnsafeMutablePointer<Int8>?
-        let status = CMBlockBufferGetDataPointer(
-            dataBuffer,
-            atOffset: 0,
-            lengthAtOffsetOut: nil,
-            totalLengthOut: &length,
-            dataPointerOut: &dataPointer
-        )
-
-        guard status == kCMBlockBufferNoErr, let pointer = dataPointer else {
-            throw FLVError.bufferAccessFailed
-        }
-
-        let nalData = Data(bytes: pointer, count: length)
+        let nalData = try copyBlockBufferData(dataBuffer)
 
         // Create video data (FLV video tag payload)
         var videoData = Data()
@@ -95,7 +121,7 @@ public struct FLVMuxer: Sendable {
         let videoData = try createVideoPayload(sampleBuffer: sampleBuffer, isKeyframe: isKeyframe)
 
         // Create FLV tag
-        let timestampMs = UInt32(timestamp.seconds * 1000)
+        let timestampMs = timestampMilliseconds(from: timestamp)
         return createTag(
             type: .video,
             data: videoData,
@@ -109,7 +135,7 @@ public struct FLVMuxer: Sendable {
     ) throws -> Data {
         // Extract SPS and PPS from format description
         var parameterSetCount: Int = 0
-        var nalUnitHeaderLength: Int32 = 0
+        var nalUnitHeaderLength: Int32 = 4
         var parameterSetPointer: UnsafePointer<UInt8>?
         var parameterSetSize: Int = 0
 
@@ -122,36 +148,12 @@ public struct FLVMuxer: Sendable {
             nalUnitHeaderLengthOut: &nalUnitHeaderLength
         )
 
-        guard status == noErr else {
+        guard status == noErr,
+              parameterSetCount >= 2,
+              let sps = parameterSetPointer,
+              parameterSetSize >= 4,
+              parameterSetSize <= Int(UInt16.max) else {
             throw FLVError.formatDescriptionFailed
-        }
-
-        // Build AVC decoder configuration record (AVCDecoderConfigurationRecord)
-        var avcC = Data()
-
-        avcC.append(0x01)  // configurationVersion
-
-        // Extract profile, compatibility, and level from SPS (first 3 bytes after NAL header)
-        if let sps = parameterSetPointer, parameterSetSize >= 4 {
-            // SPS format: [NAL header] [profile] [compatibility] [level] ...
-            avcC.append(sps[1])  // AVCProfileIndication (from SPS)
-            avcC.append(sps[2])  // profile_compatibility (from SPS)
-            avcC.append(sps[3])  // AVCLevelIndication (from SPS)
-        } else {
-            // Fallback to Main Profile 4.1 if we can't read SPS
-            avcC.append(0x4D)  // AVCProfileIndication (Main = 77 = 0x4D)
-            avcC.append(0x00)  // profile_compatibility
-            avcC.append(0x29)  // AVCLevelIndication (4.1 = 41 = 0x29)
-        }
-
-        avcC.append(0xFF)  // lengthSizeMinusOne (4 bytes)
-
-        // SPS
-        avcC.append(0xE1)  // numOfSequenceParameterSets (1)
-        if let sps = parameterSetPointer {
-            let spsSize = UInt16(parameterSetSize)
-            avcC.append(contentsOf: spsSize.bigEndianBytes)
-            avcC.append(contentsOf: UnsafeBufferPointer(start: sps, count: parameterSetSize))
         }
 
         // PPS
@@ -166,10 +168,29 @@ public struct FLVMuxer: Sendable {
             nalUnitHeaderLengthOut: nil
         )
 
-        guard ppsStatus == noErr, let pps = ppsPointer else {
+        guard ppsStatus == noErr,
+              let pps = ppsPointer,
+              ppsSize > 0,
+              ppsSize <= Int(UInt16.max) else {
             throw FLVError.formatDescriptionFailed
         }
 
+        // Build AVC decoder configuration record (AVCDecoderConfigurationRecord)
+        var avcC = Data()
+
+        avcC.append(0x01)   // configurationVersion
+        avcC.append(sps[1]) // AVCProfileIndication (from SPS)
+        avcC.append(sps[2]) // profile_compatibility (from SPS)
+        avcC.append(sps[3]) // AVCLevelIndication (from SPS)
+        avcC.append(avcLengthSizeMinusOneByte(from: nalUnitHeaderLength))
+
+        // SPS
+        avcC.append(0xE1)  // numOfSequenceParameterSets (1)
+        let spsSizeU16 = UInt16(parameterSetSize)
+        avcC.append(contentsOf: spsSizeU16.bigEndianBytes)
+        avcC.append(contentsOf: UnsafeBufferPointer(start: sps, count: parameterSetSize))
+
+        // PPS
         avcC.append(0x01)  // numOfPictureParameterSets (1)
         let ppsLength = UInt16(ppsSize)
         avcC.append(contentsOf: ppsLength.bigEndianBytes)
@@ -192,7 +213,7 @@ public struct FLVMuxer: Sendable {
     ) throws -> Data {
         let videoData = try createVideoSequenceHeaderPayload(formatDescription: formatDescription)
 
-        let timestampMs = UInt32(timestamp.seconds * 1000)
+        let timestampMs = timestampMilliseconds(from: timestamp)
         return createTag(
             type: .video,
             data: videoData,
@@ -225,26 +246,12 @@ public struct FLVMuxer: Sendable {
     public static func createAudioPayload(
         sampleBuffer: CMSampleBuffer
     ) throws -> Data {
-        // Extract AAC data
+        // Extract AAC data (safe for non-contiguous CMBlockBuffers)
         guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else {
             throw FLVError.invalidSampleBuffer
         }
 
-        var length: Int = 0
-        var dataPointer: UnsafeMutablePointer<Int8>?
-        let status = CMBlockBufferGetDataPointer(
-            dataBuffer,
-            atOffset: 0,
-            lengthAtOffsetOut: nil,
-            totalLengthOut: &length,
-            dataPointerOut: &dataPointer
-        )
-
-        guard status == kCMBlockBufferNoErr, let pointer = dataPointer else {
-            throw FLVError.bufferAccessFailed
-        }
-
-        let aacData = Data(bytes: pointer, count: length)
+        let aacData = try copyBlockBufferData(dataBuffer)
 
         // Create audio data
         var audioData = Data()
@@ -275,7 +282,7 @@ public struct FLVMuxer: Sendable {
     ) throws -> Data {
         let audioData = try createAudioPayload(sampleBuffer: sampleBuffer)
 
-        let timestampMs = UInt32(timestamp.seconds * 1000)
+        let timestampMs = timestampMilliseconds(from: timestamp)
         return createTag(
             type: .audio,
             data: audioData,
@@ -290,8 +297,15 @@ public struct FLVMuxer: Sendable {
         channels: UInt32
     ) -> Data {
         // Map sample rate to index per ISO 14496-3 Table 1.18
+        let roundedSampleRate: Int
+        if sampleRate.isFinite && sampleRate > 0 && sampleRate <= Double(Int.max) {
+            roundedSampleRate = Int(sampleRate)
+        } else {
+            roundedSampleRate = 48000
+        }
+
         let sampleRateIndex: UInt8
-        switch Int(sampleRate) {
+        switch roundedSampleRate {
         case 96000: sampleRateIndex = 0
         case 88200: sampleRateIndex = 1
         case 64000: sampleRateIndex = 2
@@ -444,7 +458,7 @@ public struct FLVMuxer: Sendable {
     ) -> Data {
         let audioData = createAudioSequenceHeaderPayload(formatDescription: formatDescription)
 
-        let timestampMs = UInt32(timestamp.seconds * 1000)
+        let timestampMs = timestampMilliseconds(from: timestamp)
         return createTag(
             type: .audio,
             data: audioData,
@@ -468,7 +482,7 @@ public struct FLVMuxer: Sendable {
         tag.append(type.rawValue)
 
         // Data size (3 bytes, big endian)
-        let dataSize = UInt32(data.count)
+        let dataSize = UInt32(clamping: data.count)
         tag.append(UInt8((dataSize >> 16) & 0xFF))
         tag.append(UInt8((dataSize >> 8) & 0xFF))
         tag.append(UInt8(dataSize & 0xFF))
@@ -486,7 +500,7 @@ public struct FLVMuxer: Sendable {
         tag.append(data)
 
         // Previous tag size (4 bytes)
-        let previousTagSize = UInt32(tag.count)
+        let previousTagSize = UInt32(clamping: tag.count)
         tag.append(contentsOf: previousTagSize.bigEndianBytes)
 
         return tag
@@ -514,43 +528,38 @@ public struct FLVMuxer: Sendable {
         // Format: @setDataFrame string + onMetaData string + ECMA array with properties
         var metadata = Data()
 
-        // String marker (0x02) + length + "@setDataFrame"
-        let setDataFrame = "@setDataFrame"
-        metadata.append(0x02)  // AMF0 String marker
-        metadata.append(contentsOf: UInt16(setDataFrame.count).bigEndianBytes)
-        metadata.append(setDataFrame.data(using: .utf8)!)
+        // String marker (0x02) + UTF-8 byte length + "@setDataFrame"
+        metadata.append(AMF0.encodeString("@setDataFrame"))
 
-        // String marker (0x02) + length + "onMetaData"
-        let onMetaData = "onMetaData"
-        metadata.append(0x02)  // AMF0 String marker
-        metadata.append(contentsOf: UInt16(onMetaData.count).bigEndianBytes)
-        metadata.append(onMetaData.data(using: .utf8)!)
+        // String marker (0x02) + UTF-8 byte length + "onMetaData"
+        metadata.append(AMF0.encodeString("onMetaData"))
 
         // ECMA Array marker (0x08) + approximate count
         let basePropertyCount: UInt32 = 11  // 10 standard + encoder
-        let customFieldCount = UInt32(customFields?.count ?? 0)
+        let customFieldCount = UInt32(clamping: customFields?.count ?? 0)
         metadata.append(0x08)  // AMF0 ECMA Array marker
-        metadata.append(contentsOf: (basePropertyCount + customFieldCount).bigEndianBytes)  // Property count
+        metadata.append(contentsOf: (basePropertyCount &+ customFieldCount).bigEndianBytes)  // Property count
 
-        // Helper to add property (name + value)
+        // Helpers using UTF-8 byte lengths (not String.count)
+        func appendPropertyName(_ name: String) {
+            let keyBytes = AMF0.truncateUTF8(name, maxBytes: Int(UInt16.max))
+            metadata.append(contentsOf: UInt16(keyBytes.count).bigEndianBytes)
+            metadata.append(keyBytes)
+        }
+
         func addNumberProperty(name: String, value: Double) {
-            metadata.append(contentsOf: UInt16(name.count).bigEndianBytes)
-            metadata.append(name.data(using: .utf8)!)
+            appendPropertyName(name)
             metadata.append(0x00)  // AMF0 Number marker
             metadata.append(contentsOf: value.bitPattern.bigEndianBytes)
         }
 
         func addStringProperty(name: String, value: String) {
-            metadata.append(contentsOf: UInt16(name.count).bigEndianBytes)
-            metadata.append(name.data(using: .utf8)!)
-            metadata.append(0x02)  // AMF0 String marker
-            metadata.append(contentsOf: UInt16(value.count).bigEndianBytes)
-            metadata.append(value.data(using: .utf8)!)
+            appendPropertyName(name)
+            metadata.append(AMF0.encodeString(value))
         }
 
         func addBooleanProperty(name: String, value: Bool) {
-            metadata.append(contentsOf: UInt16(name.count).bigEndianBytes)
-            metadata.append(name.data(using: .utf8)!)
+            appendPropertyName(name)
             metadata.append(0x01)  // AMF0 Boolean marker
             metadata.append(value ? 0x01 : 0x00)
         }
@@ -624,86 +633,9 @@ public struct FLVMuxer: Sendable {
 
     /// Create video sequence header from format description
     public static func createVideoSequenceHeader(from formatDesc: CMVideoFormatDescription) throws -> Data {
-        var payload = Data()
-
-        // Frame type and codec ID
-        let frameType: UInt8 = 0x10  // Keyframe
-        let codecID: UInt8 = 0x07    // AVC (H.264)
-        payload.append(frameType | codecID)
-
-        // AVC packet type: 0 = sequence header
-        payload.append(0x00)
-
-        // Composition time: 0
-        payload.append(contentsOf: [0x00, 0x00, 0x00])
-
-        // Extract SPS/PPS from format description and create AVCDecoderConfigurationRecord
-        var parameterSetCount: Int = 0
-        CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-            formatDesc,
-            parameterSetIndex: 0,
-            parameterSetPointerOut: nil,
-            parameterSetSizeOut: nil,
-            parameterSetCountOut: &parameterSetCount,
-            nalUnitHeaderLengthOut: nil
-        )
-
-        guard parameterSetCount >= 2 else {
-            throw FLVError.formatDescriptionFailed
-        }
-
-        // Get SPS
-        var spsPointer: UnsafePointer<UInt8>?
-        var spsSize: Int = 0
-        CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-            formatDesc,
-            parameterSetIndex: 0,
-            parameterSetPointerOut: &spsPointer,
-            parameterSetSizeOut: &spsSize,
-            parameterSetCountOut: nil,
-            nalUnitHeaderLengthOut: nil
-        )
-
-        guard let sps = spsPointer else {
-            throw FLVError.formatDescriptionFailed
-        }
-
-        // Get PPS
-        var ppsPointer: UnsafePointer<UInt8>?
-        var ppsSize: Int = 0
-        CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-            formatDesc,
-            parameterSetIndex: 1,
-            parameterSetPointerOut: &ppsPointer,
-            parameterSetSizeOut: &ppsSize,
-            parameterSetCountOut: nil,
-            nalUnitHeaderLengthOut: nil
-        )
-
-        guard let pps = ppsPointer else {
-            throw FLVError.formatDescriptionFailed
-        }
-
-        // Build AVCDecoderConfigurationRecord
-        payload.append(0x01)  // configurationVersion
-        payload.append(sps[1])  // AVCProfileIndication
-        payload.append(sps[2])  // profile_compatibility
-        payload.append(sps[3])  // AVCLevelIndication
-        payload.append(0xFF)  // lengthSizeMinusOne (4 bytes)
-
-        // SPS
-        payload.append(0xE1)  // numOfSequenceParameterSets (1)
-        payload.append(UInt8((spsSize >> 8) & 0xFF))
-        payload.append(UInt8(spsSize & 0xFF))
-        payload.append(Data(bytes: sps, count: spsSize))
-
-        // PPS
-        payload.append(0x01)  // numOfPictureParameterSets (1)
-        payload.append(UInt8((ppsSize >> 8) & 0xFF))
-        payload.append(UInt8(ppsSize & 0xFF))
-        payload.append(Data(bytes: pps, count: ppsSize))
-
-        return payload
+        // Delegate to the validated AVCDecoderConfigurationRecord builder so both paths
+        // check OSStatus, spsSize >= 4, and honor actual nalUnitHeaderLength.
+        try createVideoSequenceHeaderPayload(formatDescription: formatDesc)
     }
 
     /// Create audio sequence header from AudioSpecificConfig

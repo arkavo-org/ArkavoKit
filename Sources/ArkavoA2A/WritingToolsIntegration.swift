@@ -20,10 +20,6 @@ public final class WritingToolsIntegration: ObservableObject {
     @Published public private(set) var isAvailable: Bool = false
     @Published public private(set) var lastError: String?
 
-    #if canImport(FoundationModels)
-    private var session: Any? // Stores LanguageModelSession, but using Any to avoid @available requirement
-    #endif
-
     public init() {
         checkAvailability()
     }
@@ -36,7 +32,6 @@ public final class WritingToolsIntegration: ObservableObject {
                 // Check Foundation Models availability (powers Writing Tools features)
                 if case .available = SystemLanguageModel.default.availability {
                     isAvailable = true
-                    session = LanguageModelSession()
                 } else {
                     isAvailable = false
                 }
@@ -88,6 +83,7 @@ public final class WritingToolsIntegration: ObservableObject {
                 success: true,
                 result: AnyCodable([
                     "text": proofreadText.correctedText,
+                    "corrected_text": proofreadText.correctedText,
                     "corrections": proofreadText.corrections,
                 ])
             )
@@ -165,9 +161,7 @@ public final class WritingToolsIntegration: ObservableObject {
         #if canImport(FoundationModels)
         #if os(iOS)
             if #available(iOS 26.0, *) {
-                guard let session = session as? LanguageModelSession else {
-                    throw WritingToolsError.notAvailable
-                }
+                let session = LanguageModelSession()
 
                 let prompt = """
                 Proofread the following text and correct any grammar, spelling, or punctuation errors.
@@ -200,14 +194,12 @@ public final class WritingToolsIntegration: ObservableObject {
 
                     return ProofreadResult(correctedText: correctedText, corrections: corrections)
                 } catch {
-                    throw WritingToolsError.notAvailable
+                    throw WritingToolsError.operationFailed(error.localizedDescription)
                 }
             }
         #elseif os(macOS)
             if #available(macOS 26.0, *) {
-                guard let session = session as? LanguageModelSession else {
-                    throw WritingToolsError.notAvailable
-                }
+                let session = LanguageModelSession()
 
                 let prompt = """
                 Proofread the following text and correct any grammar, spelling, or punctuation errors.
@@ -238,7 +230,7 @@ public final class WritingToolsIntegration: ObservableObject {
 
                     return ProofreadResult(correctedText: correctedText, corrections: corrections)
                 } catch {
-                    throw WritingToolsError.notAvailable
+                    throw WritingToolsError.operationFailed(error.localizedDescription)
                 }
             }
         #endif
@@ -252,9 +244,7 @@ public final class WritingToolsIntegration: ObservableObject {
         #if canImport(FoundationModels)
         #if os(iOS)
             if #available(iOS 26.0, *) {
-                guard let session = session as? LanguageModelSession else {
-                    throw WritingToolsError.notAvailable
-                }
+                let session = LanguageModelSession()
 
                 let prompt = """
                 Rewrite the following text in a \(tone) tone while preserving the core meaning and intent.
@@ -269,14 +259,12 @@ public final class WritingToolsIntegration: ObservableObject {
                     let response = try await session.respond(to: prompt)
                     return response.content.trimmingCharacters(in: .whitespacesAndNewlines)
                 } catch {
-                    throw WritingToolsError.notAvailable
+                    throw WritingToolsError.operationFailed(error.localizedDescription)
                 }
             }
         #elseif os(macOS)
             if #available(macOS 26.0, *) {
-                guard let session = session as? LanguageModelSession else {
-                    throw WritingToolsError.notAvailable
-                }
+                let session = LanguageModelSession()
 
                 let prompt = """
                 Rewrite the following text in a \(tone) tone while preserving the core meaning and intent.
@@ -291,7 +279,7 @@ public final class WritingToolsIntegration: ObservableObject {
                     let response = try await session.respond(to: prompt)
                     return response.content.trimmingCharacters(in: .whitespacesAndNewlines)
                 } catch {
-                    throw WritingToolsError.notAvailable
+                    throw WritingToolsError.operationFailed(error.localizedDescription)
                 }
             }
         #endif
@@ -305,9 +293,7 @@ public final class WritingToolsIntegration: ObservableObject {
         #if canImport(FoundationModels)
         #if os(iOS)
             if #available(iOS 26.0, *) {
-                guard let session = session as? LanguageModelSession else {
-                    throw WritingToolsError.notAvailable
-                }
+                let session = LanguageModelSession()
 
                 // Map length parameter to specific instructions
                 let lengthInstruction: String
@@ -335,14 +321,12 @@ public final class WritingToolsIntegration: ObservableObject {
                     let response = try await session.respond(to: prompt)
                     return response.content.trimmingCharacters(in: .whitespacesAndNewlines)
                 } catch {
-                    throw WritingToolsError.notAvailable
+                    throw WritingToolsError.operationFailed(error.localizedDescription)
                 }
             }
         #elseif os(macOS)
             if #available(macOS 26.0, *) {
-                guard let session = session as? LanguageModelSession else {
-                    throw WritingToolsError.notAvailable
-                }
+                let session = LanguageModelSession()
 
                 let lengthInstruction: String
                 switch length.lowercased() {
@@ -369,7 +353,7 @@ public final class WritingToolsIntegration: ObservableObject {
                     let response = try await session.respond(to: prompt)
                     return response.content.trimmingCharacters(in: .whitespacesAndNewlines)
                 } catch {
-                    throw WritingToolsError.notAvailable
+                    throw WritingToolsError.operationFailed(error.localizedDescription)
                 }
             }
         #endif
@@ -394,6 +378,7 @@ public enum WritingToolsError: Error, LocalizedError {
     case notAvailable
     case notImplemented(String)
     case unknownTool(String)
+    case operationFailed(String)
 
     public var errorDescription: String? {
         switch self {
@@ -403,6 +388,8 @@ public enum WritingToolsError: Error, LocalizedError {
             return "Feature not yet implemented: \(detail)"
         case .unknownTool(let name):
             return "Unknown tool: \(name)"
+        case .operationFailed(let detail):
+            return "Writing Tools operation failed: \(detail)"
         }
     }
 }

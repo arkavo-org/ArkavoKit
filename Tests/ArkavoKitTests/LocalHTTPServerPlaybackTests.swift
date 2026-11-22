@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import Network
 import Testing
 @testable import ArkavoSocial
 @testable import ArkavoMediaKit
@@ -646,28 +647,94 @@ struct LocalHTTPServerPlaybackTests {
         try "test".write(to: tempDir.appendingPathComponent("test.txt"), atomically: true, encoding: .utf8)
 
         let server = LocalHTTPServer(contentDirectory: tempDir)
-        let baseURL = try server.start()
+        _ = try server.start()
         defer { server.stop() }
 
-        // Attempt path traversal using URL components to avoid URL encoding issues
-        var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)!
-        components.path = "/..%2F..%2F..%2Fetc%2Fpasswd"  // URL-encoded path traversal
+        // Send a raw percent-encoded traversal request directly over TCP so URLComponents/URLSession
+        // neither double-encode `%2e` nor collapse `..` segments before they reach the server.
+        let rawRequest = "GET /%2e%2e/%2e%2e/%2e%2e/%2e%2e/etc/passwd HTTP/1.1\r\nHost: 127.0.0.1:\(server.port)\r\nConnection: close\r\n\r\n"
+        let responseText = try await sendRawHTTPRequest(rawRequest, port: server.port)
+        let statusLine = responseText.components(separatedBy: "\r\n").first ?? ""
+        #expect(
+            statusLine.contains(" 403 ") || statusLine.contains(" 404 "),
+            "Path traversal must be blocked with 403 or 404, got: \(statusLine)"
+        )
+        #expect(!responseText.contains("root:"), "Server must never disclose /etc/passwd contents")
+    }
 
-        guard let traversalURL = components.url else {
-            // If URL can't be constructed, try another approach
-            let traversalURL2 = baseURL.appendingPathComponent("..").appendingPathComponent("..").appendingPathComponent("etc").appendingPathComponent("passwd")
-            let httpResponse = await Self.fetch(traversalURL2).response
-
-            let statusCode = httpResponse?.statusCode ?? -1
-            #expect(statusCode == 404 || statusCode == 400, "Path traversal should be blocked, got \(statusCode)")
-            return
+    private func sendRawHTTPRequest(_ rawRequest: String, port: UInt16) async throws -> String {
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+            throw URLError(.badURL)
         }
+        let connection = NWConnection(host: NWEndpoint.Host("127.0.0.1"), port: nwPort, using: .tcp)
+        let queue = DispatchQueue(label: "test.raw-http-client")
 
-        let httpResponse = await Self.fetch(traversalURL).response
+        return try await withCheckedThrowingContinuation { continuation in
+            let resumed = LockedFlag()
 
-        // Should either 404 or 400, NOT 200
-        let statusCode = httpResponse?.statusCode ?? -1
-        #expect(statusCode == 404 || statusCode == 400, "Path traversal should be blocked, got \(statusCode)")
+            @Sendable func finish(_ result: Result<String, Error>) {
+                guard resumed.claim() else { return }
+                connection.cancel()
+                continuation.resume(with: result)
+            }
+
+            @Sendable func readMore(accumulated: Data) {
+                connection.receive(minimumIncompleteLength: 1, maximumLength: 16384) { data, _, isComplete, error in
+                    var buffer = accumulated
+                    if let data {
+                        buffer.append(data)
+                    }
+                    if let error {
+                        if buffer.isEmpty {
+                            finish(.failure(error))
+                        } else {
+                            finish(.success(String(decoding: buffer, as: UTF8.self)))
+                        }
+                        return
+                    }
+                    if isComplete || data == nil {
+                        finish(.success(String(decoding: buffer, as: UTF8.self)))
+                    } else {
+                        readMore(accumulated: buffer)
+                    }
+                }
+            }
+
+            connection.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    connection.send(content: Data(rawRequest.utf8), completion: .contentProcessed { error in
+                        if let error {
+                            finish(.failure(error))
+                            return
+                        }
+                        readMore(accumulated: Data())
+                    })
+                case let .failed(error):
+                    finish(.failure(error))
+                default:
+                    break
+                }
+            }
+
+            connection.start(queue: queue)
+            queue.asyncAfter(deadline: .now() + 5) {
+                finish(.failure(URLError(.timedOut)))
+            }
+        }
+    }
+
+    private final class LockedFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var claimed = false
+
+        func claim() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            if claimed { return false }
+            claimed = true
+            return true
+        }
     }
 
     @Test("Playlist segment URIs match served files")

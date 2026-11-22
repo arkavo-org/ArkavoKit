@@ -116,11 +116,15 @@ public final class ArkavoIrohManager: Sendable {
 
         await manager.initialize(config: config.toIrohConfig())
 
+        // Bail out if reset() replaced nodeManager while awaiting initialization.
+        guard self.nodeManager === manager else { return }
+
         if let node = manager.node {
             _profileService = IrohProfileService(node: node)
             _contentService = IrohContentService(node: node)
-        } else if let managerError = manager.error {
-            error = managerError
+        } else {
+            error = manager.error
+            nodeManager = nil
         }
 
         isInitializing = false

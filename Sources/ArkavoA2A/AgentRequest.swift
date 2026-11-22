@@ -9,17 +9,52 @@ public struct AgentRequest: Codable, Sendable {
     /// The method name to invoke
     public let method: String
 
-    /// Request parameters (can be array or object)
+    /// Request parameters (can be array, object, or omitted/null)
     public let params: AnyCodable
 
     /// Unique request identifier
     public let id: String
 
-    public init(method: String, params: AnyCodable, id: String = UUID().uuidString) {
+    enum CodingKeys: String, CodingKey {
+        case jsonrpc
+        case method
+        case params
+        case id
+    }
+
+    public init(method: String, params: AnyCodable = AnyCodable(NSNull()), id: String = UUID().uuidString) {
         self.jsonrpc = "2.0"
         self.method = method
         self.params = params
         self.id = id
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.jsonrpc = try container.decode(String.self, forKey: .jsonrpc)
+        self.method = try container.decode(String.self, forKey: .method)
+        self.params = try container.decodeIfPresent(AnyCodable.self, forKey: .params) ?? AnyCodable(NSNull())
+        self.id = try Self.decodeId(from: container, forKey: .id)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(jsonrpc, forKey: .jsonrpc)
+        try container.encode(method, forKey: .method)
+        if !(params.value is NSNull) {
+            try container.encode(params, forKey: .params)
+        }
+        try container.encode(id, forKey: .id)
+    }
+
+    static func decodeId<K: CodingKey>(from container: KeyedDecodingContainer<K>, forKey key: K) throws -> String {
+        if let stringId = try? container.decode(String.self, forKey: key) {
+            return stringId
+        }
+        if let intId = try? container.decode(Int.self, forKey: key) {
+            return String(intId)
+        }
+        return try container.decode(String.self, forKey: key)
     }
 }
 
@@ -42,15 +77,16 @@ public enum AgentResponse: Codable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        let id = try container.decode(String.self, forKey: .id)
+        let id = try AgentRequest.decodeId(from: container, forKey: .id)
 
-        if let result = try? container.decode(AnyCodable.self, forKey: .result) {
-            self = .success(id: id, result: result)
-        } else if container.contains(.error) {
+        if container.contains(.error), !(try container.decodeNil(forKey: .error)) {
             let errorContainer = try container.nestedContainer(keyedBy: ErrorKeys.self, forKey: .error)
             let code = try errorContainer.decode(Int.self, forKey: .code)
             let message = try errorContainer.decode(String.self, forKey: .message)
             self = .error(id: id, code: code, message: message)
+        } else if container.contains(.result) {
+            let result = try container.decode(AnyCodable.self, forKey: .result)
+            self = .success(id: id, result: result)
         } else {
             throw DecodingError.dataCorrupted(
                 DecodingError.Context(
@@ -91,5 +127,3 @@ public enum AgentResponse: Codable, Sendable {
         }
     }
 }
-
-import Foundation

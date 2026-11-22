@@ -99,14 +99,41 @@ public struct TDFManifestLite: Codable, Sendable, Hashable {
             protectedAt = protectedAt ?? (fmp4Meta["protectedAt"] as? String)
         }
 
-        guard let finalAssetID = assetID, let finalProtectedAt = protectedAt else {
-            throw IrohContentError.manifestExtractionFailed("Missing assetId or protectedAt in manifest")
+        guard let finalAssetID = assetID?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !finalAssetID.isEmpty,
+              let finalProtectedAt = protectedAt?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !finalProtectedAt.isEmpty
+        else {
+            throw IrohContentError.manifestExtractionFailed("Missing or empty assetId or protectedAt in manifest")
+        }
+
+        let trimmedKasURL = kasURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let parsedKasURL = URL(string: trimmedKasURL),
+              let scheme = parsedKasURL.scheme?.lowercased(),
+              let host = parsedKasURL.host?.lowercased(),
+              !host.isEmpty,
+              scheme == "https" || (scheme == "http" && (host == "localhost" || host == "127.0.0.1" || host == "::1"))
+        else {
+            throw IrohContentError.manifestExtractionFailed("Invalid KAS URL in manifest")
+        }
+
+        let trimmedAlgorithm = algorithm.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedAlgorithm.isEmpty else {
+            throw IrohContentError.manifestExtractionFailed("Empty encryption algorithm in manifest")
+        }
+
+        guard !wrappedKey.isEmpty, Data(base64Encoded: wrappedKey) != nil else {
+            throw IrohContentError.manifestExtractionFailed("Invalid base64 wrappedKey in manifest")
+        }
+
+        guard !iv.isEmpty, Data(base64Encoded: iv) != nil else {
+            throw IrohContentError.manifestExtractionFailed("Invalid base64 iv in manifest")
         }
 
         return TDFManifestLite(
-            kasURL: kasURL,
+            kasURL: trimmedKasURL,
             wrappedKey: wrappedKey,
-            algorithm: algorithm,
+            algorithm: trimmedAlgorithm,
             iv: iv,
             assetID: finalAssetID,
             protectedAt: finalProtectedAt
@@ -295,6 +322,8 @@ public actor IrohContentService {
         let payloadTicket: String
         do {
             payloadTicket = try await node.put(info.tdfData)
+        } catch is CancellationError {
+            throw CancellationError()
         } catch let error as IrohError {
             throw IrohContentError.nativeNodeError(error)
         } catch {
@@ -328,6 +357,8 @@ public actor IrohContentService {
         let descriptorTicket: String
         do {
             descriptorTicket = try await node.put(descriptor, encoder: encoder)
+        } catch is CancellationError {
+            throw CancellationError()
         } catch let error as IrohError {
             throw IrohContentError.nativeNodeError(error)
         } catch {
@@ -394,6 +425,8 @@ public actor IrohContentService {
                 version: 1,
                 creatorPublicID: creatorPublicID
             )
+        } catch is CancellationError {
+            throw CancellationError()
         } catch let error as IrohError {
             throw IrohContentError.nativeNodeError(error)
         } catch {
@@ -440,6 +473,8 @@ public actor IrohContentService {
         do {
             let data = try await node.getWithRetry(ticket: ticket, maxAttempts: maxAttempts)
             return try decoder.decode(ContentDescriptor.self, from: data)
+        } catch is CancellationError {
+            throw CancellationError()
         } catch let error as IrohError {
             throw IrohContentError.nativeNodeError(error)
         } catch {

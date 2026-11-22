@@ -29,8 +29,8 @@ public final class AgentStreamHandler: ObservableObject, AgentNotificationHandle
     // Accumulated tool calls
     private var toolCalls: [String: ToolCallAccumulator] = [:]
 
-    // Auto-acknowledgment task
-    private var ackTask: Task<Void, Never>?
+    // Auto-acknowledgment task (cancelled in deinit)
+    nonisolated(unsafe) private var ackTask: Task<Void, Never>?
 
     // MARK: - Initialization
 
@@ -39,32 +39,43 @@ public final class AgentStreamHandler: ObservableObject, AgentNotificationHandle
         self.connection = connection
     }
 
+    deinit {
+        ackTask?.cancel()
+    }
+
     // MARK: - Subscription Management
 
     /// Subscribe to message deltas for this session
     public func subscribe() async throws {
         print("[AgentStreamHandler] Subscribing to chat stream for session: \(sessionId)")
 
-        isStreaming = true
+        isStreaming = false
         streamingText = ""
         lastError = nil
         lastSequence = 0
 
-        // Send chat_stream subscription request
-        let params: [String: Any] = [
-            "session_id": sessionId
-        ]
+        // Register as notification handler before subscribing so early deltas are delivered
+        await connection.setNotificationHandler(self)
 
-        print("[AgentStreamHandler] Calling chat_stream with params: \(params)")
+        print("[AgentStreamHandler] Calling chat_stream with positional params: [\(sessionId)]")
 
-        let response = try await connection.call(
-            method: "chat_stream",
-            params: params
-        )
+        let response: AgentResponse
+        do {
+            response = try await connection.call(
+                method: "chat_stream",
+                arrayParams: [sessionId]
+            )
+        } catch {
+            await connection.setNotificationHandler(nil)
+            isStreaming = false
+            throw error
+        }
 
         print("[AgentStreamHandler] Got subscription response: \(response)")
 
         guard case .success(_, let result) = response else {
+            await connection.setNotificationHandler(nil)
+            isStreaming = false
             if case .error(_, let code, let message) = response {
                 print("[AgentStreamHandler] ERROR: Subscription failed: \(code) - \(message)")
                 throw AgentError.jsonRpcError(code: code, message: message)
@@ -73,26 +84,58 @@ public final class AgentStreamHandler: ObservableObject, AgentNotificationHandle
             throw AgentError.invalidResponse("Failed to subscribe to chat stream")
         }
 
-        // Extract subscription ID if present
-        if let subDict = result.value as? [String: Any],
-           let subId = subDict["subscription"] as? String {
+        // Extract subscription ID from string, int, or dictionary result
+        if let subId = result.value as? String {
             subscriptionId = subId
             print("[AgentStreamHandler] Subscribed with ID: \(subId)")
+        } else if let subInt = result.value as? Int {
+            let subId = String(subInt)
+            subscriptionId = subId
+            print("[AgentStreamHandler] Subscribed with ID: \(subId)")
+        } else if let subDict = result.value as? [String: Any] {
+            if let subId = subDict["subscription"] as? String {
+                subscriptionId = subId
+                print("[AgentStreamHandler] Subscribed with ID: \(subId)")
+            } else if let subInt = subDict["subscription"] as? Int {
+                let subId = String(subInt)
+                subscriptionId = subId
+                print("[AgentStreamHandler] Subscribed with ID: \(subId)")
+            } else if let subId = subDict["subscription_id"] as? String {
+                subscriptionId = subId
+                print("[AgentStreamHandler] Subscribed with ID: \(subId)")
+            } else if let subInt = subDict["subscription_id"] as? Int {
+                let subId = String(subInt)
+                subscriptionId = subId
+                print("[AgentStreamHandler] Subscribed with ID: \(subId)")
+            } else {
+                print("[AgentStreamHandler] WARNING: No subscription ID in response")
+            }
         } else {
             print("[AgentStreamHandler] WARNING: No subscription ID in response")
         }
 
+        isStreaming = true
         print("[AgentStreamHandler] Subscription complete, streaming active")
     }
 
     /// Unsubscribe from message deltas
     public func unsubscribe() async {
+        let currentSubId = subscriptionId
         isStreaming = false
         subscriptionId = nil
 
         // Cancel auto-acknowledgment task
         ackTask?.cancel()
         ackTask = nil
+
+        if let currentSubId {
+            _ = try? await connection.call(
+                method: "chat_stream_unsubscribe",
+                arrayParams: [currentSubId]
+            )
+        }
+
+        await connection.setNotificationHandler(nil)
     }
 
     // MARK: - Notification Handling
@@ -245,21 +288,23 @@ public final class AgentStreamHandler: ObservableObject, AgentNotificationHandle
 
         print("[AgentStreamHandler] Starting auto-acknowledgment loop")
 
-        // Start new acknowledgment task
-        ackTask = Task {
+        // Start new acknowledgment task (capture weak self to avoid retain cycle)
+        ackTask = Task { [weak self] in
             var ackCount = 0
-            while isStreaming && !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+            while !Task.isCancelled {
+                guard self?.isStreaming == true else { break }
 
-                // Check again after sleep in case stream ended
-                guard isStreaming && !Task.isCancelled else {
+                try? await Task.sleep(nanoseconds: UInt64(max(0.01, interval) * 1_000_000_000))
+
+                // Check again after sleep in case stream ended or handler was deallocated
+                guard let self, self.isStreaming, !Task.isCancelled else {
                     print("[AgentStreamHandler] Auto-ack loop stopped (sent \(ackCount) acks)")
                     break
                 }
 
-                if lastSequence > 0 {
+                if self.lastSequence > 0 {
                     ackCount += 1
-                    try? await acknowledgeUpTo(sequence: lastSequence)
+                    try? await self.acknowledgeUpTo(sequence: self.lastSequence)
                 }
             }
             print("[AgentStreamHandler] Auto-ack task completed after \(ackCount) acknowledgments")

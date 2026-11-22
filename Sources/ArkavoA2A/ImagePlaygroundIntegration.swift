@@ -18,28 +18,9 @@ public final class ImagePlaygroundIntegration: ObservableObject {
 
     /// Check if Image Playground is available on this device
     private func checkAvailability() {
-        #if canImport(ImagePlayground)
-        #if os(iOS)
-            if #available(iOS 26.0, *) {
-                // Note: ImageCreator API structure is different than initially researched
-                // Actual API needs verification from Xcode documentation
-                // For now, assume available if framework can be imported
-                isAvailable = true
-            } else {
-                isAvailable = false
-            }
-        #elseif os(macOS)
-            if #available(macOS 26.0, *) {
-                isAvailable = true
-            } else {
-                isAvailable = false
-            }
-        #else
-            isAvailable = false
-        #endif
-        #else
-            isAvailable = false
-        #endif
+        // Image generation and editing are not yet implemented; report unavailable
+        // until ImageCreator API integration is complete.
+        isAvailable = false
     }
 
     /// Execute a tool call using Image Playground

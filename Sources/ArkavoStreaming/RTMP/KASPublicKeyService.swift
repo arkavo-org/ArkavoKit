@@ -33,6 +33,56 @@ public actor KASPublicKeyService {
         self.kasURL = kasURL
     }
 
+    static func isLoopbackHost(_ host: String) -> Bool {
+        let normalized = host.lowercased()
+        return normalized == "localhost" || normalized == "127.0.0.1" || normalized == "::1" || normalized == "[::1]"
+    }
+
+    static func validatedPublicKeyURL(for kasURL: URL) throws -> URL {
+        guard var components = URLComponents(url: kasURL, resolvingAgainstBaseURL: false),
+              let scheme = components.scheme?.lowercased(),
+              let host = components.host, !host.isEmpty else {
+            throw KASPublicKeyError.parseError("Invalid KAS URL: \(kasURL.absoluteString)")
+        }
+
+        guard scheme == "https" || (scheme == "http" && isLoopbackHost(host)) else {
+            throw KASPublicKeyError.networkError("Refusing insecure non-HTTPS KAS URL: \(kasURL.absoluteString)")
+        }
+
+        components.path = "/kas/v2/kas_public_key"
+        components.queryItems = [URLQueryItem(name: "algorithm", value: "ec")]
+
+        guard let url = components.url else {
+            throw KASPublicKeyError.parseError("Failed to construct KAS URL")
+        }
+        return url
+    }
+
+    static func makeResourceLocator(for kasURL: URL) throws -> ResourceLocator {
+        guard let scheme = kasURL.scheme?.lowercased(),
+              let host = kasURL.host, !host.isEmpty else {
+            throw KASPublicKeyError.parseError("Invalid KAS URL: \(kasURL.absoluteString)")
+        }
+
+        guard scheme == "https" || (scheme == "http" && isLoopbackHost(host)) else {
+            throw KASPublicKeyError.networkError("Refusing insecure non-HTTPS KAS URL: \(kasURL.absoluteString)")
+        }
+
+        let protocolEnum: ProtocolEnum = scheme == "https" ? .https : .http
+        let defaultPort = scheme == "https" ? 443 : 80
+        let body: String
+        if let port = kasURL.port, port != defaultPort {
+            body = "\(host):\(port)"
+        } else {
+            body = host
+        }
+
+        guard let resourceLocator = ResourceLocator(protocolEnum: protocolEnum, body: body) else {
+            throw KASPublicKeyError.parseError("Failed to create ResourceLocator for \(body)")
+        }
+        return resourceLocator
+    }
+
     /// Fetch KAS public key from /kas/v2/kas_public_key endpoint
     /// Returns compressed P-256 public key (33 bytes)
     public func fetchPublicKey() async throws -> Data {
@@ -41,14 +91,8 @@ public actor KASPublicKeyService {
             return cached
         }
 
-        // Build endpoint URL
-        var components = URLComponents(url: kasURL, resolvingAgainstBaseURL: false)!
-        components.path = "/kas/v2/kas_public_key"
-        components.queryItems = [URLQueryItem(name: "algorithm", value: "ec")]
-
-        guard let url = components.url else {
-            throw KASPublicKeyError.parseError("Failed to construct KAS URL")
-        }
+        // Validate HTTPS (or loopback HTTP) and build endpoint URL
+        let url = try Self.validatedPublicKeyURL(for: kasURL)
 
         print("📡 Fetching KAS public key from \(url)")
 
@@ -63,7 +107,7 @@ public actor KASPublicKeyService {
         // Response is JSON: {"public_key": "-----BEGIN PUBLIC KEY-----\r\n...", "kid": "ec:secp256r1"}
         struct KASResponse: Decodable {
             let public_key: String
-            let kid: String
+            let kid: String?
         }
 
         let kasResponse: KASResponse
@@ -97,15 +141,8 @@ public actor KASPublicKeyService {
             return cached
         }
 
+        let resourceLocator = try Self.makeResourceLocator(for: kasURL)
         let publicKeyData = try await fetchPublicKey()
-
-        // Create ResourceLocator from KAS URL
-        let host = kasURL.host ?? "localhost"
-        let protocolEnum: ProtocolEnum = kasURL.scheme == "https" ? .https : .http
-
-        guard let resourceLocator = ResourceLocator(protocolEnum: protocolEnum, body: host) else {
-            throw KASPublicKeyError.parseError("Failed to create ResourceLocator for \(host)")
-        }
 
         // Convert compressed public key data to P256 public key
         let p256PublicKey = try P256.KeyAgreement.PublicKey(compressedRepresentation: publicKeyData)
@@ -120,7 +157,7 @@ public actor KASPublicKeyService {
         // Cache the result
         cachedKasMetadata = kasMetadata
 
-        print("✅ Created KasMetadata for \(host)")
+        print("✅ Created KasMetadata for \(resourceLocator.body)")
         return kasMetadata
     }
 

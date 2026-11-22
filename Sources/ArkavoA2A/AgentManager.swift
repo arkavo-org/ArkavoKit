@@ -23,6 +23,7 @@ public final class AgentManager: ObservableObject {
 
     private let discoveryService: AgentDiscoveryService
     private var cancellables = Set<AnyCancellable>()
+    private var manualAgentIds: Set<String> = []
 
     // Configuration
     private let autoConnect: Bool
@@ -59,53 +60,87 @@ public final class AgentManager: ObservableObject {
 
     /// Connect to a specific agent
     public func connect(to agent: AgentEndpoint) async throws {
+        try await connect(to: agent, isManual: true)
+    }
+
+    private func connect(to agent: AgentEndpoint, isManual: Bool) async throws {
         // Check if already connected
-        if let connection = connections[agent.id] {
-            if await connection.isConnected() {
+        if let existingConnection = connections[agent.id] {
+            if await existingConnection.isConnected() {
+                if isManual {
+                    manualAgentIds.insert(agent.id)
+                }
                 print("Already connected to agent \(agent.id)")
                 return
             }
+            // Disconnect stale connection before replacing
+            connections.removeValue(forKey: agent.id)
+            await existingConnection.disconnect()
         }
 
         // Create new connection
         let connection = AgentConnection(endpoint: agent)
         connections[agent.id] = connection
+        if isManual {
+            manualAgentIds.insert(agent.id)
+        }
+
+        // Observe real status transitions from the connection
+        await connection.setStatusObserver { [weak self, weak connection] newStatus in
+            await MainActor.run {
+                guard let self, let connection, self.connections[agent.id] === connection else {
+                    return
+                }
+                self.statuses[agent.id] = newStatus
+            }
+        }
 
         // Update status
         statuses[agent.id] = .connecting
 
-        // Connect
+        // Perform initial connection so unreachable agents are not falsely marked connected
         do {
-            if autoReconnect {
-                await connection.startWithReconnection()
-            } else {
-                try await connection.connect()
+            try await connection.connect()
+            if connections[agent.id] === connection {
+                statuses[agent.id] = .connected
+                if autoReconnect {
+                    await connection.setAutoReconnectionEnabled(true)
+                }
             }
-
-            statuses[agent.id] = .connected
         } catch {
-            statuses[agent.id] = .failed(reason: error.localizedDescription)
+            if connections[agent.id] === connection {
+                statuses[agent.id] = .failed(reason: error.localizedDescription)
+            }
             throw error
         }
     }
 
     /// Disconnect from a specific agent
     public func disconnect(from agentId: String) async {
+        manualAgentIds.remove(agentId)
         guard let connection = connections.removeValue(forKey: agentId) else {
             return
         }
 
         await connection.disconnect()
-        statuses[agentId] = .disconnected
+        if connections[agentId] == nil {
+            statuses[agentId] = .disconnected
+        }
     }
 
     /// Disconnect from all agents
     public func disconnectAll() async {
-        for (agentId, connection) in connections {
+        let snapshot = connections
+        for (agentId, connection) in snapshot {
+            if connections[agentId] === connection {
+                connections.removeValue(forKey: agentId)
+                manualAgentIds.remove(agentId)
+            }
             await connection.disconnect()
-            statuses[agentId] = .disconnected
+            if connections[agentId] == nil {
+                statuses[agentId] = .disconnected
+            }
         }
-        connections.removeAll()
     }
 
     /// Get connection to an agent
@@ -147,15 +182,17 @@ public final class AgentManager: ObservableObject {
                         for agent in discoveredAgents {
                             if self.connections[agent.id] == nil {
                                 print("Auto-connecting to discovered agent: \(agent.id)")
-                                try? await self.connect(to: agent)
+                                try? await self.connect(to: agent, isManual: false)
                             }
                         }
                     }
 
-                    // Remove connections for agents that disappeared
+                    // Remove connections for discovered agents that disappeared
+                    // Manually added endpoints are tracked separately and never disconnected by mDNS updates
                     let discoveredIds = Set(discoveredAgents.map(\.id))
-                    for agentId in self.connections.keys {
-                        if !discoveredIds.contains(agentId) {
+                    let activeIds = Array(self.connections.keys)
+                    for agentId in activeIds {
+                        if !discoveredIds.contains(agentId) && !self.manualAgentIds.contains(agentId) {
                             print("Agent \(agentId) disappeared, disconnecting")
                             await self.disconnect(from: agentId)
                         }

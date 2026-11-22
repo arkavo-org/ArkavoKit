@@ -13,11 +13,18 @@ import AVFoundation
 public final class SensorBridge: NSObject, ObservableObject {
     @Published public private(set) var lastError: String?
 
+    private struct SensorPayloadBox: @unchecked Sendable {
+        let value: [String: Any]
+    }
+
     private let locationManager = CLLocationManager()
     #if os(iOS) || os(watchOS)
         private let motionManager = CMMotionManager()
+        private var compassWaiters: [UUID: (continuation: CheckedContinuation<SensorPayloadBox, Error>, timeoutTask: Task<Void, Never>)] = [:]
+        private var motionWaiters: [UUID: CheckedContinuation<SensorPayloadBox, Error>] = [:]
     #endif
-    private var permissionHandlers: [SensorType: (Bool) -> Void] = [:]
+    private var permissionWaiters: [SensorType: [CheckedContinuation<Bool, Never>]] = [:]
+    private var locationWaiters: [UUID: (continuation: CheckedContinuation<SensorPayloadBox, Error>, timeoutTask: Task<Void, Never>)] = [:]
 
     public override init() {
         super.init()
@@ -93,10 +100,11 @@ public final class SensorBridge: NSObject, ObservableObject {
 
     private func requestLocationPermission() async -> Bool {
         await withCheckedContinuation { continuation in
-            permissionHandlers[.location] = { granted in
-                continuation.resume(returning: granted)
+            let shouldRequest = (permissionWaiters[.location]?.isEmpty ?? true)
+            permissionWaiters[.location, default: []].append(continuation)
+            if shouldRequest {
+                locationManager.requestWhenInUseAuthorization()
             }
-            locationManager.requestWhenInUseAuthorization()
         }
     }
 
@@ -134,7 +142,11 @@ public final class SensorBridge: NSObject, ObservableObject {
         true
     }
 
-    private func validateRate(_ rate: Double, for sensor: SensorType) -> Bool {
+    func validateRate(_ rate: Double, for sensor: SensorType) -> Bool {
+        guard rate.isFinite, rate > 0 else {
+            return false
+        }
+
         switch sensor {
         case .motion:
             return rate <= 100.0
@@ -167,28 +179,42 @@ public final class SensorBridge: NSObject, ObservableObject {
     }
 
     private func collectLocationData() async throws -> [String: Any] {
-        try await withCheckedThrowingContinuation { continuation in
-            var hasResumed = false
+        let waiterId = UUID()
+        let payload: SensorPayloadBox = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<SensorPayloadBox, Error>) in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
 
-            let task = Task { @MainActor in
-                locationManager.requestLocation()
+                let shouldRequest = locationWaiters.isEmpty
+                let timeoutTask = Task { @MainActor [weak self] in
+                    do {
+                        try await Task.sleep(for: .seconds(10))
+                    } catch {
+                        return
+                    }
+                    guard let self, let entry = self.locationWaiters.removeValue(forKey: waiterId) else {
+                        return
+                    }
+                    entry.continuation.resume(throwing: SensorBridgeError.timeout(sensor: .location))
+                }
 
-                try await Task.sleep(for: .seconds(10))
-
-                if !hasResumed {
-                    hasResumed = true
-                    continuation.resume(throwing: SensorBridgeError.timeout(sensor: .location))
+                locationWaiters[waiterId] = (continuation: continuation, timeoutTask: timeoutTask)
+                if shouldRequest {
+                    locationManager.requestLocation()
                 }
             }
-
-            permissionHandlers[.location] = { _ in
-                if !hasResumed {
-                    hasResumed = true
-                    task.cancel()
-                    continuation.resume(throwing: SensorBridgeError.permissionDenied(sensor: .location))
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                guard let self, let entry = self.locationWaiters.removeValue(forKey: waiterId) else {
+                    return
                 }
+                entry.timeoutTask.cancel()
+                entry.continuation.resume(throwing: CancellationError())
             }
         }
+        return payload.value
     }
 
     private func collectMotionData() async throws -> [String: Any] {
@@ -197,45 +223,67 @@ public final class SensorBridge: NSObject, ObservableObject {
                 throw SensorBridgeError.sensorUnavailable(sensor: .motion)
             }
 
-            return try await withCheckedThrowingContinuation { continuation in
-                var hasResumed = false
-
-                motionManager.startDeviceMotionUpdates(to: .main) { motion, error in
-                    if hasResumed { return }
-                    hasResumed = true
-
-                    if let error {
-                        continuation.resume(throwing: error)
+            let waiterId = UUID()
+            let payload: SensorPayloadBox = try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<SensorPayloadBox, Error>) in
+                    if Task.isCancelled {
+                        continuation.resume(throwing: CancellationError())
                         return
                     }
 
-                    guard let motion else {
-                        continuation.resume(throwing: SensorBridgeError.noData(sensor: .motion))
+                    let shouldStart = motionWaiters.isEmpty
+                    motionWaiters[waiterId] = continuation
+
+                    if shouldStart {
+                        motionManager.startDeviceMotionUpdates(to: .main) { [weak self] motion, error in
+                            MainActor.assumeIsolated {
+                                guard let self else { return }
+                                self.motionManager.stopDeviceMotionUpdates()
+
+                                let waiters = self.motionWaiters
+                                self.motionWaiters.removeAll()
+                                guard !waiters.isEmpty else { return }
+
+                                if let error {
+                                    for (_, waiter) in waiters {
+                                        waiter.resume(throwing: error)
+                                    }
+                                    return
+                                }
+
+                                guard let motion else {
+                                    for (_, waiter) in waiters {
+                                        waiter.resume(throwing: SensorBridgeError.noData(sensor: .motion))
+                                    }
+                                    return
+                                }
+
+                                let acc = motion.userAcceleration
+                                let rot = motion.rotationRate
+                                let grav = motion.gravity
+                                for (_, waiter) in waiters {
+                                    waiter.resume(returning: SensorPayloadBox(value: Self.makeMotionPayload(
+                                        accX: acc.x, accY: acc.y, accZ: acc.z,
+                                        rotX: rot.x, rotY: rot.y, rotZ: rot.z,
+                                        gravX: grav.x, gravY: grav.y, gravZ: grav.z
+                                    )))
+                                }
+                            }
+                        }
+                    }
+                }
+            } onCancel: {
+                Task { @MainActor [weak self] in
+                    guard let self, let waiter = self.motionWaiters.removeValue(forKey: waiterId) else {
                         return
                     }
-
-                    let data: [String: Any] = [
-                        "acceleration": [
-                            "x": motion.userAcceleration.x,
-                            "y": motion.userAcceleration.y,
-                            "z": motion.userAcceleration.z,
-                        ],
-                        "rotation": [
-                            "x": motion.rotationRate.x,
-                            "y": motion.rotationRate.y,
-                            "z": motion.rotationRate.z,
-                        ],
-                        "gravity": [
-                            "x": motion.gravity.x,
-                            "y": motion.gravity.y,
-                            "z": motion.gravity.z,
-                        ],
-                    ]
-
-                    self.motionManager.stopDeviceMotionUpdates()
-                    continuation.resume(returning: data)
+                    if self.motionWaiters.isEmpty {
+                        self.motionManager.stopDeviceMotionUpdates()
+                    }
+                    waiter.resume(throwing: CancellationError())
                 }
             }
+            return payload.value
         #else
             throw SensorBridgeError.sensorUnavailable(sensor: .motion)
         #endif
@@ -247,33 +295,110 @@ public final class SensorBridge: NSObject, ObservableObject {
                 throw SensorBridgeError.sensorUnavailable(sensor: .compass)
             }
 
-            return try await withCheckedThrowingContinuation { continuation in
-                var hasResumed = false
+            let waiterId = UUID()
+            let payload: SensorPayloadBox = try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<SensorPayloadBox, Error>) in
+                    if Task.isCancelled {
+                        continuation.resume(throwing: CancellationError())
+                        return
+                    }
 
-                locationManager.startUpdatingHeading()
+                    let shouldStart = compassWaiters.isEmpty
+                    let timeoutTask = Task { @MainActor [weak self] in
+                        do {
+                            try await Task.sleep(for: .seconds(5))
+                        } catch {
+                            return
+                        }
+                        guard let self, let entry = self.compassWaiters.removeValue(forKey: waiterId) else {
+                            return
+                        }
+                        if self.compassWaiters.isEmpty {
+                            self.locationManager.stopUpdatingHeading()
+                        }
+                        entry.continuation.resume(throwing: SensorBridgeError.timeout(sensor: .compass))
+                    }
 
-                Task { @MainActor in
-                    try await Task.sleep(for: .seconds(5))
-
-                    if !hasResumed {
-                        hasResumed = true
-                        self.locationManager.stopUpdatingHeading()
-                        continuation.resume(throwing: SensorBridgeError.timeout(sensor: .compass))
+                    compassWaiters[waiterId] = (continuation: continuation, timeoutTask: timeoutTask)
+                    if shouldStart {
+                        locationManager.startUpdatingHeading()
                     }
                 }
-
-                permissionHandlers[.compass] = { [weak self] _ in
-                    if !hasResumed {
-                        hasResumed = true
-                        self?.locationManager.stopUpdatingHeading()
-                        continuation.resume(throwing: SensorBridgeError.permissionDenied(sensor: .compass))
+            } onCancel: {
+                Task { @MainActor [weak self] in
+                    guard let self, let entry = self.compassWaiters.removeValue(forKey: waiterId) else {
+                        return
                     }
+                    entry.timeoutTask.cancel()
+                    if self.compassWaiters.isEmpty {
+                        self.locationManager.stopUpdatingHeading()
+                    }
+                    entry.continuation.resume(throwing: CancellationError())
                 }
             }
+            return payload.value
         #else
             throw SensorBridgeError.sensorUnavailable(sensor: .compass)
         #endif
     }
+
+    private static func makeLocationPayload(
+        latitude: Double,
+        longitude: Double,
+        altitude: Double,
+        horizontalAccuracy: Double,
+        verticalAccuracy: Double,
+        timestamp: String
+    ) -> [String: Any] {
+        [
+            "latitude": latitude,
+            "longitude": longitude,
+            "altitude": altitude,
+            "horizontal_accuracy": horizontalAccuracy,
+            "vertical_accuracy": verticalAccuracy,
+            "timestamp": timestamp,
+        ]
+    }
+
+    #if os(iOS) || os(watchOS)
+        private static func makeCompassPayload(
+            magneticHeading: Double,
+            trueHeading: Double,
+            headingAccuracy: Double,
+            timestamp: String
+        ) -> [String: Any] {
+            [
+                "magnetic_heading": magneticHeading,
+                "true_heading": trueHeading,
+                "heading_accuracy": headingAccuracy,
+                "timestamp": timestamp,
+            ]
+        }
+
+        private static func makeMotionPayload(
+            accX: Double, accY: Double, accZ: Double,
+            rotX: Double, rotY: Double, rotZ: Double,
+            gravX: Double, gravY: Double, gravZ: Double
+        ) -> [String: Any] {
+            [
+                "acceleration": [
+                    "x": accX,
+                    "y": accY,
+                    "z": accZ,
+                ],
+                "rotation": [
+                    "x": rotX,
+                    "y": rotY,
+                    "z": rotZ,
+                ],
+                "gravity": [
+                    "x": gravX,
+                    "y": gravY,
+                    "z": gravZ,
+                ],
+            ]
+        }
+    #endif
 
     private func processData(_ data: [String: Any], scope: DataScope, sensor: SensorType) -> ([String: Any], [String]) {
         var processedData = data
@@ -331,20 +456,51 @@ public final class SensorBridge: NSObject, ObservableObject {
 
 extension SensorBridge: @preconcurrency CLLocationManagerDelegate {
     public func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
-        guard !locations.isEmpty else { return }
+        guard let location = locations.last else { return }
 
-        if let handler = permissionHandlers[.location] {
-            permissionHandlers.removeValue(forKey: .location)
-            handler(true)
+        let latitude = location.coordinate.latitude
+        let longitude = location.coordinate.longitude
+        let altitude = location.altitude
+        let horizontalAccuracy = location.horizontalAccuracy
+        let verticalAccuracy = location.verticalAccuracy
+        let timestamp = ISO8601DateFormatter().string(from: location.timestamp)
+
+        let waiters = locationWaiters
+        locationWaiters.removeAll()
+        for (_, entry) in waiters {
+            entry.timeoutTask.cancel()
+            entry.continuation.resume(returning: SensorPayloadBox(value: Self.makeLocationPayload(
+                latitude: latitude,
+                longitude: longitude,
+                altitude: altitude,
+                horizontalAccuracy: horizontalAccuracy,
+                verticalAccuracy: verticalAccuracy,
+                timestamp: timestamp
+            )))
         }
     }
 
     public func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
         print("[SensorBridge] Location error: \(error.localizedDescription)")
 
-        if let handler = permissionHandlers[.location] {
-            permissionHandlers.removeValue(forKey: .location)
-            handler(false)
+        #if os(iOS) || os(watchOS)
+            if let clError = error as? CLError, clError.code == .headingFailure {
+                let headingWaiters = compassWaiters
+                compassWaiters.removeAll()
+                manager.stopUpdatingHeading()
+                for (_, entry) in headingWaiters {
+                    entry.timeoutTask.cancel()
+                    entry.continuation.resume(throwing: error)
+                }
+                return
+            }
+        #endif
+
+        let waiters = locationWaiters
+        locationWaiters.removeAll()
+        for (_, entry) in waiters {
+            entry.timeoutTask.cancel()
+            entry.continuation.resume(throwing: error)
         }
     }
 
@@ -359,15 +515,10 @@ extension SensorBridge: @preconcurrency CLLocationManagerDelegate {
             let authorized = false
         #endif
 
-        if authorized {
-            if let handler = permissionHandlers[.location] {
-                permissionHandlers.removeValue(forKey: .location)
-                handler(true)
-            }
-        } else if status == .denied || status == .restricted {
-            if let handler = permissionHandlers[.location] {
-                permissionHandlers.removeValue(forKey: .location)
-                handler(false)
+        if authorized || status == .denied || status == .restricted {
+            let waiters = permissionWaiters.removeValue(forKey: .location) ?? []
+            for continuation in waiters {
+                continuation.resume(returning: authorized)
             }
         }
     }
@@ -376,12 +527,24 @@ extension SensorBridge: @preconcurrency CLLocationManagerDelegate {
         public func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {
             guard newHeading.headingAccuracy >= 0 else { return }
 
-            if let handler = permissionHandlers[.compass] {
-                permissionHandlers.removeValue(forKey: .compass)
-                handler(true)
-            }
+            let magneticHeading = newHeading.magneticHeading
+            let trueHeading = newHeading.trueHeading
+            let headingAccuracy = newHeading.headingAccuracy
+            let timestamp = ISO8601DateFormatter().string(from: newHeading.timestamp)
 
+            let waiters = compassWaiters
+            compassWaiters.removeAll()
             manager.stopUpdatingHeading()
+
+            for (_, entry) in waiters {
+                entry.timeoutTask.cancel()
+                entry.continuation.resume(returning: SensorPayloadBox(value: Self.makeCompassPayload(
+                    magneticHeading: magneticHeading,
+                    trueHeading: trueHeading,
+                    headingAccuracy: headingAccuracy,
+                    timestamp: timestamp
+                )))
+            }
         }
     #endif
 }

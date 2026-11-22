@@ -172,24 +172,19 @@ public enum PasskeyCredentialAttestation {
     }
 
     /// An EC2 P-256 COSE_Key: kty (1) = EC2 (2), crv (−1) = P-256 (1), x (−2) and y (−3) of 32 bytes, each once, on the
-    /// curve. Other labels are ignored. The identity key set's entries use it too.
+    /// curve. All labels must be unique integer or text labels (RFC 9052); other labels are ignored. The identity key
+    /// set's entries use it too.
     static func publicKey(_ item: CBOR?) -> P256.Signing.PublicKey? {
         guard case .map(let pairs)? = item else { return nil }
+        var seen = Set<Label>()
         var kty: CBOR?, crv: CBOR?, x: CBOR?, y: CBOR?
-        for (label, value) in pairs {
+        for (key, value) in pairs {
+            guard let label = label(key), seen.insert(label).inserted else { return nil }
             switch label {
-            case .uint(1):
-                guard kty == nil else { return nil }
-                kty = value
-            case .nint(0):
-                guard crv == nil else { return nil }
-                crv = value
-            case .nint(1):
-                guard x == nil else { return nil }
-                x = value
-            case .nint(2):
-                guard y == nil else { return nil }
-                y = value
+            case .uint(1): kty = value
+            case .nint(0): crv = value
+            case .nint(1): x = value
+            case .nint(2): y = value
             default: continue
             }
         }

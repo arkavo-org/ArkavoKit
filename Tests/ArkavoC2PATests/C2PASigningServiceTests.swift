@@ -367,6 +367,87 @@ final class C2PASigningServiceTests: XCTestCase {
         XCTAssertTrue(C2PASigningService().session === C2PASigningService.defaultSession)
     }
 
+    func testRefusesNonHTTPSURLWhenAccessOrDeviceTokenIsPresent() async throws {
+        var requestSent = false
+        StubURLProtocol.handler = { _, _ in
+            requestSent = true
+            return (200, Self.successBody(manifest: Self.manifestStore))
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StubURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let insecureURL = URL(string: "http://signer.test")!
+
+        for service in [
+            C2PASigningService(serverURL: insecureURL, session: session, accessToken: { "bearer-cwt" }),
+            C2PASigningService(serverURL: insecureURL, session: session, deviceToken: { "device-cwt" }),
+        ] {
+            do {
+                _ = try await service.signManifest(sampleRequest())
+                XCTFail("expected invalidResponse for insecure URL with token")
+            } catch C2PASigningService.ServiceError.invalidResponse {
+            }
+        }
+        XCTAssertFalse(requestSent)
+    }
+
+    func testAllowsLoopbackHTTPWithTokensForLocalTesting() async throws {
+        StubURLProtocol.handler = { _, _ in
+            (200, Self.successBody(manifest: Self.manifestStore))
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StubURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+
+        for loopback in ["http://127.0.0.1:8080", "http://localhost:8080", "http://[::1]:8080"] {
+            let service = C2PASigningService(
+                serverURL: URL(string: loopback)!,
+                session: session,
+                accessToken: { "bearer-cwt" },
+                deviceToken: { "device-cwt" }
+            )
+            let manifest = try await service.signManifest(sampleRequest())
+            XCTAssertEqual(manifest, Self.manifestStore)
+        }
+    }
+
+    func testAssertionDataDecodesMetadataWithoutBeingSwallowedByCreativeWork() throws {
+        var builder = C2PAManifestBuilder(title: "Test", format: "video/quicktime")
+        _ = builder.addCreatedAction(when: Date(timeIntervalSince1970: 1_800_000_000))
+        _ = builder.addAuthor(name: "Alice", identifier: "did:example:alice")
+        _ = builder.addDeviceMetadata(model: "MacBookPro", os: "macOS 27")
+        let manifest = builder.build()
+
+        let encoded = try JSONEncoder().encode(manifest)
+        let decoded = try JSONDecoder().decode(C2PAManifest.self, from: encoded)
+        XCTAssertEqual(decoded.assertions.count, 3)
+
+        guard case .actions(let actions) = decoded.assertions[0].data else {
+            return XCTFail("expected .actions, got \(decoded.assertions[0].data)")
+        }
+        XCTAssertEqual(actions.actions.first?.action, "c2pa.created")
+
+        guard case .creativeWork(let work) = decoded.assertions[1].data else {
+            return XCTFail("expected .creativeWork, got \(decoded.assertions[1].data)")
+        }
+        XCTAssertEqual(work.author?.first?.name, "Alice")
+
+        guard case .metadata(let metadata) = decoded.assertions[2].data else {
+            return XCTFail("expected .metadata, got \(decoded.assertions[2].data)")
+        }
+        XCTAssertEqual(metadata.values["model"], "MacBookPro")
+        XCTAssertEqual(metadata.values["os"], "macOS 27")
+
+        let authorStringMetadata = try JSONDecoder().decode(
+            AssertionData.self,
+            from: Data(#"{"author":"plain-string"}"#.utf8)
+        )
+        guard case .metadata(let stringMeta) = authorStringMetadata else {
+            return XCTFail("expected .metadata for string-valued author, got \(authorStringMetadata)")
+        }
+        XCTAssertEqual(stringMeta.values["author"], "plain-string")
+    }
+
     // MARK: - Fixtures
 
     /// A minimal JUMBF manifest store: one `jumb` superbox

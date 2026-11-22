@@ -32,6 +32,9 @@ public final class AudioEncoder: @unchecked Sendable {
     }
 
     private let state = Mutex(State())
+    /// Serializes encode + `onFrame` delivery across concurrent `feed` calls without
+    /// blocking `onFrame` getter/setter (which only acquire `state`).
+    private let deliveryLock = Mutex<Bool>(false)
 
     // Set in init, immutable thereafter — safe to read without locking.
     private let converter: AVAudioConverter
@@ -118,14 +121,30 @@ public final class AudioEncoder: @unchecked Sendable {
             return
         }
 
+        // Validate input PCM format: must be 48 kHz, 2-channel, interleaved signed 16-bit PCM.
+        let bytesPerFrame = Int(pcmFormat.streamDescription.pointee.mBytesPerFrame)
+        guard let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc)?.pointee,
+              asbd.mFormatID == kAudioFormatLinearPCM,
+              asbd.mSampleRate == sampleRate,
+              asbd.mChannelsPerFrame == channelCount,
+              asbd.mBitsPerChannel == 16,
+              (asbd.mFormatFlags & kAudioFormatFlagIsSignedInteger) != 0,
+              (asbd.mFormatFlags & kAudioFormatFlagIsFloat) == 0,
+              (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0,
+              Int(asbd.mBytesPerFrame) == bytesPerFrame else {
+            print("❌ AudioEncoder: Unsupported input PCM format (expected 48kHz stereo interleaved Int16)")
+            return
+        }
+
         // Whole frames only: a trailing partial frame would overrun the copy or shift the
         // channels for the rest of the stream.
-        let bytesPerFrame = Int(pcmFormat.streamDescription.pointee.mBytesPerFrame)
         let frameCount = CMBlockBufferGetDataLength(dataBuffer) / bytesPerFrame
         guard frameCount > 0 else { return }
         var samples = [Int16](repeating: 0, count: frameCount * Int(channelCount))
-        let status = samples.withUnsafeMutableBytes { raw in
-            CMBlockBufferCopyDataBytes(dataBuffer, atOffset: 0, dataLength: frameCount * bytesPerFrame, destination: raw.baseAddress!)
+        let status = samples.withUnsafeMutableBytes { raw -> OSStatus in
+            guard let base = raw.baseAddress else { return kCMBlockBufferBadPointerParameterErr }
+            return CMBlockBufferCopyDataBytes(dataBuffer, atOffset: 0, dataLength: frameCount * bytesPerFrame, destination: base)
         }
         guard status == kCMBlockBufferNoErr else {
             print("❌ AudioEncoder: Failed to copy PCM data (\(status))")
@@ -134,11 +153,14 @@ public final class AudioEncoder: @unchecked Sendable {
 
         let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
 
-        let frames: [EncodedAudioFrame] = state.withLock { state in
-            self.append(state: &state, samples: samples, frameCount: frameCount, timestamp: timestamp)
+        deliveryLock.withLock { _ in
+            let (frames, cb): ([EncodedAudioFrame], (@Sendable (EncodedAudioFrame) -> Void)?) = state.withLock { state in
+                let encoded = self.append(state: &state, samples: samples, frameCount: frameCount, timestamp: timestamp)
+                return (encoded, state.onFrame)
+            }
+            guard !frames.isEmpty, let cb else { return }
+            for frame in frames { cb(frame) }
         }
-        guard !frames.isEmpty, let cb = state.withLock({ $0.onFrame }) else { return }
-        for frame in frames { cb(frame) }
     }
 
     // MARK: - Private Methods
@@ -153,7 +175,7 @@ public final class AudioEncoder: @unchecked Sendable {
     ) -> [EncodedAudioFrame] {
         let tick = CMTimeScale(sampleRate)
         let packetDuration = CMTime(value: CMTimeValue(targetFrameCount), timescale: tick)
-        if let next = state.nextOutputPTS {
+        if let next = state.nextOutputPTS, next.isNumeric {
             // Where this buffer should start if nothing was lost: the output clock plus what is
             // still queued. Audio a source dropped or paused over puts the input ahead of that;
             // past the threshold the clock jumps across the difference, so small losses cannot
@@ -162,12 +184,15 @@ public final class AudioEncoder: @unchecked Sendable {
             if timestamp.isNumeric {
                 let queued = CMTime(value: CMTimeValue(state.pending.count / Int(channelCount)), timescale: tick)
                 let drift = timestamp - (next + queued)
-                if drift.seconds > maxContinuityGap {
+                if drift.isNumeric && drift.seconds > maxContinuityGap {
                     state.nextOutputPTS = next + drift
                 }
             }
-        } else {
+        } else if timestamp.isNumeric {
             state.nextOutputPTS = timestamp
+        } else {
+            // Do not poison nextOutputPTS with a non-numeric timestamp; wait for a valid anchor.
+            return []
         }
 
         state.pending.append(contentsOf: samples)

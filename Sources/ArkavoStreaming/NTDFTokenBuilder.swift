@@ -79,7 +79,42 @@ public struct NTDFTokenPayload: Sendable {
         self.did = did
     }
 
-    /// Serialize payload to binary format per NTDF spec
+    /// Serialize payload to binary format per NTDF spec, rejecting any field
+    /// that exceeds its wire-format length limit.
+    public func toBytesChecked() throws -> Data {
+        guard scopes.count <= Int(UInt16.max) else {
+            throw NTDFTokenError.serializationFailed("Too many scopes: \(scopes.count)")
+        }
+        for scope in scopes {
+            let scopeCount = scope.utf8.count
+            guard scopeCount <= Int(UInt8.max) else {
+                throw NTDFTokenError.serializationFailed("Scope exceeds 255 UTF-8 bytes (\(scopeCount))")
+            }
+        }
+        guard attrs.count <= Int(UInt16.max) else {
+            throw NTDFTokenError.serializationFailed("Too many attributes: \(attrs.count)")
+        }
+        let audCount = aud.utf8.count
+        guard audCount <= Int(UInt16.max) else {
+            throw NTDFTokenError.serializationFailed("Audience exceeds 65535 UTF-8 bytes (\(audCount))")
+        }
+        if let deviceId {
+            let deviceCount = deviceId.utf8.count
+            guard deviceCount <= Int(UInt8.max) else {
+                throw NTDFTokenError.serializationFailed("deviceId exceeds 255 UTF-8 bytes (\(deviceCount))")
+            }
+        }
+        if let did {
+            let didCount = did.utf8.count
+            guard didCount <= Int(UInt16.max) else {
+                throw NTDFTokenError.serializationFailed("did exceeds 65535 UTF-8 bytes (\(didCount))")
+            }
+        }
+        return toBytes()
+    }
+
+    /// Serialize payload to binary format per NTDF spec.
+    /// Safely clamps any oversized fields to wire-format limits instead of trapping.
     public func toBytes() -> Data {
         var buf = Data()
 
@@ -92,22 +127,24 @@ public struct NTDFTokenPayload: Sendable {
         buf.append(contentsOf: withUnsafeBytes(of: &flagsValue) { Data($0) })
 
         // scopes_count (2 bytes, u16 little-endian)
-        var scopesCount = UInt16(scopes.count).littleEndian
+        let clampedScopes = scopes.prefix(Int(UInt16.max))
+        var scopesCount = UInt16(clampedScopes.count).littleEndian
         buf.append(contentsOf: withUnsafeBytes(of: &scopesCount) { Data($0) })
 
-        // scopes (length-prefixed strings)
-        for scope in scopes {
-            let scopeData = scope.data(using: .utf8) ?? Data()
+        // scopes (length-prefixed strings, max 255 UTF-8 bytes each)
+        for scope in clampedScopes {
+            let scopeData = Self.truncateUTF8(scope, maxBytes: Int(UInt8.max))
             buf.append(UInt8(scopeData.count))
             buf.append(scopeData)
         }
 
         // attrs_count (2 bytes, u16 little-endian)
-        var attrsCount = UInt16(attrs.count).littleEndian
+        let clampedAttrs = attrs.prefix(Int(UInt16.max))
+        var attrsCount = UInt16(clampedAttrs.count).littleEndian
         buf.append(contentsOf: withUnsafeBytes(of: &attrsCount) { Data($0) })
 
         // attrs (type: 1 byte, value: 4 bytes little-endian)
-        for (attrType, attrValue) in attrs {
+        for (attrType, attrValue) in clampedAttrs {
             buf.append(attrType)
             var value = attrValue.littleEndian
             buf.append(contentsOf: withUnsafeBytes(of: &value) { Data($0) })
@@ -131,7 +168,7 @@ public struct NTDFTokenPayload: Sendable {
         buf.append(contentsOf: withUnsafeBytes(of: &expValue) { Data($0) })
 
         // aud_length (2 bytes, u16 little-endian) + aud
-        let audData = aud.data(using: .utf8) ?? Data()
+        let audData = Self.truncateUTF8(aud, maxBytes: Int(UInt16.max))
         var audLength = UInt16(audData.count).littleEndian
         buf.append(contentsOf: withUnsafeBytes(of: &audLength) { Data($0) })
         buf.append(audData)
@@ -147,7 +184,7 @@ public struct NTDFTokenPayload: Sendable {
 
         // device_id_present (1 byte)
         if let deviceId {
-            let deviceIdData = deviceId.data(using: .utf8) ?? Data()
+            let deviceIdData = Self.truncateUTF8(deviceId, maxBytes: Int(UInt8.max))
             buf.append(1)
             buf.append(UInt8(deviceIdData.count))
             buf.append(deviceIdData)
@@ -157,7 +194,7 @@ public struct NTDFTokenPayload: Sendable {
 
         // did_present (1 byte)
         if let did {
-            let didData = did.data(using: .utf8) ?? Data()
+            let didData = Self.truncateUTF8(did, maxBytes: Int(UInt16.max))
             buf.append(1)
             var didLength = UInt16(didData.count).littleEndian
             buf.append(contentsOf: withUnsafeBytes(of: &didLength) { Data($0) })
@@ -167,6 +204,23 @@ public struct NTDFTokenPayload: Sendable {
         }
 
         return buf
+    }
+
+    private static func truncateUTF8(_ value: String, maxBytes: Int) -> Data {
+        let full = Data(value.utf8)
+        if full.count <= maxBytes {
+            return full
+        }
+        var result = Data()
+        result.reserveCapacity(maxBytes)
+        for scalar in value.unicodeScalars {
+            let scalarBytes = scalar.utf8
+            if result.count + scalarBytes.count > maxBytes {
+                break
+            }
+            result.append(contentsOf: scalarBytes)
+        }
+        return result
     }
 }
 
@@ -213,27 +267,27 @@ public actor NTDFTokenBuilder {
     public func build(payload: NTDFTokenPayload) async throws -> String {
         print("🔐 Building NTDF token for subId=\(payload.subId)")
 
-        // 1. Serialize payload to binary
-        let plaintext = payload.toBytes()
+        // 1. Serialize payload to binary (validating wire limits)
+        let plaintext = try payload.toBytesChecked()
         print("📦 Payload serialized: \(plaintext.count) bytes")
 
-        // 2. Create KasMetadata
-        let host = URL(string: kasURL)?.host ?? "kas.arkavo.net"
-        guard let resourceLocator = ResourceLocator(protocolEnum: .https, body: host) else {
-            throw NTDFTokenError.invalidKeyFormat("Failed to create ResourceLocator for \(host)")
-        }
+        // 2. Create KasMetadata (validating scheme and preserving non-default port)
+        let locator = try Self.makeResourceLocator(from: kasURL)
 
         let p256PublicKey = try P256.KeyAgreement.PublicKey(compressedRepresentation: kasPublicKeyBytes)
         let kasMetadata = try KasMetadata(
-            resourceLocator: resourceLocator,
+            resourceLocator: locator,
             publicKey: p256PublicKey,
             curve: .secp256r1
         )
 
-        // 3. Create NanoTDF with embedded plaintext policy containing the payload
+        // 3. Create NanoTDF with a minimal non-sensitive policy header so
+        // authentication claims remain encrypted in the NanoTDF payload only.
+        let policyUUID = UUID().uuidString.lowercased()
+        let policyJSON = "{\"uuid\":\"\(policyUUID)\",\"body\":{\"dataAttributes\":[],\"dissem\":[]}}"
         var policy = Policy(
             type: .embeddedPlaintext,
-            body: EmbeddedPolicyBody(body: plaintext),
+            body: EmbeddedPolicyBody(body: Data(policyJSON.utf8)),
             remote: nil
         )
 
@@ -253,6 +307,33 @@ public actor NTDFTokenBuilder {
         print("✅ NTDF token generated: \(z85Token.count) chars")
 
         return z85Token
+    }
+
+    static func makeResourceLocator(from urlString: String) throws -> ResourceLocator {
+        guard let parsed = URL(string: urlString),
+              let host = parsed.host, !host.isEmpty,
+              let scheme = parsed.scheme?.lowercased() else {
+            throw NTDFTokenError.invalidKeyFormat("Invalid KAS URL: \(urlString)")
+        }
+
+        let isLoopback = KASPublicKeyService.isLoopbackHost(host)
+        guard scheme == "https" || (scheme == "http" && isLoopback) else {
+            throw NTDFTokenError.invalidKeyFormat("KAS URL must use HTTPS (got \(scheme)://\(host))")
+        }
+
+        let protocolEnum: ProtocolEnum = scheme == "https" ? .https : .http
+        let defaultPort = scheme == "https" ? 443 : 80
+        let body: String
+        if let port = parsed.port, port != defaultPort {
+            body = "\(host):\(port)"
+        } else {
+            body = host
+        }
+
+        guard let resourceLocator = ResourceLocator(protocolEnum: protocolEnum, body: body) else {
+            throw NTDFTokenError.invalidKeyFormat("Failed to create ResourceLocator for \(body)")
+        }
+        return resourceLocator
     }
 }
 
@@ -275,13 +356,19 @@ public enum Z85 {
         return table
     }()
 
-    /// Encode binary data to Z85 string
-    /// - Parameter data: Binary data to encode (will be padded to multiple of 4 bytes)
+    /// Encode binary data to Z85 string.
+    ///
+    /// Note: Per ZeroMQ RFC 32, Z85 operates on 4-byte blocks. Inputs whose byte
+    /// length is not a multiple of 4 are right-padded with zero bytes (required by
+    /// NanoTDF token framing); callers requiring lossless round-trip of arbitrary
+    /// lengths should use `encodeExact(_:)` on 4-byte-aligned inputs or frame the
+    /// original byte length separately.
+    /// - Parameter data: Binary data to encode (slices with non-zero startIndex are supported)
     /// - Returns: Z85-encoded string
     public static func encode(_ data: Data) -> String {
-        // Pad to multiple of 4 bytes
-        var paddedData = data
-        let remainder = data.count % 4
+        // Normalize slice startIndex to 0 and pad to multiple of 4 bytes
+        var paddedData = data.startIndex == 0 ? data : Data(data)
+        let remainder = paddedData.count % 4
         if remainder != 0 {
             let padding = 4 - remainder
             paddedData.append(contentsOf: [UInt8](repeating: 0, count: padding))
@@ -309,32 +396,47 @@ public enum Z85 {
         return result
     }
 
+    /// Strict RFC 32 Z85 encode: returns `nil` if `data.count` is not a multiple of 4,
+    /// guaranteeing exact byte-length round-trip through `decode(_:)`.
+    public static func encodeExact(_ data: Data) -> String? {
+        guard data.count % 4 == 0 else {
+            return nil
+        }
+        return encode(data)
+    }
+
     /// Decode Z85 string to binary data
     /// - Parameter string: Z85-encoded string
-    /// - Returns: Decoded binary data, or nil if invalid
+    /// - Returns: Decoded binary data, or nil if invalid or a 5-character block overflows UInt32
     public static func decode(_ string: String) -> Data? {
-        guard string.count % 5 == 0 else {
+        let bytes = Array(string.utf8)
+        guard bytes.count % 5 == 0 else {
             return nil
         }
 
         var result = Data()
-        result.reserveCapacity((string.count / 5) * 4)
+        result.reserveCapacity((bytes.count / 5) * 4)
 
-        let bytes = Array(string.utf8)
         for i in stride(from: 0, to: bytes.count, by: 5) {
-            var value: UInt32 = 0
+            var value: UInt64 = 0
             for j in 0..<5 {
                 guard let decoded = decodeTable[bytes[i + j]] else {
                     return nil
                 }
-                value = value * 85 + UInt32(decoded)
+                value = value * 85 + UInt64(decoded)
             }
 
+            // Valid 5-character Z85 alphabet blocks can represent up to 85^5 - 1 > UInt32.max.
+            guard value <= UInt64(UInt32.max) else {
+                return nil
+            }
+
+            let word = UInt32(value)
             // Write 4 bytes in big-endian order
-            result.append(UInt8((value >> 24) & 0xFF))
-            result.append(UInt8((value >> 16) & 0xFF))
-            result.append(UInt8((value >> 8) & 0xFF))
-            result.append(UInt8(value & 0xFF))
+            result.append(UInt8((word >> 24) & 0xFF))
+            result.append(UInt8((word >> 16) & 0xFF))
+            result.append(UInt8((word >> 8) & 0xFF))
+            result.append(UInt8(word & 0xFF))
         }
 
         return result

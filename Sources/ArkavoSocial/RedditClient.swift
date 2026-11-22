@@ -4,19 +4,22 @@ import SwiftUI
 public class RedditClient: ObservableObject {
     // MARK: - Published Properties
 
-    @Published public var isAuthenticated = false
-    @Published public var isLoading = false
-    @Published public var showingWebView = false
-    @Published public var username = ""
-    @Published public var error: RedditError?
+    @MainActor @Published public var isAuthenticated = false
+    @MainActor @Published public var isLoading = false
+    @MainActor @Published public var showingWebView = false
+    @MainActor @Published public var username = ""
+    @MainActor @Published public var error: RedditError?
 
     // MARK: - Private Properties
 
     private let clientId: String
     private let redirectUri: String
-    private var accessToken: String?
-    private var refreshToken: String?
-    private var tokenExpirationDate: Date?
+    @MainActor private var accessToken: String?
+    @MainActor private var refreshToken: String?
+    @MainActor private var tokenExpirationDate: Date?
+    @MainActor private var pendingOAuthState: String?
+    @MainActor private var sessionGeneration: UInt64 = 0
+    @MainActor private var activeRefreshTask: Task<Void, Error>?
 
     // MARK: - Keychain Constants
 
@@ -32,15 +35,6 @@ public class RedditClient: ObservableObject {
     public init(clientId: String, redirectUri: String = "arkavocreator://oauth/reddit") {
         self.clientId = clientId
         self.redirectUri = redirectUri
-        // TODO: handle call. fix concurrency issue
-//        NotificationCenter.default.addObserver(
-//            forName: Notification.Name("RedditOAuthCallback"),
-//            object: nil,
-//            queue: .main
-//        ) { [weak self] notification in
-//            guard let url = notification.userInfo?["url"] as? URL else { return }
-//            self?.handleCallback(url)
-//        }
     }
 
     // MARK: - Token Management
@@ -66,7 +60,7 @@ public class RedditClient: ObservableObject {
         isAuthenticated = accessToken != nil
 
         if isAuthenticated {
-            Task {
+            Task { @MainActor in
                 await fetchUsername()
             }
         }
@@ -74,12 +68,16 @@ public class RedditClient: ObservableObject {
 
     // MARK: - Authentication URL
 
+    @MainActor
     public var authURL: URL {
+        let state = UUID().uuidString
+        pendingOAuthState = state
+
         var components = URLComponents(string: "https://www.reddit.com/api/v1/authorize")!
         components.queryItems = [
             URLQueryItem(name: "client_id", value: clientId),
             URLQueryItem(name: "response_type", value: "code"),
-            URLQueryItem(name: "state", value: UUID().uuidString),
+            URLQueryItem(name: "state", value: state),
             URLQueryItem(name: "redirect_uri", value: redirectUri),
             URLQueryItem(name: "duration", value: "permanent"),
             URLQueryItem(name: "scope", value: "identity read submit"),
@@ -89,28 +87,54 @@ public class RedditClient: ObservableObject {
 
     // MARK: - Public Methods
 
+    @MainActor
     public func startOAuth() {
         showingWebView = true
     }
 
     @MainActor
     public func handleCallback(_ url: URL) {
-        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              let code = components.queryItems?.first(where: { $0.name == "code" })?.value
-        else {
+        showingWebView = false
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
             handleError(RedditError.invalidCallback)
             return
         }
 
+        let queryItems = components.queryItems ?? []
+        if queryItems.contains(where: { $0.name == "error" }) {
+            pendingOAuthState = nil
+            handleError(RedditError.invalidCallback)
+            return
+        }
+
+        guard let expectedState = pendingOAuthState,
+              let returnedState = queryItems.first(where: { $0.name == "state" })?.value,
+              returnedState == expectedState,
+              let code = queryItems.first(where: { $0.name == "code" })?.value,
+              !code.isEmpty
+        else {
+            pendingOAuthState = nil
+            handleError(RedditError.invalidCallback)
+            return
+        }
+        pendingOAuthState = nil
+
         Task { @MainActor in
             await exchangeCodeForToken(code)
         }
-        showingWebView = false
     }
 
+    @MainActor
     private func saveTokens(accessToken: String, refreshToken: String?, expirationDate: Date) {
         self.accessToken = accessToken
-        self.refreshToken = refreshToken
+        if let refreshToken, !refreshToken.isEmpty {
+            self.refreshToken = refreshToken
+            KeychainManager.save(
+                value: refreshToken,
+                service: keychainServiceBase,
+                account: KeychainKey.refreshToken,
+            )
+        }
         tokenExpirationDate = expirationDate
 
         // Save to Keychain
@@ -120,14 +144,6 @@ public class RedditClient: ObservableObject {
             account: KeychainKey.accessToken,
         )
 
-        if let refreshToken {
-            KeychainManager.save(
-                value: refreshToken,
-                service: keychainServiceBase,
-                account: KeychainKey.refreshToken,
-            )
-        }
-
         KeychainManager.save(
             value: ISO8601DateFormatter().string(from: expirationDate),
             service: keychainServiceBase,
@@ -135,7 +151,13 @@ public class RedditClient: ObservableObject {
         )
     }
 
+    @MainActor
     public func logout() {
+        sessionGeneration &+= 1
+        activeRefreshTask?.cancel()
+        activeRefreshTask = nil
+        pendingOAuthState = nil
+
         // Clear Keychain
         try? KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.accessToken)
         try? KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.refreshToken)
@@ -152,35 +174,28 @@ public class RedditClient: ObservableObject {
 
     @MainActor
     public func fetchUserInfo() async throws -> RedditUserInfo {
-        try await withCheckedThrowingContinuation { continuation in
-            Task {
-                do {
-                    _ = try await getValidAccessToken()
-                    let request = try makeAuthorizedRequest(url: URL(string: "https://oauth.reddit.com/api/v1/me")!)
+        _ = try await getValidAccessToken()
+        let request = try makeAuthorizedRequest(url: URL(string: "https://oauth.reddit.com/api/v1/me")!)
 
-                    let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await URLSession.shared.data(for: request)
 
-                    guard let httpResponse = response as? HTTPURLResponse else {
-                        throw RedditError.invalidResponse
-                    }
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw RedditError.invalidResponse
+        }
 
-                    if httpResponse.statusCode == 200 {
-                        let userInfo = try JSONDecoder().decode(RedditUserInfo.self, from: data)
-                        continuation.resume(returning: userInfo)
-                    } else {
-                        throw RedditError.httpError(statusCode: httpResponse.statusCode)
-                    }
-                } catch {
-                    continuation.resume(throwing: error)
-                }
-            }
+        if httpResponse.statusCode == 200 {
+            return try JSONDecoder().decode(RedditUserInfo.self, from: data)
+        } else {
+            throw RedditError.httpError(statusCode: httpResponse.statusCode)
         }
     }
 
     @MainActor
     private func exchangeCodeForToken(_ code: String) async {
+        let generation = sessionGeneration
         isLoading = true
         error = nil
+        defer { isLoading = false }
 
         do {
             let tokenURL = URL(string: "https://www.reddit.com/api/v1/access_token")!
@@ -188,7 +203,7 @@ public class RedditClient: ObservableObject {
             request.httpMethod = "POST"
 
             let authString = "\(clientId):"
-            let authData = authString.data(using: .utf8)!.base64EncodedString()
+            let authData = Data(authString.utf8).base64EncodedString()
             request.setValue("Basic \(authData)", forHTTPHeaderField: "Authorization")
             request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
 
@@ -202,61 +217,83 @@ public class RedditClient: ObservableObject {
 
             let (data, response) = try await URLSession.shared.data(for: request)
 
+            guard sessionGeneration == generation else { return }
+
             guard let httpResponse = response as? HTTPURLResponse else {
                 throw RedditError.invalidResponse
             }
 
             if httpResponse.statusCode == 200 {
                 let tokenResponse = try JSONDecoder().decode(RedditTokenResponse.self, from: data)
-                handleTokenResponse(tokenResponse)
+                guard sessionGeneration == generation else { return }
+                handleTokenResponse(tokenResponse, fetchUser: true)
             } else {
                 throw RedditError.httpError(statusCode: httpResponse.statusCode)
             }
         } catch {
-            handleError(error)
+            if sessionGeneration == generation {
+                handleError(error)
+            }
         }
-
-        isLoading = false
     }
 
     @MainActor
     public func refreshAccessToken() async throws {
-        guard let refreshToken else {
+        if let existingTask = activeRefreshTask {
+            return try await existingTask.value
+        }
+
+        let generation = sessionGeneration
+        guard let currentRefreshToken = refreshToken, !currentRefreshToken.isEmpty else {
             throw RedditError.noRefreshToken
         }
 
-        let tokenURL = URL(string: "https://www.reddit.com/api/v1/access_token")!
-        var request = URLRequest(url: tokenURL)
-        request.httpMethod = "POST"
+        let task = Task<Void, Error> { @MainActor in
+            defer { self.activeRefreshTask = nil }
 
-        let authString = "\(clientId):"
-        let authData = authString.data(using: .utf8)!.base64EncodedString()
-        request.setValue("Basic \(authData)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+            let tokenURL = URL(string: "https://www.reddit.com/api/v1/access_token")!
+            var request = URLRequest(url: tokenURL)
+            request.httpMethod = "POST"
 
-        let parameters = [
-            "grant_type": "refresh_token",
-            "refresh_token": refreshToken,
-        ]
+            let authString = "\(self.clientId):"
+            let authData = Data(authString.utf8).base64EncodedString()
+            request.setValue("Basic \(authData)", forHTTPHeaderField: "Authorization")
+            request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
 
-        request.httpBody = parameters.percentEncoded()
+            let parameters = [
+                "grant_type": "refresh_token",
+                "refresh_token": currentRefreshToken,
+            ]
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+            request.httpBody = parameters.percentEncoded()
 
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw RedditError.invalidResponse
+            let (data, response) = try await URLSession.shared.data(for: request)
+
+            guard self.sessionGeneration == generation else {
+                throw CancellationError()
+            }
+
+            guard let httpResponse = response as? HTTPURLResponse else {
+                throw RedditError.invalidResponse
+            }
+
+            if httpResponse.statusCode == 200 {
+                let tokenResponse = try JSONDecoder().decode(RedditTokenResponse.self, from: data)
+                guard self.sessionGeneration == generation else {
+                    throw CancellationError()
+                }
+                self.handleTokenResponse(tokenResponse, fetchUser: false)
+            } else {
+                throw RedditError.httpError(statusCode: httpResponse.statusCode)
+            }
         }
 
-        if httpResponse.statusCode == 200 {
-            let tokenResponse = try JSONDecoder().decode(RedditTokenResponse.self, from: data)
-            handleTokenResponse(tokenResponse)
-        } else {
-            throw RedditError.httpError(statusCode: httpResponse.statusCode)
-        }
+        activeRefreshTask = task
+        return try await task.value
     }
 
     @MainActor
-    private func handleTokenResponse(_ response: RedditTokenResponse) {
+    private func handleTokenResponse(_ response: RedditTokenResponse, fetchUser: Bool) {
         let expirationDate = Date().addingTimeInterval(TimeInterval(response.expires_in))
         saveTokens(
             accessToken: response.access_token,
@@ -265,8 +302,10 @@ public class RedditClient: ObservableObject {
         )
 
         isAuthenticated = true
-        Task {
-            await fetchUsername()
+        if fetchUser {
+            Task { @MainActor in
+                await fetchUsername()
+            }
         }
     }
 
@@ -286,16 +325,28 @@ public class RedditClient: ObservableObject {
                 if let newAccessToken = accessToken {
                     return newAccessToken
                 }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let redditError as RedditError {
+                switch redditError {
+                case .noRefreshToken, .httpError(statusCode: 400), .httpError(statusCode: 401):
+                    // Permanent auth failure: clear tokens and require re-authentication
+                    logout()
+                    throw RedditError.noAccessToken
+                default:
+                    // Transient error (e.g., 5xx): keep stored session intact
+                    throw redditError
+                }
             } catch {
-                // If refresh fails, clear tokens and throw error
-                logout()
-                throw RedditError.noAccessToken
+                // Transient transport error (e.g., offline/timeout): keep stored session intact
+                throw error
             }
         }
 
         throw RedditError.noAccessToken
     }
 
+    @MainActor
     private func makeAuthorizedRequest(url: URL) throws -> URLRequest {
         guard let accessToken else {
             throw RedditError.noAccessToken
@@ -312,11 +363,14 @@ public class RedditClient: ObservableObject {
         do {
             let userInfo = try await fetchUserInfo()
             username = userInfo.name
+        } catch is CancellationError {
+            return
         } catch {
             handleError(error)
         }
     }
 
+    @MainActor
     private func handleError(_ error: Error) {
         if let redditError = error as? RedditError {
             self.error = redditError
@@ -336,7 +390,7 @@ struct RedditTokenResponse: Codable {
     let scope: String
 }
 
-public struct RedditUserInfo: Codable {
+public struct RedditUserInfo: Codable, Sendable {
     public let id: String
     public let name: String
     public let created: Double
@@ -374,13 +428,17 @@ public enum RedditError: LocalizedError {
 // MARK: - Extensions
 
 extension [String: String] {
+    /// RFC 3986 `application/x-www-form-urlencoded` serialization.
+    /// Encodes all characters outside unreserved `A-Za-z0-9-._~` (including `+`, `&`, `=`, `/`, `?`, spaces).
     func percentEncoded() -> Data {
-        map { key, value in
-            let encodedKey = key.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed)!
-            let encodedValue = value.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed)!
-            return "\(encodedKey)=\(encodedValue)"
-        }
-        .joined(separator: "&")
-        .data(using: .utf8)!
+        let unreserved = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+        let encoded = sorted { $0.key < $1.key }
+            .map { key, value in
+                let encodedKey = key.addingPercentEncoding(withAllowedCharacters: unreserved) ?? ""
+                let encodedValue = value.addingPercentEncoding(withAllowedCharacters: unreserved) ?? ""
+                return "\(encodedKey)=\(encodedValue)"
+            }
+            .joined(separator: "&")
+        return Data(encoded.utf8)
     }
 }

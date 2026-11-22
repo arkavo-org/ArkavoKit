@@ -1,5 +1,6 @@
 @preconcurrency import AVFoundation
 import CoreAudio
+import os
 
 /// Audio source for capturing microphone input
 public final class MicrophoneAudioSource: NSObject, AudioSource, Sendable {
@@ -7,7 +8,7 @@ public final class MicrophoneAudioSource: NSObject, AudioSource, Sendable {
 
     public let sourceID: String
     public var sourceName: String {
-        if let deviceName = audioInput?.device.localizedName {
+        if let deviceName = state.withLockUnchecked({ $0.audioInput?.device.localizedName }) {
             return "Microphone: \(deviceName)"
         }
         return "Microphone"
@@ -23,17 +24,30 @@ public final class MicrophoneAudioSource: NSObject, AudioSource, Sendable {
         captureSession.isRunning
     }
 
-    nonisolated(unsafe) public var onSample: ((CMSampleBuffer) -> Void)?
+    public var onSample: ((CMSampleBuffer) -> Void)? {
+        get { state.withLockUnchecked { $0.onSample } }
+        set { state.withLockUnchecked { $0.onSample = newValue } }
+    }
 
     // MARK: - Properties
 
+    private struct SharedState {
+        var audioInput: AVCaptureDeviceInput?
+        var onSample: ((CMSampleBuffer) -> Void)?
+        var onLevelUpdate: (@Sendable (Float) -> Void)?
+    }
+
+    private let state = OSAllocatedUnfairLock<SharedState>(uncheckedState: SharedState())
     private let captureSession: AVCaptureSession
-    nonisolated(unsafe) private var audioInput: AVCaptureDeviceInput?
     private let audioOutput: AVCaptureAudioDataOutput
 
+    private let sessionQueue = DispatchQueue(label: "com.arkavo.microphone.session.\(UUID().uuidString)")
     private let outputQueue = DispatchQueue(label: "com.arkavo.microphone.\(UUID().uuidString)")
 
-    nonisolated(unsafe) public var onLevelUpdate: (@Sendable (Float) -> Void)?
+    public var onLevelUpdate: (@Sendable (Float) -> Void)? {
+        get { state.withLockUnchecked { $0.onLevelUpdate } }
+        set { state.withLockUnchecked { $0.onLevelUpdate = newValue } }
+    }
 
     private let deviceID: String?
 
@@ -57,72 +71,93 @@ public final class MicrophoneAudioSource: NSObject, AudioSource, Sendable {
     // MARK: - Setup
 
     private func setupSession() {
-        captureSession.beginConfiguration()
+        let session = captureSession
+        let output = audioOutput
+        let queue = outputQueue
+        sessionQueue.sync {
+            session.beginConfiguration()
 
-        // Setup audio output
-        // On macOS, we can configure explicit Linear PCM settings. On iOS, `audioSettings` is unavailable.
-        #if os(macOS)
-        // Output format: 16-bit Linear PCM, 48kHz, stereo
-        let audioSettings: [String: Any] = [
-            AVFormatIDKey: kAudioFormatLinearPCM,
-            AVSampleRateKey: 48000.0,
-            AVNumberOfChannelsKey: 2,
-            AVLinearPCMBitDepthKey: 16,
-            AVLinearPCMIsNonInterleaved: false,
-            AVLinearPCMIsFloatKey: false,
-            AVLinearPCMIsBigEndianKey: false
-        ]
-        audioOutput.audioSettings = audioSettings
-        #endif
+            // Setup audio output
+            // On macOS, we can configure explicit Linear PCM settings. On iOS, `audioSettings` is unavailable.
+            #if os(macOS)
+            // Output format: 16-bit Linear PCM, 48kHz, stereo
+            let audioSettings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatLinearPCM,
+                AVSampleRateKey: 48000.0,
+                AVNumberOfChannelsKey: 2,
+                AVLinearPCMBitDepthKey: 16,
+                AVLinearPCMIsNonInterleaved: false,
+                AVLinearPCMIsFloatKey: false,
+                AVLinearPCMIsBigEndianKey: false
+            ]
+            output.audioSettings = audioSettings
+            #endif
 
-        audioOutput.setSampleBufferDelegate(self, queue: outputQueue)
+            output.setSampleBufferDelegate(self, queue: queue)
 
-        if captureSession.canAddOutput(audioOutput) {
-            captureSession.addOutput(audioOutput)
+            if session.canAddOutput(output) {
+                session.addOutput(output)
+            }
+
+            session.commitConfiguration()
         }
-
-        captureSession.commitConfiguration()
     }
 
     // MARK: - AudioSource Protocol Methods
 
     public func start() async throws {
         #if os(macOS) || os(iOS)
-        // Find the microphone device
-        let device: AVCaptureDevice?
-        if let deviceID = deviceID {
-            device = AVCaptureDevice(uniqueID: deviceID)
-        } else {
-            device = AVCaptureDevice.default(for: .audio)
+        let targetDeviceID = deviceID
+        let session = captureSession
+
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+            sessionQueue.async { [self, session, targetDeviceID] in
+                // Find the microphone device
+                let device: AVCaptureDevice?
+                if let targetDeviceID {
+                    device = AVCaptureDevice(uniqueID: targetDeviceID)
+                } else {
+                    device = AVCaptureDevice.default(for: .audio)
+                }
+
+                guard let microphone = device else {
+                    continuation.resume(throwing: RecorderError.microphoneUnavailable)
+                    return
+                }
+
+                // Create input on sessionQueue so it never crosses concurrency domains
+                let input: AVCaptureDeviceInput
+                do {
+                    input = try AVCaptureDeviceInput(device: microphone)
+                } catch {
+                    continuation.resume(throwing: error)
+                    return
+                }
+
+                session.beginConfiguration()
+
+                // Remove existing input if any
+                if let existingInput = state.withLockUnchecked({ $0.audioInput }) {
+                    session.removeInput(existingInput)
+                }
+
+                // Add new input
+                if session.canAddInput(input) {
+                    session.addInput(input)
+                    state.withLockUnchecked { $0.audioInput = input }
+                } else {
+                    session.commitConfiguration()
+                    continuation.resume(throwing: RecorderError.cannotAddInput)
+                    return
+                }
+
+                session.commitConfiguration()
+
+                // Start the session
+                session.startRunning()
+                continuation.resume()
+            }
         }
-
-        guard let microphone = device else {
-            throw RecorderError.microphoneUnavailable
-        }
-
-        // Create input
-        let input = try AVCaptureDeviceInput(device: microphone)
-
-        captureSession.beginConfiguration()
-
-        // Remove existing input if any
-        if let existingInput = audioInput {
-            captureSession.removeInput(existingInput)
-        }
-
-        // Add new input
-        if captureSession.canAddInput(input) {
-            captureSession.addInput(input)
-            audioInput = input
-        } else {
-            captureSession.commitConfiguration()
-            throw RecorderError.cannotAddInput
-        }
-
-        captureSession.commitConfiguration()
-
-        // Start the session
-        captureSession.startRunning()
 
         print("🎤 MicrophoneAudioSource [\(sourceID)] started: \(sourceName)")
         #else
@@ -131,14 +166,22 @@ public final class MicrophoneAudioSource: NSObject, AudioSource, Sendable {
     }
 
     public func stop() async throws {
-        captureSession.stopRunning()
+        let session = captureSession
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            sessionQueue.async { [self, session] in
+                session.stopRunning()
 
-        captureSession.beginConfiguration()
-        if let input = audioInput {
-            captureSession.removeInput(input)
-            audioInput = nil
+                session.beginConfiguration()
+                if let input = state.withLockUnchecked({ state -> AVCaptureDeviceInput? in
+                    defer { state.audioInput = nil }
+                    return state.audioInput
+                }) {
+                    session.removeInput(input)
+                }
+                session.commitConfiguration()
+                continuation.resume()
+            }
         }
-        captureSession.commitConfiguration()
 
         print("🎤 MicrophoneAudioSource [\(sourceID)] stopped")
     }
@@ -184,7 +227,6 @@ public final class MicrophoneAudioSource: NSObject, AudioSource, Sendable {
         return []
         #endif
     }
-
 }
 
 // MARK: - AVCaptureAudioDataOutputSampleBufferDelegate
@@ -196,39 +238,18 @@ extension MicrophoneAudioSource: AVCaptureAudioDataOutputSampleBufferDelegate {
         from connection: AVCaptureConnection
     ) {
         // Calculate audio level from sample buffer
-        let level = calculateAudioLevel(from: sampleBuffer)
+        let level = Self.calculateAudioLevel(from: sampleBuffer)
+
+        let (levelCallback, sampleCallback) = state.withLockUnchecked { state in
+            (state.onLevelUpdate, state.onSample)
+        }
 
         // Forward directly on callback queue
-        onLevelUpdate?(level)
-        onSample?(sampleBuffer)
+        levelCallback?(level)
+        sampleCallback?(sampleBuffer)
     }
 
-    private nonisolated func calculateAudioLevel(from sampleBuffer: CMSampleBuffer) -> Float {
-        guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else {
-            return 0.0
-        }
-
-        var length = 0
-        var dataPointer: UnsafeMutablePointer<Int8>?
-        CMBlockBufferGetDataPointer(dataBuffer, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &length, dataPointerOut: &dataPointer)
-
-        guard let dataPointer = dataPointer else {
-            return 0.0
-        }
-
-        // Calculate RMS (Root Mean Square) for audio level
-        var sum: Float = 0.0
-        let samples = length / MemoryLayout<Int16>.size
-
-        dataPointer.withMemoryRebound(to: Int16.self, capacity: samples) { ptr in
-            for i in 0..<samples {
-                let sample = Float(ptr[i]) / Float(Int16.max)
-                sum += sample * sample
-            }
-        }
-
-        let rms = sqrt(sum / Float(samples))
-        return min(1.0, rms * 10) // Scale and clamp to 0-1
+    nonisolated static func calculateAudioLevel(from sampleBuffer: CMSampleBuffer) -> Float {
+        AudioManager.calculateAudioLevel(from: sampleBuffer)
     }
 }
-

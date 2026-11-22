@@ -75,10 +75,30 @@ public actor AgentWebSocketTransport {
             throw AgentError.invalidEndpoint("Invalid URL: \(endpoint.url)")
         }
 
+        // Clean up any existing session, tasks, and pending requests before reconnecting
+        heartbeatTask?.cancel()
+        heartbeatTask = nil
+
+        readerTask?.cancel()
+        readerTask = nil
+
+        webSocketTask?.cancel(with: .goingAway, reason: nil)
+        webSocketTask = nil
+
+        session?.invalidateAndCancel()
+        session = nil
+
+        isConnected = false
+
+        for (_, continuation) in pendingRequests {
+            continuation.resume(throwing: AgentError.connectionFailed("Reconnecting"))
+        }
+        pendingRequests.removeAll()
+
         // Create URL session configuration
+        // Keep timeoutIntervalForResource at its long default so persistent WebSockets are not killed
         let configuration = URLSessionConfiguration.default
-        configuration.timeoutIntervalForRequest = TimeInterval(timeoutMs / 1000)
-        configuration.timeoutIntervalForResource = TimeInterval(timeoutMs / 1000)
+        configuration.timeoutIntervalForRequest = Double(timeoutMs) / 1000.0
 
         let session = URLSession(configuration: configuration)
         self.session = session
@@ -105,10 +125,19 @@ public actor AgentWebSocketTransport {
         } catch {
             task.cancel(with: .abnormalClosure, reason: nil)
             session.invalidateAndCancel()
-            self.webSocketTask = nil
-            self.session = nil
-            self.endpoint = nil
+            if self.webSocketTask === task {
+                self.webSocketTask = nil
+                self.session = nil
+                self.endpoint = nil
+            }
             throw error
+        }
+
+        // Verify this connection attempt was not superseded or closed while awaiting sendPing
+        guard self.webSocketTask === task else {
+            task.cancel(with: .goingAway, reason: nil)
+            session.invalidateAndCancel()
+            throw AgentError.connectionFailed("Connection superseded or closed during handshake")
         }
 
         // Start receiving messages after connection is verified
@@ -177,9 +206,14 @@ public actor AgentWebSocketTransport {
 
     /// Send a JSON-RPC request and await the response
     public func sendRequest(_ request: AgentRequest) async throws -> AgentResponse {
-        guard isConnected, let task = webSocketTask else {
+        guard isConnected, webSocketTask != nil else {
             print("[AgentWebSocketTransport] ERROR: Not connected")
             throw AgentError.notConnected
+        }
+
+        guard pendingRequests[request.id] == nil else {
+            print("[AgentWebSocketTransport] ERROR: Duplicate pending request id: \(request.id)")
+            throw AgentError.webSocketError("Duplicate pending request id: \(request.id)")
         }
 
         // Encode request to JSON
@@ -193,21 +227,15 @@ public actor AgentWebSocketTransport {
         print("[AgentWebSocketTransport] Sending request: method=\(request.method), id=\(request.id)")
         print("[AgentWebSocketTransport] JSON payload: \(jsonString)")
 
-        // Send the message
-        let message = URLSessionWebSocketTask.Message.string(jsonString)
-        try await task.send(message)
-        print("[AgentWebSocketTransport] Request sent, waiting for response...")
+        let requestId = request.id
+        let timeout = timeoutMs
 
-        // Wait for response with timeout
+        // Register pending request before sending and enforce timeout with cancellation support
         do {
-            let response = try await withTimeout(ms: timeoutMs) {
-                try await withCheckedThrowingContinuation { continuation in
-                    Task {
-                        await self.registerPendingRequest(id: request.id, continuation: continuation)
-                    }
-                }
+            let response = try await withTimeout(ms: timeout) {
+                try await self.sendAndAwaitResponse(requestId: requestId, jsonString: jsonString)
             }
-            print("[AgentWebSocketTransport] Received response for request \(request.id): \(response)")
+            print("[AgentWebSocketTransport] Received response for request \(requestId): \(response)")
             return response
         } catch {
             print("[AgentWebSocketTransport] ERROR: Request failed: \(error)")
@@ -217,6 +245,59 @@ public actor AgentWebSocketTransport {
 
     // MARK: - Private Methods
 
+    private func sendAndAwaitResponse(requestId: String, jsonString: String) async throws -> AgentResponse {
+        try Task.checkCancellation()
+        guard isConnected, let task = webSocketTask else {
+            throw AgentError.notConnected
+        }
+        guard pendingRequests[requestId] == nil else {
+            throw AgentError.webSocketError("Duplicate pending request id: \(requestId)")
+        }
+
+        let message = URLSessionWebSocketTask.Message.string(jsonString)
+
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                guard self.isConnected, self.webSocketTask === task else {
+                    continuation.resume(throwing: AgentError.notConnected)
+                    return
+                }
+                guard self.pendingRequests[requestId] == nil else {
+                    continuation.resume(throwing: AgentError.webSocketError("Duplicate pending request id: \(requestId)"))
+                    return
+                }
+
+                // Register synchronously on actor BEFORE sending so fast replies are never missed
+                self.pendingRequests[requestId] = continuation
+
+                task.send(message) { [weak self] error in
+                    guard let error, let self else { return }
+                    let errorMessage = error.localizedDescription
+                    Task {
+                        await self.cancelPendingRequest(
+                            id: requestId,
+                            error: AgentError.webSocketError(errorMessage)
+                        )
+                    }
+                }
+            }
+        } onCancel: {
+            Task {
+                await self.cancelPendingRequest(id: requestId, error: CancellationError())
+            }
+        }
+    }
+
+    private func cancelPendingRequest(id: String, error: Error) {
+        if let continuation = pendingRequests.removeValue(forKey: id) {
+            continuation.resume(throwing: error)
+        }
+    }
+
     private func startReceiving(task: URLSessionWebSocketTask) {
         print("[AgentWebSocketTransport] 🎧 Starting receive loop, task state: \(task.state.rawValue)")
         readerTask = Task {
@@ -225,13 +306,14 @@ public actor AgentWebSocketTransport {
                 print("[AgentWebSocketTransport] 🔄 Waiting for message... (count: \(messageCount), cancelled: \(Task.isCancelled))")
                 do {
                     let message = try await task.receive()
+                    guard self.webSocketTask === task else { break }
                     messageCount += 1
                     print("[AgentWebSocketTransport] 📥 Received message #\(messageCount)")
                     await handleMessage(message)
                 } catch {
                     // Connection closed or error
                     print("[AgentWebSocketTransport] ❌ Receive error: \(error)")
-                    await handleError(error)
+                    await handleError(error, for: task)
                     break
                 }
             }
@@ -289,13 +371,28 @@ public actor AgentWebSocketTransport {
         }
     }
 
-    private func handleError(_ error: Error) async {
+    private func handleError(_ error: Error, for task: URLSessionWebSocketTask) async {
+        // Ignore stale errors from superseded connections
+        guard self.webSocketTask === task else {
+            return
+        }
+
         let wasConnected = isConnected
         isConnected = false
 
-        // Stop heartbeat
+        // Stop heartbeat and reader
         heartbeatTask?.cancel()
         heartbeatTask = nil
+
+        readerTask?.cancel()
+        readerTask = nil
+
+        // Tear down WebSocket task and session to prevent leaks
+        webSocketTask?.cancel(with: .abnormalClosure, reason: nil)
+        webSocketTask = nil
+
+        session?.invalidateAndCancel()
+        session = nil
 
         // Cancel all pending requests with error
         for (_, continuation) in pendingRequests {
@@ -313,11 +410,12 @@ public actor AgentWebSocketTransport {
         heartbeatTask = Task {
             var missedPongs = 0
 
-            while !Task.isCancelled && isConnected {
+            while !Task.isCancelled && isConnected && self.webSocketTask === task {
                 // Wait for heartbeat interval
-                try? await Task.sleep(nanoseconds: heartbeatIntervalMs * 1_000_000)
+                let (nanos, overflow) = heartbeatIntervalMs.multipliedReportingOverflow(by: 1_000_000)
+                try? await Task.sleep(nanoseconds: overflow ? UInt64.max : nanos)
 
-                guard !Task.isCancelled && isConnected else { break }
+                guard !Task.isCancelled && isConnected && self.webSocketTask === task else { break }
 
                 // Send ping
                 print("[AgentWebSocketTransport] 💓 Sending heartbeat ping")
@@ -343,17 +441,13 @@ public actor AgentWebSocketTransport {
 
                     if missedPongs >= missedPongThreshold {
                         print("[AgentWebSocketTransport] ❌ Connection stale, triggering disconnect")
-                        await handleError(AgentError.connectionFailed("Heartbeat timeout"))
+                        await handleError(AgentError.connectionFailed("Heartbeat timeout"), for: task)
                         break
                     }
                 }
             }
             print("[AgentWebSocketTransport] 💓 Heartbeat task ended")
         }
-    }
-
-    private func registerPendingRequest(id: String, continuation: CheckedContinuation<AgentResponse, Error>) {
-        pendingRequests[id] = continuation
     }
 
     private func withTimeout<T: Sendable>(ms: UInt64, operation: @escaping @Sendable () async throws -> T) async throws -> T {
@@ -363,13 +457,19 @@ public actor AgentWebSocketTransport {
             }
 
             group.addTask {
-                try await Task.sleep(nanoseconds: ms * 1_000_000)
+                let (nanos, overflow) = ms.multipliedReportingOverflow(by: 1_000_000)
+                try await Task.sleep(nanoseconds: overflow ? UInt64.max : nanos)
                 throw AgentError.timeout(ms)
             }
 
-            let result = try await group.next()!
-            group.cancelAll()
-            return result
+            do {
+                let result = try await group.next()!
+                group.cancelAll()
+                return result
+            } catch {
+                group.cancelAll()
+                throw error
+            }
         }
     }
 }

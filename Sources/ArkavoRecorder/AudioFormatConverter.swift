@@ -50,7 +50,8 @@ public class AudioFormatConverter {
         // Check if conversion is needed
         if sourceFormat.sampleRate == targetFormat.sampleRate &&
            sourceFormat.channelCount == targetFormat.channelCount &&
-           sourceFormat.commonFormat == targetFormat.commonFormat {
+           sourceFormat.commonFormat == targetFormat.commonFormat &&
+           sourceFormat.isInterleaved == targetFormat.isInterleaved {
             // No conversion needed
             return sampleBuffer
         }
@@ -121,6 +122,11 @@ public class AudioFormatConverter {
 
         guard conversionStatus != AVAudioConverterOutputStatus.error, error == nil else {
             print("⚠️ AudioFormatConverter [\(sourceID)]: Conversion failed: \(error?.localizedDescription ?? "unknown error")")
+            return nil
+        }
+
+        // Resampler priming can produce 0 output frames without error
+        guard destinationPCMBuffer.frameLength > 0 else {
             return nil
         }
 

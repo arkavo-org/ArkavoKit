@@ -108,7 +108,16 @@ struct SecureEnclaveSessionKey: SessionDeviceKey {
 struct SecureEnclaveSessionKeys: SessionKeyFactory {
     func make() throws -> any SessionDeviceKey {
         // Usable only while the device is unlocked, and only on this device.
-        SecureEnclaveSessionKey(key: try SecureEnclave.P256.Signing.PrivateKey())
+        var accessControlError: Unmanaged<CFError>?
+        guard let accessControl = SecAccessControlCreateWithFlags(
+            nil,
+            kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+            [],
+            &accessControlError
+        ) else {
+            throw accessControlError?.takeRetainedValue() ?? CryptoKitError.underlyingCoreCryptoError(error: Int32(errSecParam))
+        }
+        return SecureEnclaveSessionKey(key: try SecureEnclave.P256.Signing.PrivateKey(accessControl: accessControl))
     }
 
     func restore(_ persistentForm: Data) throws -> any SessionDeviceKey {

@@ -75,10 +75,11 @@ struct BMFFBox: Equatable {
         while offset < fileSize {
             try handle.seek(toOffset: offset)
             guard let header = try handle.read(upToCount: 8), header.count == 8 else { return damaged() }
-            var size = UInt64(header.bigEndianUInt32(at: 0))
+            let rawSize = header.bigEndianUInt32(at: 0)
+            var size = UInt64(rawSize)
             guard let type = String(bytes: header[4..<8], encoding: .ascii) else { return damaged() }
             var headerLength: UInt64 = 8
-            if size == 1 {
+            if rawSize == 1 {
                 guard let large = try handle.read(upToCount: 8), large.count == 8 else { return damaged() }
                 size = large.bigEndianUInt64(at: 0)
                 headerLength = 16
@@ -89,7 +90,7 @@ struct BMFFBox: Equatable {
                 userType = extended
                 headerLength += 16
             }
-            if size == 0 {
+            if rawSize == 0 {
                 boxes.append(BMFFBox(type: type, offset: offset, size: 0, userType: userType))
                 return Scan(boxes: boxes, fileSize: fileSize, isComplete: true)
             }

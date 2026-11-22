@@ -1,6 +1,8 @@
 import ArkavoC2PA
 import AVFoundation
+import Darwin
 import Foundation
+import os
 
 /// C2PA Sign CLI — signs a MOV/MP4/M4A through the arkavo-rs signing server and
 /// checks the result with `c2patool`
@@ -22,6 +24,10 @@ struct C2PASignCLI {
 
         guard let options = Options(arguments: Array(CommandLine.arguments.dropFirst())) else {
             printUsage()
+            exit(1)
+        }
+        if options.token != nil, !isSecureServerURL(options.serverURL) {
+            printError("refusing to send --token over non-HTTPS server URL: \(options.serverURL.absoluteString)")
             exit(1)
         }
         guard let c2patool = findExecutable("c2patool") else {
@@ -185,6 +191,17 @@ struct C2PASignCLI {
         """)
     }
 
+    static func isSecureServerURL(_ url: URL) -> Bool {
+        let scheme = url.scheme?.lowercased()
+        if scheme == "https" {
+            return true
+        }
+        guard scheme == "http", let host = url.host?.lowercased() else {
+            return false
+        }
+        return host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]"
+    }
+
     static func printError(_ message: String) {
         fputs("Error: \(message)\n", stderr)
     }
@@ -232,7 +249,12 @@ struct Options {
         while let argument = iterator.next() {
             switch argument {
             case "--server":
-                guard let value = iterator.next(), let url = URL(string: value) else { return nil }
+                guard let value = iterator.next(),
+                      let url = URL(string: value),
+                      let scheme = url.scheme?.lowercased(),
+                      (scheme == "https" || scheme == "http"),
+                      let host = url.host, !host.isEmpty
+                else { return nil }
                 serverURL = url
             case "--title":
                 guard let value = iterator.next() else { return nil }
@@ -287,8 +309,36 @@ struct C2PAToolReport {
         process.standardOutput = stdout
         process.standardError = stderr
         try process.run()
+        try? stdout.fileHandleForWriting.close()
+        try? stderr.fileHandleForWriting.close()
+        let stderrFD = stderr.fileHandleForReading.fileDescriptor
+        let stderrLock = OSAllocatedUnfairLock(initialState: Data())
+        let stderrGroup = DispatchGroup()
+        stderrGroup.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            var captured = Data()
+            var buffer = [UInt8](repeating: 0, count: 4096)
+            while true {
+                let count = Darwin.read(stderrFD, &buffer, buffer.count)
+                if count > 0 {
+                    captured.append(buffer, count: count)
+                } else if count == 0 {
+                    break
+                } else if errno == EINTR {
+                    continue
+                } else {
+                    break
+                }
+            }
+            let finalCaptured = captured
+            stderrLock.withLock { $0 = finalCaptured }
+            stderrGroup.leave()
+        }
         let data = stdout.fileHandleForReading.readDataToEndOfFile()
-        let errorOutput = stderr.fileHandleForReading.readDataToEndOfFile()
+        stderrGroup.wait()
+        let errorOutput = stderrLock.withLock { $0 }
+        try? stdout.fileHandleForReading.close()
+        try? stderr.fileHandleForReading.close()
         process.waitUntilExit()
 
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {

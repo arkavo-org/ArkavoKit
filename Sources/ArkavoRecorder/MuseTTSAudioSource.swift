@@ -8,6 +8,7 @@
 
 import AVFoundation
 import CoreMedia
+import os
 
 /// Audio source that captures TTS speech output for streaming
 /// Uses AVSpeechSynthesizer's write() API to render audio to buffers
@@ -26,26 +27,52 @@ public final class MuseTTSAudioSource: NSObject, AudioSource, @unchecked Sendabl
         )
     }
 
-    public private(set) var isActive: Bool = false
-    public var onSample: ((CMSampleBuffer) -> Void)?
+    public var isActive: Bool {
+        state.withLockUnchecked { $0.isActive }
+    }
+
+    public var onSample: ((CMSampleBuffer) -> Void)? {
+        get { state.withLockUnchecked { $0.onSample } }
+        set { state.withLockUnchecked { $0.onSample = newValue } }
+    }
 
     // MARK: - Properties
 
+    private struct SharedState {
+        var isActive: Bool = false
+        var onSample: ((CMSampleBuffer) -> Void)?
+        var speechRate: Float = AVSpeechUtteranceDefaultSpeechRate
+        var voiceIdentifier: String?
+        var onUtteranceFinished: (() -> Void)?
+        var anchorHostTime: CMTime?
+        var samplesSinceAnchor: Int64 = 0
+        var lastSampleRate: Double = 0
+    }
+
+    private let state = OSAllocatedUnfairLock<SharedState>(uncheckedState: SharedState())
     private let synthesizer = AVSpeechSynthesizer()
-    private var pendingUtterances: [AVSpeechUtterance] = []
 
     /// Speech rate (matches AVSpeechUtterance rate scale)
-    public var speechRate: Float = AVSpeechUtteranceDefaultSpeechRate
+    public var speechRate: Float {
+        get { state.withLockUnchecked { $0.speechRate } }
+        set { state.withLockUnchecked { $0.speechRate = newValue } }
+    }
 
     /// Voice identifier (nil = system default)
-    public var voiceIdentifier: String?
+    public var voiceIdentifier: String? {
+        get { state.withLockUnchecked { $0.voiceIdentifier } }
+        set { state.withLockUnchecked { $0.voiceIdentifier = newValue } }
+    }
 
     /// Called when an utterance finishes speaking
-    public var onUtteranceFinished: (() -> Void)?
+    public var onUtteranceFinished: (() -> Void)? {
+        get { state.withLockUnchecked { $0.onUtteranceFinished } }
+        set { state.withLockUnchecked { $0.onUtteranceFinished = newValue } }
+    }
 
     // MARK: - Initialization
 
-    public init(sourceID: String = "muse-tts") {
+    public init(sourceID: String = "muse-voice") {
         self.sourceID = sourceID
         super.init()
         synthesizer.delegate = self
@@ -54,13 +81,22 @@ public final class MuseTTSAudioSource: NSObject, AudioSource, @unchecked Sendabl
     // MARK: - AudioSource Protocol
 
     public func start() async throws {
-        isActive = true
+        state.withLockUnchecked { state in
+            state.isActive = true
+            state.anchorHostTime = nil
+            state.samplesSinceAnchor = 0
+            state.lastSampleRate = 0
+        }
     }
 
     public func stop() async throws {
-        isActive = false
+        state.withLockUnchecked { state in
+            state.isActive = false
+            state.anchorHostTime = nil
+            state.samplesSinceAnchor = 0
+            state.lastSampleRate = 0
+        }
         synthesizer.stopSpeaking(at: .immediate)
-        pendingUtterances.removeAll()
     }
 
     // MARK: - TTS API
@@ -68,12 +104,15 @@ public final class MuseTTSAudioSource: NSObject, AudioSource, @unchecked Sendabl
     /// Speak text and capture audio as CMSampleBuffers
     /// Audio is rendered to buffers, not played through speakers
     public func speak(_ text: String) {
-        guard isActive else { return }
+        let (active, rate, voiceID) = state.withLockUnchecked { state in
+            (state.isActive, state.speechRate, state.voiceIdentifier)
+        }
+        guard active else { return }
 
         let utterance = AVSpeechUtterance(string: text)
-        utterance.rate = speechRate
+        utterance.rate = rate
 
-        if let voiceID = voiceIdentifier,
+        if let voiceID,
            let voice = AVSpeechSynthesisVoice(identifier: voiceID)
         {
             utterance.voice = voice
@@ -91,7 +130,8 @@ public final class MuseTTSAudioSource: NSObject, AudioSource, @unchecked Sendabl
 
             // Convert AVAudioPCMBuffer to CMSampleBuffer
             if let sampleBuffer = self.convertToSampleBuffer(pcmBuffer) {
-                self.onSample?(sampleBuffer)
+                let callback = self.state.withLockUnchecked { $0.onSample }
+                callback?(sampleBuffer)
             }
         }
     }
@@ -99,6 +139,10 @@ public final class MuseTTSAudioSource: NSObject, AudioSource, @unchecked Sendabl
     /// Stop current speech immediately
     public func stopSpeaking() {
         synthesizer.stopSpeaking(at: .immediate)
+        state.withLockUnchecked { state in
+            state.anchorHostTime = nil
+            state.samplesSinceAnchor = 0
+        }
     }
 
     /// Check if currently speaking
@@ -106,19 +150,21 @@ public final class MuseTTSAudioSource: NSObject, AudioSource, @unchecked Sendabl
         synthesizer.isSpeaking
     }
 
-    // MARK: - Private
+    // MARK: - Internal / Private
 
-    /// Running sample count for timestamp calculation
-    private var totalSamplesWritten: Int64 = 0
-
-    private func convertToSampleBuffer(_ pcmBuffer: AVAudioPCMBuffer) -> CMSampleBuffer? {
-        let format = pcmBuffer.format
+    func convertToSampleBuffer(_ pcmBuffer: AVAudioPCMBuffer) -> CMSampleBuffer? {
         let frameCount = CMItemCount(pcmBuffer.frameLength)
+        guard frameCount > 0 else { return nil }
+
+        let format = pcmBuffer.format
+        var asbdCopy = format.streamDescription.pointee
+        let sampleRate = asbdCopy.mSampleRate
+        guard sampleRate.isFinite, sampleRate > 0 else { return nil }
+        let timescale = CMTimeScale(sampleRate.rounded())
+        guard timescale > 0 else { return nil }
 
         // Create format description
         var formatDescription: CMAudioFormatDescription?
-        let asbd = format.streamDescription.pointee
-        var asbdCopy = asbd
         let status = CMAudioFormatDescriptionCreate(
             allocator: kCFAllocatorDefault,
             asbd: &asbdCopy,
@@ -134,61 +180,64 @@ public final class MuseTTSAudioSource: NSObject, AudioSource, @unchecked Sendabl
             return nil
         }
 
-        // Create timing info using running sample count
-        let sampleRate = asbd.mSampleRate
-        let timing = CMSampleTimingInfo(
-            duration: CMTime(value: 1, timescale: CMTimeScale(sampleRate)),
-            presentationTimeStamp: CMTime(
-                value: totalSamplesWritten,
-                timescale: CMTimeScale(sampleRate)
-            ),
-            decodeTimeStamp: .invalid
-        )
-
-        totalSamplesWritten += Int64(frameCount)
-
-        // Create sample buffer from audio buffer list
-        var sampleBuffer: CMSampleBuffer?
-        guard let audioBufferList = pcmBuffer.audioBufferList.pointee.mBuffers.mData else {
-            return nil
+        // Anchor PTS to the host clock and advance continuously by sample count so TTS-only
+        // video recordings align with host-clock video frames rather than being dropped as beforeStart.
+        let now = CMClockGetTime(CMClockGetHostTimeClock())
+        let presentationTimeStamp: CMTime = state.withLockUnchecked { state in
+            let pts: CMTime
+            if let anchor = state.anchorHostTime, state.lastSampleRate == sampleRate {
+                let offset = CMTime(value: state.samplesSinceAnchor, timescale: timescale)
+                let continuous = CMTimeAdd(anchor, offset)
+                // Re-anchor after pauses between utterances so new speech aligns with current video.
+                if CMTimeSubtract(now, continuous).seconds > 0.25 {
+                    let reanchored = CMTimeConvertScale(now, timescale: timescale, method: .default)
+                    state.anchorHostTime = reanchored
+                    state.samplesSinceAnchor = 0
+                    pts = reanchored
+                } else {
+                    pts = continuous
+                }
+            } else {
+                let anchored = CMTimeConvertScale(now, timescale: timescale, method: .default)
+                state.anchorHostTime = anchored
+                state.samplesSinceAnchor = 0
+                state.lastSampleRate = sampleRate
+                pts = anchored
+            }
+            state.samplesSinceAnchor += Int64(frameCount)
+            return pts
         }
 
-        let dataLength = Int(pcmBuffer.audioBufferList.pointee.mBuffers.mDataByteSize)
-        let blockBuffer: CMBlockBuffer?
-        var block: CMBlockBuffer?
-        CMBlockBufferCreateWithMemoryBlock(
+        // Create sample buffer and copy ALL channels/planes from the full AudioBufferList.
+        var sampleBuffer: CMSampleBuffer?
+        let createStatus = CMAudioSampleBufferCreateWithPacketDescriptions(
             allocator: kCFAllocatorDefault,
-            memoryBlock: nil,
-            blockLength: dataLength,
-            blockAllocator: kCFAllocatorDefault,
-            customBlockSource: nil,
-            offsetToData: 0,
-            dataLength: dataLength,
-            flags: 0,
-            blockBufferOut: &block
-        )
-
-        guard let blk = block else { return nil }
-        blockBuffer = blk
-
-        CMBlockBufferReplaceDataBytes(
-            with: audioBufferList,
-            blockBuffer: blk,
-            offsetIntoDestination: 0,
-            dataLength: dataLength
-        )
-
-        CMAudioSampleBufferCreateReadyWithPacketDescriptions(
-            allocator: kCFAllocatorDefault,
-            dataBuffer: blockBuffer!,
+            dataBuffer: nil,
+            dataReady: false,
+            makeDataReadyCallback: nil,
+            refcon: nil,
             formatDescription: desc,
             sampleCount: frameCount,
-            presentationTimeStamp: timing.presentationTimeStamp,
+            presentationTimeStamp: presentationTimeStamp,
             packetDescriptions: nil,
             sampleBufferOut: &sampleBuffer
         )
+        guard createStatus == noErr, let buffer = sampleBuffer else {
+            return nil
+        }
 
-        return sampleBuffer
+        let dataStatus = CMSampleBufferSetDataBufferFromAudioBufferList(
+            buffer,
+            blockBufferAllocator: kCFAllocatorDefault,
+            blockBufferMemoryAllocator: kCFAllocatorDefault,
+            flags: 0,
+            bufferList: pcmBuffer.audioBufferList
+        )
+        guard dataStatus == noErr else {
+            return nil
+        }
+
+        return buffer
     }
 }
 
@@ -199,8 +248,10 @@ extension MuseTTSAudioSource: AVSpeechSynthesizerDelegate {
         _: AVSpeechSynthesizer,
         didFinish _: AVSpeechUtterance
     ) {
-        Task { @MainActor in
-            self.onUtteranceFinished?()
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let callback = self.state.withLockUnchecked { $0.onUtteranceFinished }
+            callback?()
         }
     }
 }

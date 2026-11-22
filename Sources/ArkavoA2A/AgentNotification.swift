@@ -18,18 +18,26 @@ public struct AgentNotification: Codable, Sendable {
         case params
     }
 
+    public init(method: String, params: AnyCodable = AnyCodable(NSNull()), jsonrpc: String = "2.0") {
+        self.jsonrpc = jsonrpc
+        self.method = method
+        self.params = params
+    }
+
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.jsonrpc = try container.decode(String.self, forKey: .jsonrpc)
         self.method = try container.decode(String.self, forKey: .method)
-        self.params = try container.decode(AnyCodable.self, forKey: .params)
+        self.params = try container.decodeIfPresent(AnyCodable.self, forKey: .params) ?? AnyCodable(NSNull())
     }
 
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(jsonrpc, forKey: .jsonrpc)
         try container.encode(method, forKey: .method)
-        try container.encode(params, forKey: .params)
+        if !(params.value is NSNull) {
+            try container.encode(params, forKey: .params)
+        }
     }
 }
 

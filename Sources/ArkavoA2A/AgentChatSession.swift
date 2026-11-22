@@ -224,10 +224,7 @@ public final class AgentChatSessionManager: ObservableObject, AgentNotificationH
             throw AgentError.invalidResponse("Unexpected response format")
         }
 
-        let sessionData = try JSONSerialization.data(withJSONObject: result.value)
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        let session = try decoder.decode(ChatSession.self, from: sessionData)
+        let session = try Self.decodeChatSession(from: result)
 
         activeSessions[session.id] = session
         sessionAgentMap[session.id] = agentId
@@ -317,7 +314,8 @@ public final class AgentChatSessionManager: ObservableObject, AgentNotificationH
             throw AgentError.notConnected
         }
 
-        // Store the callback for this session
+        // Store the callback for this session (restore/remove if subscription fails)
+        let previousCallback = deltaCallbacks[sessionId]
         deltaCallbacks[sessionId] = onDelta
 
         // Set ourselves as the notification handler on the connection
@@ -325,16 +323,35 @@ public final class AgentChatSessionManager: ObservableObject, AgentNotificationH
 
         // Subscribe to chat_stream via JSON-RPC subscription
         // Note: jsonrpsee uses positional (array) params for subscriptions
-        let response = try await connection.call(
-            method: "chat_stream",
-            arrayParams: [sessionId]
-        )
+        let response: AgentResponse
+        do {
+            response = try await connection.call(
+                method: "chat_stream",
+                arrayParams: [sessionId]
+            )
+        } catch {
+            if let previousCallback {
+                deltaCallbacks[sessionId] = previousCallback
+            } else {
+                deltaCallbacks.removeValue(forKey: sessionId)
+            }
+            throw error
+        }
 
         switch response {
-        case .success(let id, _):
-            print("[AgentChatSessionManager] Successfully subscribed to chat_stream, subscription id: \(id)")
-            streamSubscriptionIds[sessionId] = id
+        case .success(_, let result):
+            if let subId = Self.extractSubscriptionId(from: result) {
+                print("[AgentChatSessionManager] Successfully subscribed to chat_stream, subscription id: \(subId)")
+                streamSubscriptionIds[sessionId] = subId
+            } else {
+                print("[AgentChatSessionManager] Subscribed to chat_stream (no subscription id returned)")
+            }
         case .error(_, let code, let message):
+            if let previousCallback {
+                deltaCallbacks[sessionId] = previousCallback
+            } else {
+                deltaCallbacks.removeValue(forKey: sessionId)
+            }
             print("[AgentChatSessionManager] ERROR: Failed to subscribe: \(code) - \(message)")
             throw AgentError.jsonRpcError(code: code, message: message)
         }
@@ -348,30 +365,17 @@ public final class AgentChatSessionManager: ObservableObject, AgentNotificationH
         }
 
         do {
-            // jsonrpsee subscription format: {"subscription": <id>, "result": <MessageDelta>}
-            // Extract the "result" field which contains the actual MessageDelta
-            guard let paramsDict = params.value as? [String: Any],
-                  let resultValue = paramsDict["result"] else {
-                print("[AgentChatSessionManager] Invalid subscription params format")
-                return
-            }
+            let delta = try Self.decodeMessageDelta(from: params)
 
-            let data = try JSONSerialization.data(withJSONObject: resultValue)
-            let decoder = JSONDecoder()
-            decoder.dateDecodingStrategy = .iso8601
-            let delta = try decoder.decode(MessageDelta.self, from: data)
-
-            // Dispatch to the registered callback on MainActor
+            // Dispatch to the registered callback on MainActor only for active sessions
             await MainActor.run {
+                guard activeSessions[delta.sessionId] != nil else {
+                    return
+                }
                 if let callback = deltaCallbacks[delta.sessionId] {
                     callback(delta)
                 }
-                // Also store in messageDeltas array
-                if messageDeltas[delta.sessionId] != nil {
-                    messageDeltas[delta.sessionId]?.append(delta)
-                } else {
-                    messageDeltas[delta.sessionId] = [delta]
-                }
+                messageDeltas[delta.sessionId, default: []].append(delta)
             }
         } catch {
             print("[AgentChatSessionManager] Failed to decode chat_stream notification: \(error)")
@@ -384,9 +388,10 @@ public final class AgentChatSessionManager: ObservableObject, AgentNotificationH
             return
         }
 
-        // Remove callbacks and subscription tracking
+        // Remove callbacks and capture server subscription ID before clearing
         deltaCallbacks.removeValue(forKey: sessionId)
-        streamSubscriptionIds.removeValue(forKey: sessionId)
+        let subscriptionId = streamSubscriptionIds.removeValue(forKey: sessionId)
+        messageDeltas.removeValue(forKey: sessionId)
 
         guard let agentId = sessionAgentMap.removeValue(forKey: sessionId),
               let connection = agentManager.getConnection(for: agentId) else {
@@ -399,18 +404,18 @@ public final class AgentChatSessionManager: ObservableObject, AgentNotificationH
             agentSessionMap.removeValue(forKey: agentId)
         }
 
-        // Unsubscribe from chat_stream first
-        _ = try? await connection.call(
-            method: "chat_stream_unsubscribe",
-            params: ["session_id": sessionId]
-        )
+        // Unsubscribe from chat_stream using positional server subscription ID
+        if let subscriptionId {
+            _ = try? await connection.call(
+                method: "chat_stream_unsubscribe",
+                arrayParams: [subscriptionId]
+            )
+        }
 
         _ = try? await connection.call(
             method: "chat_close",
             params: ["session_id": sessionId]
         )
-
-        messageDeltas.removeValue(forKey: sessionId)
     }
 
     // MARK: - AgentConnectionDelegate
@@ -483,15 +488,65 @@ public final class AgentChatSessionManager: ObservableObject, AgentNotificationH
         )
 
         switch response {
-        case .success(let id, _):
-            print("[AgentChatSessionManager] Re-subscribed to chat_stream: \(id)")
-            streamSubscriptionIds[sessionId] = id
+        case .success(_, let result):
+            if let subId = Self.extractSubscriptionId(from: result) {
+                print("[AgentChatSessionManager] Re-subscribed to chat_stream: \(subId)")
+                streamSubscriptionIds[sessionId] = subId
+            }
         case .error(_, let code, let message):
             throw AgentError.jsonRpcError(code: code, message: message)
         }
     }
 
-    // MARK: - Private Helpers
+    // MARK: - Helpers
+
+    nonisolated static func decodeChatSession(from result: AnyCodable) throws -> ChatSession {
+        guard JSONSerialization.isValidJSONObject(result.value) else {
+            throw AgentError.invalidResponse("Expected JSON object for chat session")
+        }
+        let sessionData = try JSONSerialization.data(withJSONObject: result.value)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode(ChatSession.self, from: sessionData)
+    }
+
+    nonisolated static func decodeMessageDelta(from params: AnyCodable) throws -> MessageDelta {
+        // jsonrpsee subscription format: {"subscription": <id>, "result": <MessageDelta>}
+        guard let paramsDict = params.value as? [String: Any],
+              let resultValue = paramsDict["result"],
+              JSONSerialization.isValidJSONObject(resultValue) else {
+            throw AgentError.invalidResponse("Invalid subscription params format")
+        }
+
+        let data = try JSONSerialization.data(withJSONObject: resultValue)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode(MessageDelta.self, from: data)
+    }
+
+    nonisolated static func extractSubscriptionId(from result: AnyCodable) -> String? {
+        if let str = result.value as? String {
+            return str
+        }
+        if let intVal = result.value as? Int {
+            return String(intVal)
+        }
+        if let dict = result.value as? [String: Any] {
+            if let sub = dict["subscription"] as? String {
+                return sub
+            }
+            if let subInt = dict["subscription"] as? Int {
+                return String(subInt)
+            }
+            if let sub = dict["subscription_id"] as? String {
+                return sub
+            }
+            if let subInt = dict["subscription_id"] as? Int {
+                return String(subInt)
+            }
+        }
+        return nil
+    }
 
     private func encodeToAnyCodable<T: Encodable>(_ value: T) throws -> Any {
         let encoder = JSONEncoder()
