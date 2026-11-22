@@ -30,9 +30,17 @@ struct C2PATestCLI {
         let keyPath = args[3]
 
         var serverURL = defaultServerURL
-        if args.count >= 6, args[4] == "--server",
-           let url = URL(string: args[5])
-        {
+        if args.count > 4 {
+            guard args.count == 6, args[4] == "--server",
+                  let url = URL(string: args[5]),
+                  let scheme = url.scheme?.lowercased(),
+                  (scheme == "https" || scheme == "http"),
+                  let host = url.host, !host.isEmpty
+            else {
+                printError("Invalid or incomplete arguments. Expected optional: --server <http(s)://host>")
+                printUsage()
+                exit(1)
+            }
             serverURL = url
         }
 
@@ -276,9 +284,11 @@ struct C2PATestCLI {
                 print("  Creator: \(creator)")
             }
 
-            // Server returns "valid" as 0/1 and provenance data
             guard valStatus == 200 else {
                 throw TestError.assertion("validate HTTP \(valStatus)")
+            }
+            guard validateJSON["valid"] as? Bool == true else {
+                throw TestError.assertion("validate reported invalid manifest: \(validateJSON["errors"] ?? validateJSON)")
             }
             guard validateJSON["provenance_chain"] != nil else {
                 throw TestError.assertion("validate should return provenance_chain")

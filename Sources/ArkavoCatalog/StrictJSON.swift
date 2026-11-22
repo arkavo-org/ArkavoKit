@@ -6,7 +6,28 @@ import Foundation
 /// escapes are decoded. Numbers keep their text, so `1`, `1.0` and `1e0` are different values. It prints and reflects
 /// as a fixed text, so no value reaches a log.
 indirect enum StrictJSON: Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
-    case object([String: StrictJSON])
+    /// A JSON object key compared and hashed by its exact UTF-8 bytes rather than Swift `String` Unicode canonical equivalence.
+    struct Key: Hashable, Sendable, ExpressibleByStringLiteral {
+        let bytes: [UInt8]
+
+        init(_ string: String) {
+            self.bytes = Array(string.utf8)
+        }
+
+        init(bytes: [UInt8]) {
+            self.bytes = bytes
+        }
+
+        init(stringLiteral value: String) {
+            self.bytes = Array(value.utf8)
+        }
+
+        var string: String {
+            String(decoding: bytes, as: UTF8.self)
+        }
+    }
+
+    case object([Key: StrictJSON])
     case array([StrictJSON])
     case string(String)
     case number(String)
@@ -15,6 +36,18 @@ indirect enum StrictJSON: Equatable, Sendable, CustomStringConvertible, CustomDe
 
     /// A guard against unbounded recursion, not an import limit: a TDF manifest nests about five deep.
     static let maxDepth = 32
+
+    static func == (lhs: StrictJSON, rhs: StrictJSON) -> Bool {
+        switch (lhs, rhs) {
+        case (.object(let a), .object(let b)): a == b
+        case (.array(let a), .array(let b)): a == b
+        case (.string(let a), .string(let b)): a.utf8.elementsEqual(b.utf8)
+        case (.number(let a), .number(let b)): a.utf8.elementsEqual(b.utf8)
+        case (.bool(let a), .bool(let b)): a == b
+        case (.null, .null): true
+        default: false
+        }
+    }
 
     static func parse(_ data: Data) -> StrictJSON? {
         let bytes = [UInt8](data)
@@ -29,7 +62,7 @@ indirect enum StrictJSON: Equatable, Sendable, CustomStringConvertible, CustomDe
     var debugDescription: String { "Strict JSON value" }
     var customMirror: Mirror { Mirror(self, children: [], displayStyle: .enum) }
 
-    var object: [String: StrictJSON]? {
+    var object: [Key: StrictJSON]? {
         if case .object(let value) = self { value } else { nil }
     }
 
@@ -67,12 +100,15 @@ indirect enum StrictJSON: Equatable, Sendable, CustomStringConvertible, CustomDe
         private mutating func object(depth: Int) -> StrictJSON? {
             guard depth <= StrictJSON.maxDepth else { return nil }
             index += 1
-            var members: [String: StrictJSON] = [:]
+            var members: [Key: StrictJSON] = [:]
             skipWhitespace()
             if consume(UInt8(ascii: "}")) { return .object(members) }
             while true {
                 skipWhitespace()
-                guard index < bytes.count, bytes[index] == UInt8(ascii: "\""), let key = string() else { return nil }
+                guard index < bytes.count, bytes[index] == UInt8(ascii: "\""), let keyBytes = stringBytes() else {
+                    return nil
+                }
+                let key = Key(bytes: keyBytes)
                 skipWhitespace()
                 guard consume(UInt8(ascii: ":")), let member = value(depth: depth), members[key] == nil else {
                     return nil
@@ -100,14 +136,14 @@ indirect enum StrictJSON: Equatable, Sendable, CustomStringConvertible, CustomDe
         }
 
         /// From the opening quote. The document is valid UTF-8, so the bytes between escapes are copied as they are.
-        private mutating func string() -> String? {
+        private mutating func stringBytes() -> [UInt8]? {
             index += 1
             var utf8: [UInt8] = []
             while index < bytes.count {
                 let byte = bytes[index]
                 index += 1
                 switch byte {
-                case UInt8(ascii: "\""): return String(decoding: utf8, as: UTF8.self)
+                case UInt8(ascii: "\""): return utf8
                 case 0x00..<0x20: return nil
                 case UInt8(ascii: "\\"):
                     guard let scalar = escape() else { return nil }
@@ -116,6 +152,10 @@ indirect enum StrictJSON: Equatable, Sendable, CustomStringConvertible, CustomDe
                 }
             }
             return nil
+        }
+
+        private mutating func string() -> String? {
+            stringBytes().map { String(decoding: $0, as: UTF8.self) }
         }
 
         /// After a backslash: one escape, with a `\u` surrogate pair joined; a lone surrogate is refused.

@@ -26,29 +26,32 @@ public class KeychainManager {
     }
 
     public static func save(_ data: Data, service: String, account: String, accessGroup: String? = nil) throws {
-        var query: [String: AnyObject] = [
+        var searchQuery: [String: AnyObject] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service as AnyObject,
             kSecAttrAccount as String: account as AnyObject,
-            kSecValueData as String: data as AnyObject,
-            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
             kSecUseDataProtectionKeychain as String: true as AnyObject,
         ]
 
         if let accessGroup = accessGroup {
-            query[kSecAttrAccessGroup as String] = accessGroup as AnyObject
+            searchQuery[kSecAttrAccessGroup as String] = accessGroup as AnyObject
         }
 
-        let status = SecItemAdd(query as CFDictionary, nil)
+        var addQuery = searchQuery
+        addQuery[kSecValueData as String] = data as AnyObject
+        addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+
+        let status = SecItemAdd(addQuery as CFDictionary, nil)
 
         if status == errSecDuplicateItem {
             let attributes: [String: AnyObject] = [
                 kSecValueData as String: data as AnyObject,
+                kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
             ]
 
-            let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
-            guard status == errSecSuccess else {
-                throw KeychainError.unknown(status)
+            let updateStatus = SecItemUpdate(searchQuery as CFDictionary, attributes as CFDictionary)
+            guard updateStatus == errSecSuccess else {
+                throw KeychainError.unknown(updateStatus)
             }
         } else if status != errSecSuccess {
             throw KeychainError.unknown(status)
@@ -217,6 +220,7 @@ public class KeychainManager {
         try? delete(service: "com.arkavo.bluesky", account: "access_token")
         try? delete(service: "com.arkavo.bluesky", account: "refresh_token")
         try? delete(service: "com.arkavo.bluesky", account: "handle")
+        try? delete(service: "com.arkavo.bluesky", account: "did")
     }
 
     // MARK: - Shared Arkavo Authentication (shared across all Arkavo apps)
@@ -461,11 +465,16 @@ public extension KeychainManager {
     /// `Data`, as at creation and lookup; a `String` tag matches nothing, so
     /// `SecItemDelete` used to report success while the key stayed.
     internal static func didKeyDeletionQuery() -> [String: Any] {
-        [
+        var query: [String: Any] = [
             kSecClass as String: kSecClassKey,
             kSecAttrApplicationTag as String: didKeyTag.data(using: .utf8)!,
             kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+            kSecAttrTokenID as String: kSecAttrTokenIDSecureEnclave,
         ]
+        #if os(macOS)
+        query[kSecUseDataProtectionKeychain as String] = true
+        #endif
+        return query
     }
 
     internal static func deleteDIDKey() throws {

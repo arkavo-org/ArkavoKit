@@ -1,10 +1,11 @@
 import AVFoundation
 import CoreVideo
+import Synchronization
 import VideoToolbox
 
 /// Hardware-accelerated H.264 video encoder for streaming
 /// Uses VTCompressionSession for efficient encoding
-public final class VideoEncoder: Sendable {
+public final class VideoEncoder: @unchecked Sendable {
     // MARK: - Types
 
     public enum EncoderError: Error {
@@ -53,9 +54,65 @@ public final class VideoEncoder: Sendable {
         }
     }
 
+    /// Dedicated synchronization box for the `onFrame` handler, decoupled from
+    /// `sessionLock` so a synchronous VideoToolbox output callback invoked during
+    /// `VTCompressionSessionEncodeFrame` can safely read or mutate `onFrame`
+    /// without deadlocking.
+    private final class HandlerBox: Sendable {
+        private let handler = Mutex<(@Sendable (EncodedVideoFrame) -> Void)?>(nil)
+
+        var onFrame: (@Sendable (EncodedVideoFrame) -> Void)? {
+            get { handler.withLock { $0 } }
+            set {
+                let previous = handler.withLock { current -> (@Sendable (EncodedVideoFrame) -> Void)? in
+                    let old = current
+                    current = newValue
+                    return old
+                }
+                _ = previous
+            }
+        }
+    }
+
+    /// Retained by the active `VTCompressionSession` as its `refcon` and released
+    /// only after `VTCompressionSessionInvalidate` completes, eliminating any
+    /// use-after-free hazard if `VideoEncoder` is stopped or deallocated while a
+    /// VideoToolbox callback is in flight.
+    private final class CallbackContext: Sendable {
+        private let isActiveMutex = Mutex<Bool>(true)
+        private let handlerBox: HandlerBox
+
+        init(handlerBox: HandlerBox) {
+            self.handlerBox = handlerBox
+        }
+
+        var isActive: Bool {
+            isActiveMutex.withLock { $0 }
+        }
+
+        func deactivate() {
+            isActiveMutex.withLock { $0 = false }
+        }
+
+        func activeHandler() -> (@Sendable (EncodedVideoFrame) -> Void)? {
+            guard isActiveMutex.withLock({ $0 }) else { return nil }
+            return handlerBox.onFrame
+        }
+    }
+
+    private struct SessionState {
+        var compressionSession: VTCompressionSession?
+        var callbackContextPtr: UnsafeMutableRawPointer?
+        var activeContext: CallbackContext?
+        var isEncoding: Bool = false
+        var sentSequenceHeader: Bool = false
+    }
+
     // MARK: - Properties
 
-    nonisolated(unsafe) private var compressionSession: VTCompressionSession?
+    private let sessionLock = NSLock()
+    private var sessionState = SessionState()
+    private let handlerBox = HandlerBox()
 
     private let width: Int
     private let height: Int
@@ -63,11 +120,37 @@ public final class VideoEncoder: Sendable {
     private let bitrate: Int
     private let maxBitrate: Int
 
-    nonisolated(unsafe) private var isEncoding = false
-    nonisolated(unsafe) private var sentSequenceHeader = false
-
     /// Callback invoked when an H.264 frame is ready
-    nonisolated(unsafe) public var onFrame: (@Sendable (EncodedVideoFrame) -> Void)?
+    public var onFrame: (@Sendable (EncodedVideoFrame) -> Void)? {
+        get { handlerBox.onFrame }
+        set { handlerBox.onFrame = newValue }
+    }
+
+    /// Internal test inspection of active session/callback context state.
+    var isRunning: Bool {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        return sessionState.compressionSession != nil && sessionState.isEncoding
+    }
+
+    /// Internal test inspection of whether the active session's callback context is active.
+    var hasActiveCallbackContext: Bool {
+        let context: CallbackContext? = {
+            sessionLock.lock()
+            defer { sessionLock.unlock() }
+            return sessionState.activeContext
+        }()
+        return context?.isActive ?? false
+    }
+
+    /// Internal test helper simulating a synchronous VideoToolbox output callback
+    /// invoked while `sessionLock` is held by `encode(_:timestamp:)`.
+    func invokeActiveCallbackWhileHoldingSessionLockForTesting(_ frame: EncodedVideoFrame) {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        guard let handler = sessionState.activeContext?.activeHandler() else { return }
+        handler(frame)
+    }
 
     // MARK: - Initialization
 
@@ -82,28 +165,44 @@ public final class VideoEncoder: Sendable {
         print("🎥 VideoEncoder initialized: \(width)x\(height)@\(fps)fps, bitrate=\(bitrate/1000)kbps")
     }
 
+    deinit {
+        stop()
+    }
+
     // MARK: - Public Methods
 
     /// Start encoding
     public func start() throws {
-        guard compressionSession == nil else { return }
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+
+        guard sessionState.compressionSession == nil else { return }
+
+        let context = CallbackContext(handlerBox: handlerBox)
+        let retainedPtr = Unmanaged.passRetained(context).toOpaque()
+
+        let enableHardwareAcceleration: CFBoolean = kCFBooleanTrue
+        let encoderSpecification: CFDictionary = [
+            kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: enableHardwareAcceleration
+        ] as CFDictionary
 
         var session: VTCompressionSession?
-
         let status = VTCompressionSessionCreate(
             allocator: kCFAllocatorDefault,
             width: Int32(width),
             height: Int32(height),
             codecType: kCMVideoCodecType_H264,
-            encoderSpecification: nil,
+            encoderSpecification: encoderSpecification,
             imageBufferAttributes: nil,
             compressedDataAllocator: nil,
-            outputCallback: compressionOutputCallback,
-            refcon: Unmanaged.passUnretained(self).toOpaque(),
+            outputCallback: Self.compressionOutputCallback,
+            refcon: retainedPtr,
             compressionSessionOut: &session
         )
 
         guard status == noErr, let session = session else {
+            context.deactivate()
+            Unmanaged<CallbackContext>.fromOpaque(retainedPtr).release()
             throw EncoderError.sessionCreationFailed(status)
         }
 
@@ -113,23 +212,42 @@ public final class VideoEncoder: Sendable {
         // Prepare session
         VTCompressionSessionPrepareToEncodeFrames(session)
 
-        compressionSession = session
-        isEncoding = true
-        sentSequenceHeader = false
+        sessionState.compressionSession = session
+        sessionState.callbackContextPtr = retainedPtr
+        sessionState.activeContext = context
+        sessionState.isEncoding = true
+        sessionState.sentSequenceHeader = false
 
         print("✅ VTCompressionSession created: \(width)x\(height)@\(fps)fps, bitrate=\(bitrate/1000)kbps (max=\(maxBitrate/1000)kbps), profile=High")
     }
 
     /// Stop encoding
     public func stop() {
-        guard let session = compressionSession else { return }
+        let tornDown: (VTCompressionSession, UnsafeMutableRawPointer?, CallbackContext?)? = {
+            sessionLock.lock()
+            defer { sessionLock.unlock() }
+            guard let session = sessionState.compressionSession else { return nil }
+            let ptr = sessionState.callbackContextPtr
+            let context = sessionState.activeContext
+            sessionState.compressionSession = nil
+            sessionState.callbackContextPtr = nil
+            sessionState.activeContext = nil
+            sessionState.isEncoding = false
+            sessionState.sentSequenceHeader = false
+            return (session, ptr, context)
+        }()
+
+        guard let (session, contextPtr, activeContext) = tornDown else { return }
+
+        activeContext?.deactivate()
 
         VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
         VTCompressionSessionInvalidate(session)
 
-        compressionSession = nil
-        isEncoding = false
-        sentSequenceHeader = false
+        // VideoToolbox guarantees no further output callbacks after Invalidate returns.
+        if let contextPtr {
+            Unmanaged<CallbackContext>.fromOpaque(contextPtr).release()
+        }
 
         print("🛑 VideoEncoder stopped")
     }
@@ -139,7 +257,10 @@ public final class VideoEncoder: Sendable {
     ///   - pixelBuffer: Video frame to encode
     ///   - timestamp: Presentation timestamp
     public func encode(_ pixelBuffer: CVPixelBuffer, timestamp: CMTime) throws {
-        guard let session = compressionSession else {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+
+        guard let session = sessionState.compressionSession, sessionState.isEncoding else {
             throw EncoderError.invalidInput
         }
 
@@ -184,9 +305,6 @@ public final class VideoEncoder: Sendable {
         // Disable B-frames for RTMP compatibility
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
 
-        // Enable hardware acceleration
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, value: kCFBooleanTrue)
-
         // Use constant bitrate mode for consistent streaming
         // AverageBitRate + DataRateLimits together enforce CBR-like behavior.
         // Do NOT set Quality — it overrides bitrate targets and reduces output.
@@ -195,11 +313,11 @@ public final class VideoEncoder: Sendable {
         print("   DataRateLimits: \(bytesPerSecond/1000)KB/s in 1-second windows, CBR target: \(bitrate/1000)kbps")
     }
 
-    private let compressionOutputCallback: VTCompressionOutputCallback = { (
+    private static let compressionOutputCallback: VTCompressionOutputCallback = { (
         outputCallbackRefCon: UnsafeMutableRawPointer?,
-        sourceFrameRefCon: UnsafeMutableRawPointer?,
+        _: UnsafeMutableRawPointer?,
         status: OSStatus,
-        infoFlags: VTEncodeInfoFlags,
+        _: VTEncodeInfoFlags,
         sampleBuffer: CMSampleBuffer?
     ) in
         guard status == noErr, let sampleBuffer = sampleBuffer else {
@@ -207,13 +325,17 @@ public final class VideoEncoder: Sendable {
             return
         }
 
-        guard let encoder = outputCallbackRefCon else { return }
-        let videoEncoder = Unmanaged<VideoEncoder>.fromOpaque(encoder).takeUnretainedValue()
+        guard let refcon = outputCallbackRefCon else { return }
+        let context = Unmanaged<CallbackContext>.fromOpaque(refcon).takeUnretainedValue()
+        guard let handler = context.activeHandler() else { return }
 
-        videoEncoder.handleCompressedFrame(sampleBuffer)
+        VideoEncoder.handleCompressedFrame(sampleBuffer, handler: handler)
     }
 
-    private func handleCompressedFrame(_ sampleBuffer: CMSampleBuffer) {
+    private static func handleCompressedFrame(
+        _ sampleBuffer: CMSampleBuffer,
+        handler: @Sendable (EncodedVideoFrame) -> Void
+    ) {
         guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else {
             print("❌ No data buffer in compressed frame")
             return
@@ -255,16 +377,6 @@ public final class VideoEncoder: Sendable {
             formatDescription: formatDesc
         )
 
-        onFrame?(frame)
-    }
-
-    // Static counter for P-frame logging (thread-safe via lock)
-    private static let frameCountLock = NSLock()
-    private nonisolated(unsafe) static var _frameCount: Int = 0
-    private static func incrementFrameCount() -> Int {
-        frameCountLock.lock()
-        defer { frameCountLock.unlock() }
-        _frameCount += 1
-        return _frameCount
+        handler(frame)
     }
 }

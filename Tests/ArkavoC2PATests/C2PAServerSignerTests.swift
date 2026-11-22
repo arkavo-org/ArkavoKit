@@ -351,6 +351,50 @@ final class C2PAServerSignerTests: XCTestCase {
         try await assertUnsupported(ftypBox() + box("mdat", Data(repeating: 1, count: 32)) + moov)
     }
 
+    func testSignRejectsLargeSizeZeroBoxHeader() async throws {
+        var bytes = ftypBox() + moovBox(chunkTable(.stco, [28]))
+        bytes.append(contentsOf: [0, 0, 0, 1]) // 64-bit largesize indicator
+        bytes.append(contentsOf: Array("mdat".utf8))
+        bytes.append(bigEndian: UInt64(0)) // malformed largesize == 0
+        bytes.append(Data(repeating: 1, count: 32))
+
+        let url = try writeFile("bad-largesize.mov", bytes)
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let scan = try BMFFBox.scan(handle)
+        XCTAssertFalse(scan.isComplete)
+
+        try await assertUnsupported(bytes)
+    }
+
+    func testSignRejectsCompressedCmovMovieHeaders() async throws {
+        let moov = box("moov", box("cmov", Data(repeating: 0xAA, count: 16)))
+        try await assertUnsupported(ftypBox() + box("mdat", Data(repeating: 1, count: 32)) + moov)
+    }
+
+    func testSignRejectsNestedMetaBoxesWithIlocOffsets() async throws {
+        let trak = box("trak", box("mdia", box("minf", box("stbl", chunkTable(.stco, [28])))))
+        let metaWithIloc = fullBox("meta", fullBox("iloc", Data(count: 8)))
+        let moovWithMeta = box("moov", trak + metaWithIloc)
+        try await assertUnsupported(ftypBox() + box("mdat", Data(repeating: 1, count: 32)) + moovWithMeta)
+
+        let trakWithMeta = box("trak", box("mdia", box("minf", box("stbl", chunkTable(.stco, [28])))) + metaWithIloc)
+        try await assertUnsupported(ftypBox() + box("mdat", Data(repeating: 1, count: 32)) + box("moov", trakWithMeta))
+    }
+
+    func testSignAcceptsBenignQuickTimeMetaBoxWithoutIloc() async throws {
+        let chunk = UInt64(ftypBox().count + 8)
+        let trak = box("trak", box("mdia", box("minf", box("stbl", chunkTable(.stco, [chunk])))))
+        let benignMeta = fullBox("meta", fullBox("hdlr", Data(count: 12)))
+        let movie = ftypBox() + box("mdat", Data(repeating: 1, count: 32)) + box("moov", trak + benignMeta)
+        let input = try writeFile("qt-meta.mov", movie)
+        let output = directory.appendingPathComponent("qt-meta-signed.mov")
+        let signer = C2PAServerSigner(reservation: 4096) { _ in Data(count: 100) }
+
+        _ = try await signer.sign(inputFile: input, outputFile: output, metadata: metadata())
+        XCTAssertEqual(try chunkOffsets(Data(contentsOf: output)), .stco([chunk + 4096]))
+    }
+
     func testSignRejectsUnknownFileExtensions() async throws {
         let input = try writeFile("in.avi", makeMovie(payloadSize: 16, moovFirst: false).bytes)
         let output = directory.appendingPathComponent("out.avi")

@@ -344,6 +344,10 @@ struct PasskeyCredentialAttestationTests {
                 extra: [(.nint(1), .bytes(Array(Fixture.credentialX)))])))),
             .init("publicKey with kty twice", minted(Fixture.goldenClaims("publicKey", Fixture.coseKey(
                 extra: [(.uint(1), .uint(2))])))),
+            .init("publicKey with an ignored label twice", minted(Fixture.goldenClaims("publicKey", Fixture.coseKey(
+                extra: [(.uint(3), .nint(6)), (.uint(3), .nint(6))])))),
+            .init("publicKey with a byte-string label", minted(Fixture.goldenClaims("publicKey", Fixture.coseKey(
+                extra: [(.bytes([1]), .uint(0))])))),
             .init("an off-curve key", minted(Fixture.goldenClaims("publicKey", Fixture.coseKey(
                 x: Data(repeating: 0, count: 32), y: Data(repeating: 0, count: 32))))),
             .init("a key with y's last bit flipped", minted(Fixture.goldenClaims("publicKey", Fixture.coseKey(
@@ -415,5 +419,17 @@ struct PasskeyCredentialAttestationTests {
         #expect(Array(credential.subject.utf8) == Array("5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10".utf8))
         #expect(credential.credentialID == Data(repeating: 0x0B, count: 16))
         #expect(credential.publicKey.x963Representation == x963)
+    }
+
+    @Test
+    func cborReaderRejectsIllFormedOneByteSimpleValues() {
+        for value: UInt8 in 0...31 {
+            var reader = CBORReader(bytes: [0xF8, value])
+            #expect(throws: CBORReader.Failure.invalid) { _ = try reader.read() }
+        }
+        for value: UInt8 in [32, 255] {
+            var reader = CBORReader(bytes: [0xF8, value])
+            #expect(throws: Never.self) { _ = try reader.read() }
+        }
     }
 }

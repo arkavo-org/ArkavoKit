@@ -63,14 +63,26 @@ public enum AssertionData: Codable, Sendable {
         }
     }
 
+    private enum CreativeWorkPresenceKey: String, CodingKey {
+        case author
+    }
+
     public init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
         if let actions = try? container.decode(Actions.self) {
             self = .actions(actions)
-        } else if let work = try? container.decode(CreativeWork.self) {
+            return
+        }
+        // Only treat the payload as CreativeWork ahead of Metadata when the JSON object
+        // explicitly carries an "author" key; otherwise CreativeWork (whose sole property is
+        // optional) would swallow every generic string-valued Metadata dictionary.
+        let hasAuthorKey = (try? decoder.container(keyedBy: CreativeWorkPresenceKey.self).contains(.author)) ?? false
+        if hasAuthorKey, let work = try? container.decode(CreativeWork.self) {
             self = .creativeWork(work)
         } else if let metadata = try? container.decode(Metadata.self) {
             self = .metadata(metadata)
+        } else if let work = try? container.decode(CreativeWork.self) {
+            self = .creativeWork(work)
         } else {
             throw DecodingError.dataCorruptedError(
                 in: container,

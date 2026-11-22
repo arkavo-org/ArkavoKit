@@ -93,18 +93,22 @@ public final class AgentDiscoveryService: NSObject, ObservableObject {
     private func handleServiceResolved(_ service: NetService) {
         resolvingServices.remove(service)
 
+        guard service.port > 0, service.port <= Int(UInt16.max) else {
+            print("Service \(service.name) has invalid port: \(service.port)")
+            return
+        }
+
         guard let addresses = service.addresses, !addresses.isEmpty else {
             print("Service \(service.name) has no addresses")
             return
         }
 
-        // Get the first IPv4 address
-        guard let host = getHostFromAddress(addresses.first!) else {
+        // Prefer IPv4 addresses, falling back to properly bracketed IPv6
+        guard let selected = Self.selectPreferredHost(from: addresses),
+              let wsURL = Self.formatWebSocketURL(host: selected.host, isIPv6: selected.isIPv6, port: service.port) else {
             print("Failed to parse address for service \(service.name)")
             return
         }
-
-        let port = service.port
 
         // Parse TXT record for agent metadata
         let metadata = parseTXTRecord(service.txtRecordData())
@@ -120,11 +124,9 @@ public final class AgentDiscoveryService: NSObject, ObservableObject {
 
         // Create agent endpoint
         // Note: jsonrpsee servers use root path for WebSocket, not /ws
-        let wsPath = ""
-
         let endpoint = AgentEndpoint(
             id: agentId,
-            url: "ws://\(host):\(port)\(wsPath)",
+            url: wsURL,
             publicKey: nil,
             metadata: AgentMetadata(
                 name: metadata["name"] ?? agentId,
@@ -163,14 +165,66 @@ public final class AgentDiscoveryService: NSObject, ObservableObject {
         return result
     }
 
-    private func getHostFromAddress(_ addressData: Data) -> String? {
-        var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+    nonisolated static func selectPreferredHost(from addresses: [Data]) -> (host: String, isIPv6: Bool)? {
+        var fallbackIPv6: String?
 
-        addressData.withUnsafeBytes { (pointer: UnsafeRawBufferPointer) -> Void in
+        for addressData in addresses {
+            guard let parsed = parseHostFromAddress(addressData) else {
+                continue
+            }
+            if !parsed.isIPv6 {
+                return parsed
+            }
+            if fallbackIPv6 == nil {
+                fallbackIPv6 = parsed.host
+            }
+        }
+
+        if let ipv6 = fallbackIPv6 {
+            return (host: ipv6, isIPv6: true)
+        }
+        return nil
+    }
+
+    nonisolated static func formatWebSocketURL(host: String, isIPv6: Bool, port: Int, path: String = "") -> String? {
+        guard !host.isEmpty, port > 0, port <= Int(UInt16.max) else {
+            return nil
+        }
+
+        let formattedHost: String
+        if isIPv6 || host.contains(":") {
+            let escapedHost = host.replacingOccurrences(of: "%", with: "%25")
+            formattedHost = "[\(escapedHost)]"
+        } else {
+            formattedHost = host
+        }
+
+        let urlString = "ws://\(formattedHost):\(port)\(path)"
+        guard URL(string: urlString) != nil else {
+            return nil
+        }
+        return urlString
+    }
+
+    nonisolated static func parseHostFromAddress(_ addressData: Data) -> (host: String, isIPv6: Bool)? {
+        guard addressData.count >= MemoryLayout<sockaddr>.size else {
+            return nil
+        }
+
+        var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+        var family: sa_family_t = 0
+        var status: Int32 = -1
+
+        addressData.withUnsafeBytes { (pointer: UnsafeRawBufferPointer) in
             guard let baseAddress = pointer.baseAddress else { return }
             let sockaddrPtr = baseAddress.assumingMemoryBound(to: sockaddr.self)
+            family = sockaddrPtr.pointee.sa_family
 
-            getnameinfo(
+            guard family == sa_family_t(AF_INET) || family == sa_family_t(AF_INET6) else {
+                return
+            }
+
+            status = getnameinfo(
                 sockaddrPtr,
                 socklen_t(addressData.count),
                 &hostname,
@@ -181,9 +235,18 @@ public final class AgentDiscoveryService: NSObject, ObservableObject {
             )
         }
 
+        guard status == 0 else {
+            return nil
+        }
+
         // The name ends at the first NUL; the rest of the buffer is zero fill.
         let nameBytes = hostname.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
-        return String(decoding: nameBytes, as: UTF8.self)
+        let host = String(decoding: nameBytes, as: UTF8.self)
+        guard !host.isEmpty else {
+            return nil
+        }
+
+        return (host: host, isIPv6: family == sa_family_t(AF_INET6))
     }
 }
 

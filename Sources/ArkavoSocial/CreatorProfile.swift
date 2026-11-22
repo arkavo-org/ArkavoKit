@@ -76,16 +76,6 @@ public struct CreatorProfile: Codable, Identifiable, Sendable, Hashable {
             Data(SHA256.hash(data: buffer))
         }
     }
-
-    // MARK: - Hashable
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(id)
-    }
-
-    public static func == (lhs: CreatorProfile, rhs: CreatorProfile) -> Bool {
-        lhs.id == rhs.id
-    }
 }
 
 // MARK: - Serialization

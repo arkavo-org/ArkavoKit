@@ -24,6 +24,9 @@ public final class AudioMixer: @unchecked Sendable {
     private let channels: UInt32
 
     private let lock = NSLock()
+    /// Serializes `onMixedSample` emissions across `addSample`, `drain()`, and clock switches
+    /// so downstream consumers never see out-of-order PTS. Always acquired before `lock`.
+    private let emissionLock = NSLock()
     private var fifos: [String: [Int16]] = [:]        // interleaved Int16, non-clock sources only
     private var clockSourceID: String?
     private var registeredSourceIDs: Set<String> = []
@@ -39,10 +42,18 @@ public final class AudioMixer: @unchecked Sendable {
 
     /// The source whose activity ducks the others (the Muse voice). nil = no ducking.
     public let voiceSourceID: String?
+    private var _voiceDuckAmount: Float = 0.7
     /// Attenuation applied to non-voice sources while the voice is active (0.7 = 70%).
-    public var voiceDuckAmount: Float = 0.7
+    public var voiceDuckAmount: Float {
+        get { lock.lock(); defer { lock.unlock() }; return _voiceDuckAmount }
+        set { lock.lock(); _voiceDuckAmount = newValue; lock.unlock() }
+    }
+    private var _voiceDuckHangover: TimeInterval = 0.3
     /// How long after the voice FIFO empties the duck stays applied, in seconds.
-    public var voiceDuckHangover: TimeInterval = 0.3
+    public var voiceDuckHangover: TimeInterval {
+        get { lock.lock(); defer { lock.unlock() }; return _voiceDuckHangover }
+        set { lock.lock(); _voiceDuckHangover = newValue; lock.unlock() }
+    }
 
     /// Longest a non-clock source may queue, in seconds. Older samples are dropped.
     public let maxQueuedSeconds: Double = AudioMixer.queueCapSeconds
@@ -62,7 +73,11 @@ public final class AudioMixer: @unchecked Sendable {
     /// The source ID the mix reaches the encoder under.
     public static let outputSourceID = "mixed"
 
-    public var onMixedSample: ((CMSampleBuffer) -> Void)?
+    private var _onMixedSample: ((CMSampleBuffer) -> Void)?
+    public var onMixedSample: ((CMSampleBuffer) -> Void)? {
+        get { lock.lock(); defer { lock.unlock() }; return _onMixedSample }
+        set { lock.lock(); _onMixedSample = newValue; lock.unlock() }
+    }
 
     /// - Parameter prefillSeconds: The lead each non-clock source builds before it plays
     ///   (`defaultPrefillSeconds`, 60 ms). Every non-clock source lands about this much later
@@ -119,6 +134,9 @@ public final class AudioMixer: @unchecked Sendable {
         guard let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer) else { return }
         let incoming = Self.samples(of: sampleBuffer)
         guard !incoming.isEmpty else { return }
+
+        emissionLock.lock()
+        defer { emissionLock.unlock() }
 
         lock.lock()
         if clockSourceID == nil {
@@ -179,15 +197,17 @@ public final class AudioMixer: @unchecked Sendable {
         // Queued voice ducks even while it builds its lead, so the duck starts up to one prefill
         // before the voice is audible and its first syllable never lands on unducked audio.
         let voiceQueued = voiceSourceID.map { (fifos[$0]?.isEmpty == false) } ?? false
-        let voiceRecent = CACurrentMediaTime() - lastVoiceActivity <= voiceDuckHangover
+        let voiceRecent = CACurrentMediaTime() - lastVoiceActivity <= _voiceDuckHangover
         let ducking = voiceSourceID != nil && (voiceQueued || voiceRecent || contributions.contains { $0.id == voiceSourceID && !$0.samples.isEmpty })
+        let duckAmount = _voiceDuckAmount
         let gains = sourceGains
+        let callback = _onMixedSample
         lock.unlock()
 
         let out = mix([(id: sourceID, samples: incoming)] + contributions, length: frameSamples,
-                      gains: gains, ducking: ducking)
+                      gains: gains, ducking: ducking, duckAmount: duckAmount)
         if let sb = Self.makeBuffer(out, frames: clockFrames, format: formatDesc, pts: clockPTS) {
-            onMixedSample?(sb)
+            callback?(sb)
         }
     }
 
@@ -198,6 +218,9 @@ public final class AudioMixer: @unchecked Sendable {
     /// RecordingSession does before it finishes a recording. Emits nothing if the clock never
     /// delivered, as there is no timeline to continue.
     public func drain() {
+        emissionLock.lock()
+        defer { emissionLock.unlock() }
+
         lock.lock()
         let queued = fifos.filter { $0.key != clockSourceID && !$0.value.isEmpty }
         fifos.removeAll()
@@ -208,7 +231,9 @@ public final class AudioMixer: @unchecked Sendable {
             return
         }
         let gains = sourceGains
-        let voiceRecent = CACurrentMediaTime() - lastVoiceActivity <= voiceDuckHangover
+        let duckAmount = _voiceDuckAmount
+        let voiceRecent = CACurrentMediaTime() - lastVoiceActivity <= _voiceDuckHangover
+        let callback = _onMixedSample
         let longest = queued.values.map(\.count).max() ?? 0
         var pts = clock.end
         var tail: [(samples: [Int16], pts: CMTime)] = []
@@ -221,7 +246,7 @@ public final class AudioMixer: @unchecked Sendable {
             let length = contributions.map(\.samples.count).max() ?? 0
             let voicePlays = contributions.contains { $0.id == voiceSourceID }
             let ducking = voiceSourceID != nil && (voicePlays || voiceRecent)
-            tail.append((mix(contributions, length: length, gains: gains, ducking: ducking), pts))
+            tail.append((mix(contributions, length: length, gains: gains, ducking: ducking, duckAmount: duckAmount), pts))
             pts = CMTimeAdd(pts, frameDuration(length / Int(channels)))
         }
         lastClock?.end = pts
@@ -230,7 +255,7 @@ public final class AudioMixer: @unchecked Sendable {
         for chunk in tail {
             if let sb = Self.makeBuffer(chunk.samples, frames: chunk.samples.count / Int(channels),
                                         format: clock.format, pts: chunk.pts) {
-                onMixedSample?(sb)
+                callback?(sb)
             }
         }
     }
@@ -238,10 +263,10 @@ public final class AudioMixer: @unchecked Sendable {
     /// Sums `sources` sample by sample into `length` interleaved samples, applying each source's
     /// gain, and the voice duck to every source but the voice while `ducking`.
     private func mix(_ sources: [(id: String, samples: [Int16])], length: Int,
-                     gains: [String: Float], ducking: Bool) -> [Int16] {
+                     gains: [String: Float], ducking: Bool, duckAmount: Float) -> [Int16] {
         var mixed = [Float](repeating: 0, count: length)
         for source in sources {
-            let duck: Float = (ducking && source.id != voiceSourceID) ? voiceDuckAmount : 1.0
+            let duck: Float = (ducking && source.id != voiceSourceID) ? duckAmount : 1.0
             let g = (gains[source.id] ?? 1.0) * duck
             for (i, v) in source.samples.enumerated() { mixed[i] += Float(v) * g }
         }
@@ -294,29 +319,65 @@ public final class AudioMixer: @unchecked Sendable {
 
     private static func samples(of sb: CMSampleBuffer) -> [Int16] {
         guard let block = CMSampleBufferGetDataBuffer(sb) else { return [] }
+        let totalLength = CMBlockBufferGetDataLength(block)
+        let sampleCount = totalLength / MemoryLayout<Int16>.size
+        guard sampleCount > 0 else { return [] }
+        let byteCount = sampleCount * MemoryLayout<Int16>.size
+
+        var lengthAtOffset = 0
         var length = 0
         var ptr: UnsafeMutablePointer<Int8>?
-        CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &length, dataPointerOut: &ptr)
-        guard let ptr, length >= 2 else { return [] }
-        return ptr.withMemoryRebound(to: Int16.self, capacity: length / 2) {
-            Array(UnsafeBufferPointer(start: $0, count: length / 2))
+        let status = CMBlockBufferGetDataPointer(
+            block,
+            atOffset: 0,
+            lengthAtOffsetOut: &lengthAtOffset,
+            totalLengthOut: &length,
+            dataPointerOut: &ptr
+        )
+
+        var result = [Int16](repeating: 0, count: sampleCount)
+        if status == kCMBlockBufferNoErr, let ptr, lengthAtOffset >= byteCount {
+            result.withUnsafeMutableBytes { dest in
+                dest.copyBytes(from: UnsafeRawBufferPointer(start: ptr, count: byteCount))
+            }
+            return result
         }
+
+        let copyStatus = result.withUnsafeMutableBytes { dest -> OSStatus in
+            guard let base = dest.baseAddress else { return kCMBlockBufferBadPointerParameterErr }
+            return CMBlockBufferCopyDataBytes(
+                block,
+                atOffset: 0,
+                dataLength: byteCount,
+                destination: base
+            )
+        }
+        guard copyStatus == kCMBlockBufferNoErr else { return [] }
+        return result
     }
 
     private static func makeBuffer(_ samples: [Int16], frames: Int, format: CMFormatDescription, pts: CMTime) -> CMSampleBuffer? {
         let length = samples.count * MemoryLayout<Int16>.size
+        guard length > 0, frames > 0 else { return nil }
         var block: CMBlockBuffer?
-        CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: length,
-                                           blockAllocator: kCFAllocatorDefault, customBlockSource: nil, offsetToData: 0,
-                                           dataLength: length, flags: 0, blockBufferOut: &block)
-        guard let block else { return nil }
-        var copy = samples
-        copy.withUnsafeMutableBytes { raw in
-            _ = CMBlockBufferReplaceDataBytes(with: raw.baseAddress!, blockBuffer: block, offsetIntoDestination: 0, dataLength: length)
+        let createStatus = CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: length,
+            blockAllocator: kCFAllocatorDefault, customBlockSource: nil, offsetToData: 0,
+            dataLength: length, flags: 0, blockBufferOut: &block
+        )
+        guard createStatus == kCMBlockBufferNoErr, let block else { return nil }
+        let replaceStatus = samples.withUnsafeBytes { raw -> OSStatus in
+            guard let base = raw.baseAddress else { return kCMBlockBufferBadPointerParameterErr }
+            return CMBlockBufferReplaceDataBytes(with: base, blockBuffer: block, offsetIntoDestination: 0, dataLength: length)
         }
+        guard replaceStatus == kCMBlockBufferNoErr else { return nil }
         var out: CMSampleBuffer?
-        CMAudioSampleBufferCreateReadyWithPacketDescriptions(allocator: kCFAllocatorDefault, dataBuffer: block,
-            formatDescription: format, sampleCount: frames, presentationTimeStamp: pts, packetDescriptions: nil, sampleBufferOut: &out)
+        let sampleStatus = CMAudioSampleBufferCreateReadyWithPacketDescriptions(
+            allocator: kCFAllocatorDefault, dataBuffer: block,
+            formatDescription: format, sampleCount: frames, presentationTimeStamp: pts,
+            packetDescriptions: nil, sampleBufferOut: &out
+        )
+        guard sampleStatus == noErr else { return nil }
         return out
     }
 }

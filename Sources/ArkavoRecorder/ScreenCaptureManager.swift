@@ -26,17 +26,34 @@ public final class ScreenCaptureManager: NSObject, Sendable {
 
     private let outputQueue = DispatchQueue(label: "com.arkavo.screencapture")
 
+    private struct FrameHandlers: Sendable {
+        var onFrame: (@Sendable (CMSampleBuffer) -> Void)?
+        var onFrameForCapture: (@Sendable (CMSampleBuffer, UUID) -> Void)?
+        var frameValidatedForTesting: (@Sendable (UUID) -> Void)?
+    }
+
+    private let handlersLock = OSAllocatedUnfairLock(initialState: FrameHandlers())
+
     /// Called with each frame of the current capture, on the capture's callback queue. A start or
     /// stop waits while a call is running, so it must not wait for the main actor.
-    nonisolated(unsafe) public var onFrame: (@Sendable (CMSampleBuffer) -> Void)?
+    nonisolated public var onFrame: (@Sendable (CMSampleBuffer) -> Void)? {
+        get { handlersLock.withLock { $0.onFrame } }
+        set { handlersLock.withLock { $0.onFrame = newValue } }
+    }
     /// Called on the main actor when `startCapture` can't attach its display because the session
     /// can't take its input (`RecorderError.cannotAddInput`). The display captured before keeps
     /// capturing. `startCaptureAndWaitForFirstFrame` throws instead.
     public var onCaptureError: (@MainActor (any Error) -> Void)?
-    nonisolated(unsafe) var onFrameForCapture: (@Sendable (CMSampleBuffer, UUID) -> Void)?
+    nonisolated var onFrameForCapture: (@Sendable (CMSampleBuffer, UUID) -> Void)? {
+        get { handlersLock.withLock { $0.onFrameForCapture } }
+        set { handlersLock.withLock { $0.onFrameForCapture = newValue } }
+    }
     /// Tests: called on the callback's thread once a frame has been matched to its capture, before
     /// it's delivered.
-    nonisolated(unsafe) var frameValidatedForTesting: (@Sendable (UUID) -> Void)?
+    nonisolated var frameValidatedForTesting: (@Sendable (UUID) -> Void)? {
+        get { handlersLock.withLock { $0.frameValidatedForTesting } }
+        set { handlersLock.withLock { $0.frameValidatedForTesting = newValue } }
+    }
     private let activeCapture = OSAllocatedUnfairLock<ActiveCapture?>(initialState: nil)
     /// Held by every change to `activeCapture` and by a frame's last check and its delivery, so a
     /// change is atomic with delivery. Taken before `activeCapture`, never while `activeCapture`
@@ -276,21 +293,36 @@ extension ScreenCaptureManager: AVCaptureVideoDataOutputSampleBufferDelegate {
               let captureID = activeCapture.withLock({ state in
                   state?.input == ObjectIdentifier(input) ? state?.id : nil
               }) else { return }
-        frameValidatedForTesting?(captureID)
+        let validatedHook = handlersLock.withLock { $0.frameValidatedForTesting }
+        validatedHook?(captureID)
         // The last check and the handover share the lock routing changes take: a stop or
         // replacement that came after the check above drops the frame here, and one that comes
         // during the handover waits for it to finish.
-        let delivered = routingLock.withLockUnchecked { () -> Bool in
-            guard isCurrentCapture(captureID) else { return false }
-            onFrame?(sampleBuffer)
-            onFrameForCapture?(sampleBuffer, captureID)
-            return true
+        let isFirstFrame: Bool? = routingLock.withLockUnchecked {
+            let check = activeCapture.withLock { state -> (isCurrent: Bool, isFirst: Bool) in
+                guard var current = state, current.id == captureID else {
+                    return (false, false)
+                }
+                let first = !current.firstFrameDelivered
+                if first {
+                    current.firstFrameDelivered = true
+                    state = current
+                }
+                return (true, first)
+            }
+            guard check.isCurrent else { return nil }
+            let (frameHandler, captureHandler) = handlersLock.withLock { ($0.onFrame, $0.onFrameForCapture) }
+            frameHandler?(sampleBuffer)
+            captureHandler?(sampleBuffer, captureID)
+            return check.isFirst
         }
-        guard delivered else { return }
+        guard let isFirstFrame else { return }
 
-        // Signal first frame for async startup
-        Task { @MainActor [weak self] in
-            self?.signalFirstFrame(captureID: captureID)
+        // Hop to MainActor only once for the first frame of this capture
+        if isFirstFrame {
+            Task { @MainActor [weak self] in
+                self?.signalFirstFrame(captureID: captureID)
+            }
         }
     }
 }
@@ -301,6 +333,7 @@ extension ScreenCaptureManager: AVCaptureVideoDataOutputSampleBufferDelegate {
 private struct ActiveCapture: Sendable {
     let input: ObjectIdentifier
     let id: UUID
+    var firstFrameDelivered: Bool = false
 }
 
 /// The capture session, its video output and its screen input. Every member is used only on

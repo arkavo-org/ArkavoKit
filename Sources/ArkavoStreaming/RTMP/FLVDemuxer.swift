@@ -53,6 +53,10 @@ public struct FLVDemuxer: Sendable {
         public let naluLengthSize: UInt8  // Usually 4
 
         public func createFormatDescription() throws -> CMVideoFormatDescription {
+            guard !sps.isEmpty, !pps.isEmpty, (1...4).contains(naluLengthSize) else {
+                throw DemuxError.invalidData
+            }
+
             var formatDescription: CMVideoFormatDescription?
 
             // Create arrays for parameter sets
@@ -61,20 +65,24 @@ public struct FLVDemuxer: Sendable {
             let parameterSetSizes: [Int] = [spsArray.count, ppsArray.count]
 
             // Use nested withUnsafeBufferPointer to ensure pointers remain valid
-            let status = spsArray.withUnsafeBufferPointer { spsBuffer in
-                ppsArray.withUnsafeBufferPointer { ppsBuffer in
-                    // Create array of pointers inside the safe scope
-                    var parameterSetPointers: [UnsafePointer<UInt8>] = [
-                        spsBuffer.baseAddress!,
-                        ppsBuffer.baseAddress!,
-                    ]
+            let status: OSStatus = spsArray.withUnsafeBufferPointer { spsBuffer in
+                guard let spsPtr = spsBuffer.baseAddress else { return kCMFormatDescriptionError_InvalidParameter }
+                return ppsArray.withUnsafeBufferPointer { ppsBuffer in
+                    guard let ppsPtr = ppsBuffer.baseAddress else { return kCMFormatDescriptionError_InvalidParameter }
+                    var parameterSetPointers: [UnsafePointer<UInt8>] = [spsPtr, ppsPtr]
                     return parameterSetPointers.withUnsafeMutableBufferPointer { pointersBuffer in
-                        parameterSetSizes.withUnsafeBufferPointer { sizesBuffer in
-                            CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                        guard let pointersBase = pointersBuffer.baseAddress else {
+                            return kCMFormatDescriptionError_InvalidParameter
+                        }
+                        return parameterSetSizes.withUnsafeBufferPointer { sizesBuffer in
+                            guard let sizesBase = sizesBuffer.baseAddress else {
+                                return kCMFormatDescriptionError_InvalidParameter
+                            }
+                            return CMVideoFormatDescriptionCreateFromH264ParameterSets(
                                 allocator: kCFAllocatorDefault,
                                 parameterSetCount: 2,
-                                parameterSetPointers: pointersBuffer.baseAddress!,
-                                parameterSetSizes: sizesBuffer.baseAddress!,
+                                parameterSetPointers: pointersBase,
+                                parameterSetSizes: sizesBase,
                                 nalUnitHeaderLength: Int32(naluLengthSize),
                                 formatDescriptionOut: &formatDescription
                             )
@@ -98,8 +106,10 @@ public struct FLVDemuxer: Sendable {
         public let channelCount: Int
 
         public func createFormatDescription() throws -> CMAudioFormatDescription {
-            // Parse AudioSpecificConfig
-            guard audioSpecificConfig.count >= 2 else {
+            guard audioSpecificConfig.count >= 2,
+                  sampleRate > 0,
+                  channelCount > 0,
+                  channelCount <= Int(UInt32.max) else {
                 throw DemuxError.invalidData
             }
 
@@ -118,16 +128,21 @@ public struct FLVDemuxer: Sendable {
 
             var formatDescription: CMAudioFormatDescription?
 
-            let status = CMAudioFormatDescriptionCreate(
-                allocator: kCFAllocatorDefault,
-                asbd: &asbd,
-                layoutSize: 0,
-                layout: nil,
-                magicCookieSize: audioSpecificConfig.count,
-                magicCookie: (audioSpecificConfig as NSData).bytes,
-                extensions: nil,
-                formatDescriptionOut: &formatDescription
-            )
+            let status = audioSpecificConfig.withUnsafeBytes { raw -> OSStatus in
+                guard let base = raw.baseAddress else {
+                    return kCMFormatDescriptionError_InvalidParameter
+                }
+                return CMAudioFormatDescriptionCreate(
+                    allocator: kCFAllocatorDefault,
+                    asbd: &asbd,
+                    layoutSize: 0,
+                    layout: nil,
+                    magicCookieSize: audioSpecificConfig.count,
+                    magicCookie: base,
+                    extensions: nil,
+                    formatDescriptionOut: &formatDescription
+                )
+            }
 
             guard status == noErr, let desc = formatDescription else {
                 throw DemuxError.invalidData
@@ -140,7 +155,9 @@ public struct FLVDemuxer: Sendable {
     // MARK: - Static Methods
 
     /// Parse AVC (H.264) sequence header from FLV video tag
-    public static func parseAVCSequenceHeader(_ data: Data) throws -> AVCDecoderConfig {
+    public static func parseAVCSequenceHeader(_ rawData: Data) throws -> AVCDecoderConfig {
+        let data = rawData.startIndex == 0 ? rawData : Data(rawData)
+
         // FLV video tag format:
         // byte 0: frame type (4 bits) | codec id (4 bits)
         // byte 1: AVC packet type (0 = sequence header)
@@ -172,47 +189,56 @@ public struct FLVDemuxer: Sendable {
         let levelIndication = config[3]
         let naluLengthSize = (config[4] & 0x03) + 1
 
-        // Parse SPS
-        let numSPS = config[5] & 0x1F
+        // Parse all SPS entries (retain the first, advance past any additional entries)
+        let numSPS = Int(config[5] & 0x1F)
         guard numSPS >= 1 else {
             throw DemuxError.invalidData
         }
 
         var offset = 6
-        guard config.count > offset + 2 else {
-            throw DemuxError.invalidData
+        var firstSPS: Data?
+        for i in 0 ..< numSPS {
+            guard config.count - offset >= 2 else {
+                throw DemuxError.invalidData
+            }
+
+            let spsLength = Int(config[offset]) << 8 | Int(config[offset + 1])
+            offset += 2
+
+            guard spsLength > 0, config.count - offset >= spsLength else {
+                throw DemuxError.invalidData
+            }
+
+            if i == 0 {
+                firstSPS = config.subdata(in: offset ..< (offset + spsLength))
+            }
+            offset += spsLength
         }
 
-        let spsLength = Int(config[offset]) << 8 | Int(config[offset + 1])
-        offset += 2
-
-        guard config.count >= offset + spsLength else {
+        guard let sps = firstSPS, !sps.isEmpty else {
             throw DemuxError.invalidData
         }
-
-        let sps = config.subdata(in: offset ..< offset + spsLength)
-        offset += spsLength
 
         // Parse PPS
         guard config.count > offset else {
             throw DemuxError.invalidData
         }
 
-        let numPPS = config[offset]
+        let numPPS = Int(config[offset])
         offset += 1
 
-        guard numPPS >= 1, config.count > offset + 2 else {
+        guard numPPS >= 1, config.count - offset >= 2 else {
             throw DemuxError.invalidData
         }
 
         let ppsLength = Int(config[offset]) << 8 | Int(config[offset + 1])
         offset += 2
 
-        guard config.count >= offset + ppsLength else {
+        guard ppsLength > 0, config.count - offset >= ppsLength else {
             throw DemuxError.invalidData
         }
 
-        let pps = config.subdata(in: offset ..< offset + ppsLength)
+        let pps = config.subdata(in: offset ..< (offset + ppsLength))
 
         return AVCDecoderConfig(
             sps: sps,
@@ -225,7 +251,9 @@ public struct FLVDemuxer: Sendable {
     }
 
     /// Parse AAC sequence header from FLV audio tag
-    public static func parseAACSequenceHeader(_ data: Data) throws -> AACDecoderConfig {
+    public static func parseAACSequenceHeader(_ rawData: Data) throws -> AACDecoderConfig {
+        let data = rawData.startIndex == 0 ? rawData : Data(rawData)
+
         // FLV audio tag format:
         // byte 0: sound format (4 bits) | rate (2 bits) | size (1 bit) | type (1 bit)
         // byte 1: AAC packet type (0 = sequence header)
@@ -270,8 +298,10 @@ public struct FLVDemuxer: Sendable {
     }
 
     /// Parse AVC (H.264) video frame from FLV video tag
-    public static func parseAVCVideoFrame(_ data: Data, naluLengthSize: Int, baseTimestamp: UInt32) throws -> VideoFrame {
-        guard data.count > 5 else {
+    public static func parseAVCVideoFrame(_ rawData: Data, naluLengthSize: Int, baseTimestamp: UInt32) throws -> VideoFrame {
+        let data = rawData.startIndex == 0 ? rawData : Data(rawData)
+
+        guard data.count > 5, (1...4).contains(naluLengthSize) else {
             throw DemuxError.invalidData
         }
 
@@ -298,18 +328,18 @@ public struct FLVDemuxer: Sendable {
         var nalus: [Data] = []
         var offset = 5
 
-        while offset + naluLengthSize <= data.count {
+        while data.count - offset >= naluLengthSize {
             var naluLength = 0
             for i in 0 ..< naluLengthSize {
                 naluLength = (naluLength << 8) | Int(data[offset + i])
             }
             offset += naluLengthSize
 
-            guard offset + naluLength <= data.count else {
+            guard naluLength > 0, naluLength <= data.count - offset else {
                 break
             }
 
-            let nalu = data.subdata(in: offset ..< offset + naluLength)
+            let nalu = data.subdata(in: offset ..< (offset + naluLength))
             nalus.append(nalu)
             offset += naluLength
         }
@@ -341,7 +371,9 @@ public struct FLVDemuxer: Sendable {
     }
 
     /// Parse AAC audio frame from FLV audio tag
-    public static func parseAACAudioFrame(_ data: Data, baseTimestamp: UInt32) throws -> AudioFrame {
+    public static func parseAACAudioFrame(_ rawData: Data, baseTimestamp: UInt32) throws -> AudioFrame {
+        let data = rawData.startIndex == 0 ? rawData : Data(rawData)
+
         guard data.count > 2 else {
             throw DemuxError.invalidData
         }
@@ -363,23 +395,34 @@ public struct FLVDemuxer: Sendable {
         formatDescription: CMVideoFormatDescription,
         naluLengthSize: Int
     ) throws -> CMSampleBuffer {
+        guard (1...4).contains(naluLengthSize), !frame.nalus.isEmpty else {
+            throw DemuxError.invalidData
+        }
+
+        let maxNaluLength = (UInt64(1) << (naluLengthSize * 8)) - 1
+
         // Combine NALUs with length prefix
         var blockData = Data()
         for nalu in frame.nalus {
-            var length = UInt32(nalu.count)
+            guard !nalu.isEmpty, UInt64(nalu.count) <= maxNaluLength else {
+                throw DemuxError.invalidNALU
+            }
+            let length = UInt32(nalu.count)
             // Write length in big-endian
-            for _ in 0 ..< naluLengthSize {
-                let shift = (naluLengthSize - 1) * 8
+            for byteIndex in (0 ..< naluLengthSize).reversed() {
+                let shift = byteIndex * 8
                 blockData.append(UInt8((length >> shift) & 0xFF))
-                length <<= 8
             }
             blockData.append(nalu)
+        }
+
+        guard !blockData.isEmpty else {
+            throw DemuxError.invalidData
         }
 
         // Create block buffer with copied data (important: data must be retained)
         var blockBuffer: CMBlockBuffer?
 
-        // First create an empty block buffer, then append data (which copies it)
         var status = CMBlockBufferCreateEmpty(
             allocator: kCFAllocatorDefault,
             capacity: 0,
@@ -391,28 +434,27 @@ public struct FLVDemuxer: Sendable {
             throw DemuxError.invalidData
         }
 
-        // Append data to block buffer - this copies the data so it's retained
-        status = blockData.withUnsafeBytes { bufferPointer in
-            CMBlockBufferAppendMemoryBlock(
-                buffer,
-                memoryBlock: nil,  // nil = allocate new memory
-                length: blockData.count,
-                blockAllocator: kCFAllocatorDefault,
-                customBlockSource: nil,
-                offsetToData: 0,
-                dataLength: blockData.count,
-                flags: 0
-            )
-        }
+        status = CMBlockBufferAppendMemoryBlock(
+            buffer,
+            memoryBlock: nil,  // nil = allocate new memory
+            length: blockData.count,
+            blockAllocator: kCFAllocatorDefault,
+            customBlockSource: nil,
+            offsetToData: 0,
+            dataLength: blockData.count,
+            flags: 0
+        )
 
         guard status == noErr else {
             throw DemuxError.invalidData
         }
 
-        // Copy the actual data into the block buffer
-        status = blockData.withUnsafeBytes { bufferPointer in
-            CMBlockBufferReplaceDataBytes(
-                with: bufferPointer.baseAddress!,
+        status = blockData.withUnsafeBytes { bufferPointer -> OSStatus in
+            guard let baseAddress = bufferPointer.baseAddress else {
+                return kCMBlockBufferBadPointerParameterErr
+            }
+            return CMBlockBufferReplaceDataBytes(
+                with: baseAddress,
                 blockBuffer: buffer,
                 offsetIntoDestination: 0,
                 dataLength: blockData.count
@@ -449,14 +491,16 @@ public struct FLVDemuxer: Sendable {
             throw DemuxError.invalidData
         }
 
-        // Set keyframe attachment
-        if frame.isKeyframe {
-            let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true)
-            if let array = attachments as? [[CFString: Any]], !array.isEmpty {
-                var dict = array[0]
-                dict[kCMSampleAttachmentKey_NotSync] = false
-                // Note: Can't easily modify attachments after creation
-            }
+        // Mutate the underlying CFMutableDictionary so downstream consumers see
+        // accurate keyframe vs non-keyframe (NotSync) attachment metadata.
+        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true),
+           CFArrayGetCount(attachments) > 0,
+           let rawDict = CFArrayGetValueAtIndex(attachments, 0) {
+            let dict = unsafeBitCast(rawDict, to: CFMutableDictionary.self)
+            let key = Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque()
+            let boolVal: CFBoolean = frame.isKeyframe ? kCFBooleanFalse : kCFBooleanTrue
+            let value = Unmanaged.passUnretained(boolVal).toOpaque()
+            CFDictionarySetValue(dict, key, value)
         }
 
         return sample
@@ -468,11 +512,14 @@ public struct FLVDemuxer: Sendable {
         formatDescription: CMAudioFormatDescription,
         sampleRate: Int = 48000
     ) throws -> CMSampleBuffer {
+        let blockData = frame.data
+        guard !blockData.isEmpty, sampleRate > 0, sampleRate <= Int(Int32.max) else {
+            throw DemuxError.invalidData
+        }
+
         // Create block buffer with copied data (important: data must be retained)
         var blockBuffer: CMBlockBuffer?
-        let blockData = frame.data
 
-        // First create an empty block buffer, then append data (which copies it)
         var status = CMBlockBufferCreateEmpty(
             allocator: kCFAllocatorDefault,
             capacity: 0,
@@ -484,7 +531,6 @@ public struct FLVDemuxer: Sendable {
             throw DemuxError.invalidData
         }
 
-        // Append data to block buffer - this allocates and copies
         status = CMBlockBufferAppendMemoryBlock(
             buffer,
             memoryBlock: nil,  // nil = allocate new memory
@@ -500,10 +546,12 @@ public struct FLVDemuxer: Sendable {
             throw DemuxError.invalidData
         }
 
-        // Copy the actual data into the block buffer
-        status = blockData.withUnsafeBytes { bufferPointer in
-            CMBlockBufferReplaceDataBytes(
-                with: bufferPointer.baseAddress!,
+        status = blockData.withUnsafeBytes { bufferPointer -> OSStatus in
+            guard let baseAddress = bufferPointer.baseAddress else {
+                return kCMBlockBufferBadPointerParameterErr
+            }
+            return CMBlockBufferReplaceDataBytes(
+                with: baseAddress,
                 blockBuffer: buffer,
                 offsetIntoDestination: 0,
                 dataLength: blockData.count

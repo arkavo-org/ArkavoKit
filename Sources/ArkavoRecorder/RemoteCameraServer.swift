@@ -4,12 +4,18 @@ import CoreVideo
 import Foundation
 import ImageIO
 import Network
+import os
 
 @MainActor
 public protocol RemoteCameraServerDelegate: AnyObject {
     func remoteCameraServer(_ server: RemoteCameraServer, didReceiveFrame buffer: CMSampleBuffer, sourceID: String)
     func remoteCameraServer(_ server: RemoteCameraServer, didReceive metadata: CameraMetadataEvent)
     func remoteCameraServer(_ server: RemoteCameraServer, didUpdateSources sources: [String])
+    func remoteCameraServer(_ server: RemoteCameraServer, didReceiveAudio payload: RemoteCameraMessage.AudioPayload, sourceID: String)
+}
+
+public extension RemoteCameraServerDelegate {
+    func remoteCameraServer(_ server: RemoteCameraServer, didReceiveAudio payload: RemoteCameraMessage.AudioPayload, sourceID: String) {}
 }
 
 /// Lightweight TCP server that ingests remote camera frames + metadata encoded as NDJSON `RemoteCameraMessage`s.
@@ -17,14 +23,21 @@ public final class RemoteCameraServer: NSObject, @unchecked Sendable {
     public static let serviceType = RemoteCameraConstants.serviceType
 
     private let queue = DispatchQueue(label: "com.arkavo.remote-camera-server")
+    private let queueKey = DispatchSpecificKey<Void>()
     private var listener: NWListener?
     private var connections: [UUID: ConnectionState] = [:]
+    /// Only mutated/accessed on `DispatchQueue.main` so `NetService` runs on `RunLoop.main`.
     private var netService: NetService?
     private var serviceName: String?
     private var videoDecoders: [String: VideoStreamDecoder] = [:]  // sourceID -> decoder
 
+    private let _port = OSAllocatedUnfairLock<UInt16>(initialState: 0)
+    private let bonjourGeneration = OSAllocatedUnfairLock<UInt64>(initialState: 0)
+
     public weak var delegate: RemoteCameraServerDelegate?
-    public private(set) var port: UInt16 = 0
+    public var port: UInt16 {
+        _port.withLock { $0 }
+    }
 
     private struct ConnectionState {
         let id: UUID
@@ -35,84 +48,127 @@ public final class RemoteCameraServer: NSObject, @unchecked Sendable {
 
     public override init() {
         super.init()
+        queue.setSpecific(key: queueKey, value: ())
+    }
+
+    private func onQueueSync<T>(_ work: () throws -> T) rethrows -> T {
+        if DispatchQueue.getSpecific(key: queueKey) != nil {
+            return try work()
+        }
+        return try queue.sync(execute: work)
     }
 
     public func start(port: UInt16 = 0, serviceName: String? = nil) throws {
-        guard listener == nil else { return }
+        try onQueueSync {
+            guard listener == nil else { return }
 
-        if port == 0 {
-            print("🚀 [RemoteCameraServer] Starting TCP listener on dynamic port...")
-        } else {
-            print("🚀 [RemoteCameraServer] Starting TCP listener on port \(port)...")
-        }
-
-        let parameters = NWParameters.tcp
-        parameters.allowLocalEndpointReuse = true
-        let nwPort: NWEndpoint.Port = port == 0 ? .any : (NWEndpoint.Port(rawValue: port) ?? .any)
-        let listener = try NWListener(using: parameters, on: nwPort)
-        self.listener = listener
-
-        #if os(macOS)
-            self.serviceName = serviceName ?? Host.current().localizedName ?? ProcessInfo.processInfo.hostName
-        #else
-            self.serviceName = serviceName ?? ProcessInfo.processInfo.hostName
-        #endif
-
-        listener.newConnectionHandler = { [weak self] connection in
-            self?.handleNewConnection(connection)
-        }
-
-        listener.stateUpdateHandler = { [weak self] state in
-            guard let self = self else { return }
-            switch state {
-            case .ready:
-                self.port = listener.port?.rawValue ?? port
-                print("✅ [RemoteCameraServer] TCP listener ready on port \(self.port)")
-                self.publishBonjourService()
-            case .failed(let error):
-                print("❌ [RemoteCameraServer] Listener failed: \(error)")
-            case .cancelled:
-                print("🛑 [RemoteCameraServer] Listener cancelled")
-            default:
-                break
+            if port == 0 {
+                print("🚀 [RemoteCameraServer] Starting TCP listener on dynamic port...")
+            } else {
+                print("🚀 [RemoteCameraServer] Starting TCP listener on port \(port)...")
             }
-        }
 
-        listener.start(queue: queue)
+            let parameters = NWParameters.tcp
+            parameters.allowLocalEndpointReuse = true
+            let nwPort: NWEndpoint.Port = port == 0 ? .any : (NWEndpoint.Port(rawValue: port) ?? .any)
+            let listener = try NWListener(using: parameters, on: nwPort)
+            self.listener = listener
+
+            #if os(macOS)
+                self.serviceName = serviceName ?? Host.current().localizedName ?? ProcessInfo.processInfo.hostName
+            #else
+                self.serviceName = serviceName ?? ProcessInfo.processInfo.hostName
+            #endif
+
+            listener.newConnectionHandler = { [weak self] connection in
+                self?.handleNewConnection(connection)
+            }
+
+            listener.stateUpdateHandler = { [weak self, weak listener] state in
+                guard let self, let listener else { return }
+                switch state {
+                case .ready:
+                    let boundPort = listener.port?.rawValue ?? port
+                    self._port.withLock { $0 = boundPort }
+                    print("✅ [RemoteCameraServer] TCP listener ready on port \(boundPort)")
+                    if let name = self.serviceName {
+                        let generation = self.bonjourGeneration.withLock { gen -> UInt64 in
+                            gen &+= 1
+                            return gen
+                        }
+                        self.publishBonjourService(name: name, port: boundPort, generation: generation)
+                    }
+                case .failed(let error):
+                    print("❌ [RemoteCameraServer] Listener failed: \(error)")
+                    if self.listener === listener {
+                        self.listener = nil
+                    }
+                    self._port.withLock { $0 = 0 }
+                case .cancelled:
+                    print("🛑 [RemoteCameraServer] Listener cancelled")
+                    if self.listener === listener {
+                        self.listener = nil
+                    }
+                    self._port.withLock { $0 = 0 }
+                default:
+                    break
+                }
+            }
+
+            listener.start(queue: queue)
+        }
     }
 
     public func stop() {
-        listener?.cancel()
-        listener = nil
+        bonjourGeneration.withLock { $0 &+= 1 }
 
-        for (_, connection) in connections {
-            connection.connection.cancel()
+        onQueueSync {
+            listener?.cancel()
+            listener = nil
+            _port.withLock { $0 = 0 }
+
+            for (_, state) in connections {
+                state.connection.cancel()
+            }
+            connections.removeAll()
+
+            for (_, decoder) in videoDecoders {
+                decoder.invalidate()
+            }
+            videoDecoders.removeAll()
         }
-        connections.removeAll()
-        netService?.stop()
-        netService = nil
+
+        DispatchQueue.main.async { [weak self] in
+            self?.netService?.stop()
+            self?.netService = nil
+        }
+
         Task { @MainActor [weak self] in
             guard let self else { return }
             self.delegate?.remoteCameraServer(self, didUpdateSources: [])
         }
     }
 
-    private func publishBonjourService() {
-        netService?.stop()
-        guard let name = serviceName else { return }
+    private func publishBonjourService(name: String, port: UInt16, generation: UInt64) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard self.bonjourGeneration.withLock({ $0 }) == generation else { return }
 
-        print("🔊 [Bonjour] Publishing service '\(name)' on port \(port)")
-        print("   Type: \(Self.serviceType)")
-        print("   Domain: local.")
-        print("   Options: includesPeerToPeer (no listenForConnections - we have our own NWListener)")
+            self.netService?.stop()
 
-        let service = NetService(domain: "local.", type: Self.serviceType, name: name, port: Int32(port))
-        service.includesPeerToPeer = true
-        service.delegate = self
-        // Don't use .listenForConnections - we already have our own NWListener
-        // NetService is only for discovery/advertisement
-        service.publish(options: [])
-        netService = service
+            print("🔊 [Bonjour] Publishing service '\(name)' on port \(port)")
+            print("   Type: \(Self.serviceType)")
+            print("   Domain: local.")
+            print("   Options: includesPeerToPeer (no listenForConnections - we have our own NWListener)")
+
+            let service = NetService(domain: "local.", type: Self.serviceType, name: name, port: Int32(port))
+            service.includesPeerToPeer = true
+            service.delegate = self
+            // Don't use .listenForConnections - we already have our own NWListener
+            // NetService is only for discovery/advertisement
+            service.publish(options: [])
+            self.netService = service
+        }
     }
 
     private func handleNewConnection(_ connection: NWConnection) {
@@ -140,14 +196,35 @@ public final class RemoteCameraServer: NSObject, @unchecked Sendable {
     }
 
     private func cleanupConnection(id: UUID) {
-        if let state = connections[id], let sourceID = state.sourceID {
-            updateSources(removing: sourceID)
-            // Clean up decoder for this source
-            videoDecoders[sourceID]?.invalidate()
-            videoDecoders.removeValue(forKey: sourceID)
+        // Remove connection first so shared sourceID checks see only remaining active connections.
+        guard let state = connections.removeValue(forKey: id) else { return }
+        state.connection.cancel()
+
+        if let sourceID = state.sourceID {
+            cleanupOrphanedDecoder(for: sourceID)
+            updateSources()
         }
-        connections[id]?.connection.cancel()
-        connections.removeValue(forKey: id)
+    }
+
+    /// Invalidates and removes `videoDecoders[sourceID]` only if no active connection still owns `sourceID`.
+    private func cleanupOrphanedDecoder(for sourceID: String) {
+        let stillOwned = connections.values.contains { $0.sourceID == sourceID }
+        if !stillOwned {
+            videoDecoders.removeValue(forKey: sourceID)?.invalidate()
+        }
+    }
+
+    /// Associates a connection with `sourceID`, cleaning up any previous source's orphaned decoder
+    /// (keeping total decoders bounded by `RemoteCameraConstants.maxConnections`).
+    private func assignSourceID(_ newSourceID: String, for connectionID: UUID, state: inout ConnectionState) {
+        let previousSourceID = state.sourceID
+        state.sourceID = newSourceID
+        connections[connectionID] = state
+
+        if let previousSourceID, previousSourceID != newSourceID {
+            cleanupOrphanedDecoder(for: previousSourceID)
+        }
+        updateSources()
     }
 
     private func receive(on connection: NWConnection, id: UUID) {
@@ -190,7 +267,9 @@ public final class RemoteCameraServer: NSObject, @unchecked Sendable {
             processPacket(packet, from: id, state: &state)
         }
 
-        connections[id] = state
+        if connections[id] != nil {
+            connections[id] = state
+        }
     }
 
     private func processPacket(_ data: Data, from id: UUID, state: inout ConnectionState) {
@@ -200,13 +279,11 @@ public final class RemoteCameraServer: NSObject, @unchecked Sendable {
             switch message.kind {
             case .handshake:
                 if let sourceID = message.handshake?.sourceID {
-                    state.sourceID = sourceID
-                    updateSources(adding: sourceID)
+                    assignSourceID(sourceID, for: id, state: &state)
                 }
             case .videoNALU:
                 guard let naluPayload = message.videoNALU else { return }
-                state.sourceID = naluPayload.sourceID
-                updateSources(adding: naluPayload.sourceID)
+                assignSourceID(naluPayload.sourceID, for: id, state: &state)
 
                 // Get or create decoder for this source
                 let decoder: VideoStreamDecoder
@@ -233,48 +310,35 @@ public final class RemoteCameraServer: NSObject, @unchecked Sendable {
                 try? decoder.decode(naluPayload.naluData, isKeyFrame: naluPayload.isKeyFrame, timestamp: timestamp)
             case .metadata:
                 guard let event = message.metadata else { return }
-                state.sourceID = event.sourceID
-                updateSources(adding: event.sourceID)
-                // Verbose logging disabled - uncomment to debug metadata flow
-                // print("📊 [RemoteCameraServer] Received metadata from \(event.sourceID)")
-                // if case .arFace(let faceMetadata) = event.metadata {
-                //     print("   └─ Face metadata: \(faceMetadata.blendShapes.count) blend shapes")
-                // }
+                assignSourceID(event.sourceID, for: id, state: &state)
                 Task { @MainActor [weak self] in
                     guard let self else { return }
-                    // print("📤 [RemoteCameraServer] Forwarding metadata to delegate")
                     self.delegate?.remoteCameraServer(self, didReceive: event)
                 }
             case .audio:
                 guard let audioPayload = message.audio else { return }
-                state.sourceID = audioPayload.sourceID
-                updateSources(adding: audioPayload.sourceID)
-                // TODO: Implement audio sample buffer handling and delegate call
-                print("🎤 Received audio: \(audioPayload.audioData.count) bytes at \(audioPayload.sampleRate)Hz")
+                assignSourceID(audioPayload.sourceID, for: id, state: &state)
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.delegate?.remoteCameraServer(self, didReceiveAudio: audioPayload, sourceID: audioPayload.sourceID)
+                }
             }
-
-            connections[id] = state
         } catch {
             print("⚠️ RemoteCameraServer decode error: \(error)")
         }
     }
 
-    private func updateSources(adding id: String? = nil, removing removedID: String? = nil) {
+    private func updateSources() {
         var sources = Set<String>()
         for state in connections.values {
             if let sourceID = state.sourceID {
                 sources.insert(sourceID)
             }
         }
-        if let removedID {
-            sources.remove(removedID)
-        }
-        if let id {
-            sources.insert(id)
-        }
+        let sortedSources = Array(sources)
         Task { @MainActor [weak self] in
             guard let self else { return }
-            self.delegate?.remoteCameraServer(self, didUpdateSources: Array(sources))
+            self.delegate?.remoteCameraServer(self, didUpdateSources: sortedSources)
         }
     }
 

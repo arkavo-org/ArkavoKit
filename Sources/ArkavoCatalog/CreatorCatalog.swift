@@ -43,9 +43,9 @@ public struct CreatorCatalog: Sendable, Equatable {
     /// The viewer's limit on a metadata TDF.
     public static let maxMetadataSize = 65_536
 
-    private static let documentKeys: Set<String> = ["schema", "owner", "entries"]
-    private static let entryKeys: Set<String> = ["contentID", "version", "payloadHash", "payloadSize", "metadata"]
-    private static let indexKeys: Set<String> = ["contentID", "version", "payloadHash", "payloadSize"]
+    private static let documentKeys: Set<StrictJSON.Key> = ["schema", "owner", "entries"]
+    private static let entryKeys: Set<StrictJSON.Key> = ["contentID", "version", "payloadHash", "payloadSize", "metadata"]
+    private static let indexKeys: Set<StrictJSON.Key> = ["contentID", "version", "payloadHash", "payloadSize"]
 
     /// One listed recording.
     public struct Entry: Sendable, Equatable {
@@ -100,11 +100,9 @@ public struct CreatorCatalog: Sendable, Equatable {
     /// Drops a contentID. Returns whether it was listed.
     @discardableResult
     public mutating func remove(contentID: String) -> Bool {
-        guard let index = entries.firstIndex(where: { $0.contentID.utf8.elementsEqual(contentID.utf8) }) else {
-            return false
-        }
-        entries.remove(at: index)
-        return true
+        let countBefore = entries.count
+        entries.removeAll { $0.contentID.utf8.elementsEqual(contentID.utf8) }
+        return entries.count != countBefore
     }
 
     // MARK: - Encoding
@@ -272,7 +270,7 @@ public struct CreatorCatalog: Sendable, Equatable {
     }
 
     /// The four fields an entry and an index entry share.
-    private static func fields(_ object: [String: StrictJSON], index: Int) throws(CreatorCatalogError) -> IndexEntry {
+    private static func fields(_ object: [StrictJSON.Key: StrictJSON], index: Int) throws(CreatorCatalogError) -> IndexEntry {
         guard let contentID = object["contentID"]?.string, CatalogField.isValidContentID(contentID) else {
             throw .contentID(index)
         }

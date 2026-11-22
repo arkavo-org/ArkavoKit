@@ -49,6 +49,9 @@ public class AppleSignInService: NSObject, ObservableObject {
     /// binds the Apple identity to an existing arkavo account. This method is
     /// retained for clients that still need the device-only behavior.
     public func linkAppleAccount() async throws {
+        guard !isProcessing, continuation == nil else {
+            throw AppleSignInError.notHandled
+        }
         isProcessing = true
         error = nil
         defer { isProcessing = false }
@@ -89,6 +92,9 @@ public class AppleSignInService: NSObject, ObservableObject {
     /// linked to a *different* arkavo account. The conflicting user_id is
     /// **not** disclosed by the server.
     public func linkAppleAccount(with client: ArkavoClient) async throws {
+        guard !isProcessing, continuation == nil else {
+            throw AppleSignInError.notHandled
+        }
         isProcessing = true
         error = nil
         defer { isProcessing = false }
@@ -153,6 +159,10 @@ public class AppleSignInService: NSObject, ObservableObject {
         nonce: String?,
         requestPII: Bool
     ) async throws -> ASAuthorizationAppleIDCredential {
+        guard continuation == nil else {
+            throw AppleSignInError.notHandled
+        }
+
         let appleIDProvider = ASAuthorizationAppleIDProvider()
         let request = appleIDProvider.createRequest()
         request.requestedScopes = requestPII ? [.fullName, .email] : []

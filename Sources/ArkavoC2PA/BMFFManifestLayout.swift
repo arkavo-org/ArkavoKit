@@ -163,9 +163,43 @@ struct BMFFManifestLayout {
                 if child.type == "saio" {
                     throw SigningError.unsupportedContainer("'saio' auxiliary offsets are not supported")
                 }
+                if child.type == "cmov" {
+                    throw SigningError.unsupportedContainer("compressed 'cmov' movie headers are not supported")
+                }
+                if child.type == "meta" {
+                    try checkUnsupportedMeta(data, meta: child)
+                }
                 body.append(path.contains(child.type) ? try rewrite(data, box: child, shift: shift) : bytes(data, child))
             }
             return header(box.type, bodySize: body.count, large: box.headerSize == 16) + body
+        }
+    }
+
+    /// Refuses a nested `meta` box if it contains an `iloc` item-location table (whose
+    /// absolute file offsets this layout does not rewrite) or if its children cannot be
+    /// parsed as either an ISO BMFF FullBox `meta` or a QuickTime container `meta`.
+    private static func checkUnsupportedMeta(_ data: Data, meta: Header) throws {
+        func parseChildren(startingAt start: Int) -> [Header]? {
+            guard start <= meta.body.upperBound else { return nil }
+            var result: [Header] = []
+            var offset = start
+            while offset < meta.body.upperBound {
+                guard let child = try? parseHeader(data, at: offset, limit: meta.body.upperBound) else {
+                    return nil
+                }
+                result.append(child)
+                offset = child.range.upperBound
+            }
+            return result
+        }
+        let fullBoxChildren = meta.body.count >= 4 ? parseChildren(startingAt: meta.body.lowerBound + 4) : nil
+        let qtChildren = parseChildren(startingAt: meta.body.lowerBound)
+        guard fullBoxChildren != nil || qtChildren != nil else {
+            throw SigningError.unsupportedContainer("malformed nested 'meta' box is not supported")
+        }
+        let allChildren = (fullBoxChildren ?? []) + (qtChildren ?? [])
+        if allChildren.contains(where: { $0.type == "iloc" }) {
+            throw SigningError.unsupportedContainer("nested 'meta' box with 'iloc' offsets is not supported")
         }
     }
 

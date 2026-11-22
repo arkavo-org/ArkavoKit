@@ -93,6 +93,9 @@ public actor IrohProfileService {
     /// - Parameter profile: The updated creator profile
     /// - Returns: A new ProfileTicket for the updated profile
     public func updateProfile(_ profile: CreatorProfile) async throws -> ProfileTicket {
+        guard profile.version < Int.max else {
+            throw IrohProfileError.encodingError("Profile version overflow")
+        }
         var updatedProfile = profile
         updatedProfile.updatedAt = Date()
         updatedProfile.version += 1
@@ -120,6 +123,8 @@ public actor IrohProfileService {
                 version: profile.version,
                 createdAt: Date()
             )
+        } catch is CancellationError {
+            throw CancellationError()
         } catch let error as IrohError {
             throw IrohProfileError.nativeNodeError(error)
         } catch {
@@ -167,6 +172,8 @@ public actor IrohProfileService {
         do {
             let data = try await node.getWithRetry(ticket: ticket, maxAttempts: maxAttempts)
             return try decoder.decode(CreatorProfile.self, from: data)
+        } catch is CancellationError {
+            throw CancellationError()
         } catch let error as IrohError {
             throw IrohProfileError.nativeNodeError(error)
         } catch {

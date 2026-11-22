@@ -36,20 +36,32 @@ public final class LocalHTTPServer: @unchecked Sendable {
         var rangeEnd: Int?
     }
 
+    // MARK: - Constants
+
+    private static let queueKey = DispatchSpecificKey<Void>()
+    private static let maxHeaderBytes = 16 * 1024
+    private static let headerTerminator = Data("\r\n\r\n".utf8)
+
     // MARK: - Properties
 
     private let contentDirectory: URL
     private let queue = DispatchQueue(label: "com.arkavo.LocalHTTPServer")
     private var listener: NWListener?
     private var connections: [ObjectIdentifier: NWConnection] = [:]
+    private var connectionBuffers: [ObjectIdentifier: Data] = [:]
     private var startupError: Error?
+    private var startupSignaled = false
+    private var _port: UInt16 = 0
 
-    public private(set) var port: UInt16 = 0
+    public var port: UInt16 {
+        syncOnQueue { _port }
+    }
 
     /// Base URL for the server (e.g., http://127.0.0.1:8080)
     public var baseURL: URL? {
-        guard port > 0 else { return nil }
-        return URL(string: "http://127.0.0.1:\(port)")
+        let currentPort = port
+        guard currentPort > 0 else { return nil }
+        return URL(string: "http://127.0.0.1:\(currentPort)")
     }
 
     // MARK: - Initialization
@@ -58,10 +70,20 @@ public final class LocalHTTPServer: @unchecked Sendable {
     /// - Parameter contentDirectory: Directory containing files to serve
     public init(contentDirectory: URL) {
         self.contentDirectory = contentDirectory
+        queue.setSpecific(key: Self.queueKey, value: ())
     }
 
     deinit {
         stop()
+    }
+
+    // MARK: - Synchronization
+
+    private func syncOnQueue<T>(_ body: () -> T) -> T {
+        if DispatchQueue.getSpecific(key: Self.queueKey) != nil {
+            return body()
+        }
+        return queue.sync(execute: body)
     }
 
     // MARK: - Server Control
@@ -80,55 +102,85 @@ public final class LocalHTTPServer: @unchecked Sendable {
             port: .any
         )
 
+        let newListener: NWListener
         do {
-            listener = try NWListener(using: parameters)
+            newListener = try NWListener(using: parameters)
         } catch {
             throw ServerError.startFailed(error)
         }
 
-        listener?.newConnectionHandler = { [weak self] connection in
+        let semaphore = DispatchSemaphore(value: 0)
+
+        syncOnQueue {
+            stopLocked()
+            listener = newListener
+            startupError = nil
+            startupSignaled = false
+            _port = 0
+        }
+
+        newListener.newConnectionHandler = { [weak self] connection in
             self?.handleNewConnection(connection)
         }
 
-        let semaphore = DispatchSemaphore(value: 0)
-        startupError = nil
-
-        listener?.stateUpdateHandler = { [weak self] state in
-            guard let self = self else { return }
+        newListener.stateUpdateHandler = { [weak self, weak newListener] state in
+            guard let self, let newListener else { return }
+            guard self.listener === newListener else { return }
             switch state {
             case .ready:
-                self.port = self.listener?.port?.rawValue ?? 0
-                print("🌐 HTTP server listening on port \(self.port)")
-                semaphore.signal()
+                self._port = newListener.port?.rawValue ?? 0
+                print("🌐 HTTP server listening on port \(self._port)")
+                if !self.startupSignaled {
+                    self.startupSignaled = true
+                    semaphore.signal()
+                }
             case .failed(let error):
                 print("🌐 HTTP server failed: \(error.localizedDescription)")
                 self.startupError = error
-                semaphore.signal()
+                if !self.startupSignaled {
+                    self.startupSignaled = true
+                    semaphore.signal()
+                }
             case .cancelled:
                 print("🌐 HTTP server cancelled")
+                if !self.startupSignaled {
+                    self.startupSignaled = true
+                    semaphore.signal()
+                }
             default:
                 break
             }
         }
 
-        listener?.start(queue: queue)
+        newListener.start(queue: queue)
 
         // Wait for listener to be ready
         let result = semaphore.wait(timeout: .now() + 5)
 
         if result == .timedOut {
-            listener?.cancel()
-            listener = nil
+            syncOnQueue {
+                if listener === newListener {
+                    stopLocked()
+                }
+            }
             throw ServerError.startTimeout
         }
 
-        if let error = startupError {
-            listener?.cancel()
-            listener = nil
+        let startOutcome: (error: Error?, port: UInt16) = syncOnQueue {
+            if let error = startupError {
+                if listener === newListener {
+                    stopLocked()
+                }
+                return (error, 0)
+            }
+            return (nil, _port)
+        }
+
+        if let error = startOutcome.error {
             throw ServerError.startFailed(error)
         }
 
-        guard let url = baseURL else {
+        guard startOutcome.port > 0, let url = URL(string: "http://127.0.0.1:\(startOutcome.port)") else {
             throw ServerError.notStarted
         }
 
@@ -137,60 +189,140 @@ public final class LocalHTTPServer: @unchecked Sendable {
 
     /// Stop the HTTP server and clean up all connections
     public func stop() {
-        // Cancel all connections
+        syncOnQueue {
+            stopLocked()
+        }
+        print("🌐 HTTP server stopped")
+    }
+
+    private func stopLocked() {
         for (_, connection) in connections {
             connection.cancel()
         }
         connections.removeAll()
+        connectionBuffers.removeAll()
 
-        // Cancel listener
         listener?.cancel()
         listener = nil
-        port = 0
-
-        print("🌐 HTTP server stopped")
+        _port = 0
+        startupError = nil
     }
 
     // MARK: - Connection Handling
 
     private func handleNewConnection(_ connection: NWConnection) {
         let connectionID = ObjectIdentifier(connection)
-        queue.async { [weak self] in
-            self?.connections[connectionID] = connection
-        }
+        connections[connectionID] = connection
+        connectionBuffers[connectionID] = Data()
 
         connection.stateUpdateHandler = { [weak self] state in
             switch state {
             case .failed, .cancelled:
-                self?.queue.async { [weak self] in
-                    self?.connections.removeValue(forKey: connectionID)
-                }
+                self?.connections.removeValue(forKey: connectionID)
+                self?.connectionBuffers.removeValue(forKey: connectionID)
             default:
                 break
             }
         }
 
         connection.start(queue: queue)
-        receiveRequest(on: connection)
+        receiveRequest(on: connection, id: connectionID)
     }
 
-    private func receiveRequest(on connection: NWConnection) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 16384) { [weak self] data, _, _, error in
+    private func receiveRequest(on connection: NWConnection, id connectionID: ObjectIdentifier) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: Self.maxHeaderBytes) { [weak self] data, _, isComplete, error in
             guard let self = self else { return }
 
             if let error = error {
                 print("🌐 Receive error: \(error.localizedDescription)")
+                self.connectionBuffers.removeValue(forKey: connectionID)
                 connection.cancel()
                 return
             }
 
-            guard let data = data, let requestString = String(data: data, encoding: .utf8) else {
-                self.sendResponse(to: connection, status: 400, statusText: "Bad Request", body: nil)
+            if let data = data, !data.isEmpty {
+                var buffer = self.connectionBuffers[connectionID] ?? Data()
+                if buffer.count + data.count > Self.maxHeaderBytes {
+                    self.connectionBuffers.removeValue(forKey: connectionID)
+                    self.sendResponse(
+                        to: connection,
+                        status: 431,
+                        statusText: "Request Header Fields Too Large",
+                        body: nil
+                    )
+                    return
+                }
+                buffer.append(data)
+                self.connectionBuffers[connectionID] = buffer
+
+                if let headerEnd = buffer.range(of: Self.headerTerminator) {
+                    self.connectionBuffers.removeValue(forKey: connectionID)
+                    let headerData = buffer[..<headerEnd.upperBound]
+                    guard let requestString = String(data: headerData, encoding: .utf8) else {
+                        self.sendResponse(to: connection, status: 400, statusText: "Bad Request", body: nil)
+                        return
+                    }
+                    self.handleHTTPRequest(requestString, on: connection)
+                    return
+                }
+            }
+
+            if isComplete {
+                let remaining = self.connectionBuffers.removeValue(forKey: connectionID) ?? Data()
+                if remaining.isEmpty {
+                    connection.cancel()
+                } else {
+                    self.sendResponse(to: connection, status: 400, statusText: "Bad Request", body: nil)
+                }
                 return
             }
 
-            self.handleHTTPRequest(requestString, on: connection)
+            self.receiveRequest(on: connection, id: connectionID)
         }
+    }
+
+    // MARK: - Path Resolution
+
+    private enum ResolvedFile {
+        case file(URL, relativePath: String)
+        case forbidden
+        case notFound
+    }
+
+    private func resolveRequestedFile(for path: String) -> ResolvedFile {
+        guard path.hasPrefix("/") else {
+            return .forbidden
+        }
+
+        let relativePath = String(path.dropFirst())
+        guard !relativePath.isEmpty else {
+            return .notFound
+        }
+        guard !relativePath.hasPrefix("/"), !relativePath.contains("\0") else {
+            return .forbidden
+        }
+
+        let canonicalRoot = contentDirectory.standardizedFileURL.resolvingSymlinksInPath()
+        let rootPrefix = canonicalRoot.path.hasSuffix("/") ? canonicalRoot.path : canonicalRoot.path + "/"
+
+        let resolvedURL = canonicalRoot
+            .appendingPathComponent(relativePath)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+        let resolvedPath = resolvedURL.path
+
+        guard resolvedPath.hasPrefix(rootPrefix), resolvedPath != canonicalRoot.path else {
+            return .forbidden
+        }
+
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: resolvedPath, isDirectory: &isDirectory),
+              !isDirectory.boolValue
+        else {
+            return .notFound
+        }
+
+        return .file(resolvedURL, relativePath: relativePath)
     }
 
     // MARK: - HTTP Request Handling
@@ -210,24 +342,37 @@ public final class LocalHTTPServer: @unchecked Sendable {
             return
         }
 
-        // Get filename from path (remove leading /)
-        let filename = String(request.path.dropFirst())
+        let fileURL: URL
+        let filename: String
+        switch resolveRequestedFile(for: request.path) {
+        case let .file(url, relativePath):
+            fileURL = url
+            filename = relativePath
+        case .forbidden:
+            print("🌐 HTTP 403 Forbidden: \(request.path)")
+            sendResponse(to: connection, status: 403, statusText: "Forbidden", body: nil)
+            return
+        case .notFound:
+            print("🌐 HTTP 404 Not Found: \(request.path)")
+            sendResponse(to: connection, status: 404, statusText: "Not Found", body: nil)
+            return
+        }
 
-        // Read file
-        let fileURL = contentDirectory.appendingPathComponent(filename)
-        guard FileManager.default.fileExists(atPath: fileURL.path),
-              let fileData = try? Data(contentsOf: fileURL) else {
+        // Determine file size from attributes without loading the entire file into memory
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+              let fileSizeNumber = attributes[.size] as? NSNumber
+        else {
             print("🌐 HTTP 404 Not Found: \(filename)")
             sendResponse(to: connection, status: 404, statusText: "Not Found", body: nil)
             return
         }
 
+        let fullLength = fileSizeNumber.intValue
         let contentType = mimeType(for: filename)
-        let fullLength = fileData.count
 
         // Handle Range request
         if let rangeStart = request.rangeStart {
-            let rangeEnd = min(request.rangeEnd ?? (fullLength - 1), fullLength - 1)
+            let rangeEnd = fullLength > 0 ? min(request.rangeEnd ?? (fullLength - 1), fullLength - 1) : -1
 
             // Validate range
             guard rangeStart >= 0, rangeStart < fullLength, rangeStart <= rangeEnd else {
@@ -241,10 +386,38 @@ public final class LocalHTTPServer: @unchecked Sendable {
                 return
             }
 
-            let slice = fileData[rangeStart...rangeEnd]
-            let sliceLength = slice.count
+            let requestedLength = rangeEnd - rangeStart + 1
+            let body: Data?
+            let actualLength: Int
+            let actualRangeEnd: Int
+            let actualTotalLength: Int
+            if request.method == "HEAD" {
+                body = nil
+                actualLength = requestedLength
+                actualRangeEnd = rangeEnd
+                actualTotalLength = fullLength
+            } else {
+                guard let sliceData = readFileSlice(from: fileURL, offset: UInt64(rangeStart), length: requestedLength) else {
+                    sendResponse(to: connection, status: 500, statusText: "Internal Server Error", body: nil)
+                    return
+                }
+                if sliceData.isEmpty {
+                    sendResponse(
+                        to: connection,
+                        status: 416,
+                        statusText: "Range Not Satisfiable",
+                        headers: ["Content-Range": "bytes */\(rangeStart)"],
+                        body: nil
+                    )
+                    return
+                }
+                body = sliceData
+                actualLength = sliceData.count
+                actualRangeEnd = rangeStart + actualLength - 1
+                actualTotalLength = actualLength < requestedLength ? (rangeStart + actualLength) : fullLength
+            }
 
-            print("🌐 HTTP 206 \(filename) bytes=\(rangeStart)-\(rangeEnd)/\(fullLength)")
+            print("🌐 HTTP 206 \(filename) bytes=\(rangeStart)-\(actualRangeEnd)/\(actualTotalLength)")
 
             sendResponse(
                 to: connection,
@@ -252,15 +425,29 @@ public final class LocalHTTPServer: @unchecked Sendable {
                 statusText: "Partial Content",
                 headers: [
                     "Content-Type": contentType,
-                    "Content-Length": "\(sliceLength)",
-                    "Content-Range": "bytes \(rangeStart)-\(rangeEnd)/\(fullLength)",
+                    "Content-Length": "\(actualLength)",
+                    "Content-Range": "bytes \(rangeStart)-\(actualRangeEnd)/\(actualTotalLength)",
                     "Accept-Ranges": "bytes"
                 ],
-                body: request.method == "HEAD" ? nil : Data(slice)
+                body: body
             )
         } else {
+            let body: Data?
+            let contentLength: Int
+            if request.method == "HEAD" {
+                body = nil
+                contentLength = fullLength
+            } else {
+                guard let fileData = try? Data(contentsOf: fileURL, options: .mappedIfSafe) else {
+                    sendResponse(to: connection, status: 500, statusText: "Internal Server Error", body: nil)
+                    return
+                }
+                body = fileData
+                contentLength = fileData.count
+            }
+
             // Full file response
-            print("🌐 HTTP 200 \(filename) (\(fullLength) bytes)")
+            print("🌐 HTTP 200 \(filename) (\(contentLength) bytes)")
 
             sendResponse(
                 to: connection,
@@ -268,11 +455,33 @@ public final class LocalHTTPServer: @unchecked Sendable {
                 statusText: "OK",
                 headers: [
                     "Content-Type": contentType,
-                    "Content-Length": "\(fullLength)",
+                    "Content-Length": "\(contentLength)",
                     "Accept-Ranges": "bytes"
                 ],
-                body: request.method == "HEAD" ? nil : fileData
+                body: body
             )
+        }
+    }
+
+    private func readFileSlice(from fileURL: URL, offset: UInt64, length: Int) -> Data? {
+        guard length >= 0 else { return nil }
+        do {
+            let handle = try FileHandle(forReadingFrom: fileURL)
+            defer { try? handle.close() }
+            try handle.seek(toOffset: offset)
+            var buffer = Data()
+            buffer.reserveCapacity(length)
+            while buffer.count < length {
+                let remaining = length - buffer.count
+                guard let chunk = try handle.read(upToCount: remaining), !chunk.isEmpty else {
+                    break
+                }
+                buffer.append(chunk)
+            }
+            return buffer
+        } catch {
+            print("🌐 Read slice error: \(error.localizedDescription)")
+            return nil
         }
     }
 
@@ -295,7 +504,7 @@ public final class LocalHTTPServer: @unchecked Sendable {
         }
 
         // Percent-decode path
-        let path = pathString.removingPercentEncoding ?? pathString
+        guard let path = pathString.removingPercentEncoding else { return nil }
 
         // Parse headers
         var headers: [String: String] = [:]

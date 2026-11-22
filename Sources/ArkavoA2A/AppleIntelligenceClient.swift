@@ -11,10 +11,6 @@ public final class AppleIntelligenceClient: ObservableObject {
     @Published public private(set) var isAvailable: Bool = false
     @Published public private(set) var lastError: String?
 
-    #if canImport(FoundationModels)
-    private var session: Any? // Stores LanguageModelSession, but using Any to avoid @available requirement
-    #endif
-
     public init() {
         checkAvailability()
     }
@@ -27,7 +23,6 @@ public final class AppleIntelligenceClient: ObservableObject {
                 // Check actual model availability
                 if case .available = SystemLanguageModel.default.availability {
                     isAvailable = true
-                    session = LanguageModelSession()
                 } else {
                     isAvailable = false
                 }
@@ -53,6 +48,8 @@ public final class AppleIntelligenceClient: ObservableObject {
             return try await generateText(toolCall)
         case "foundation_models_structured":
             return try await generateStructured(toolCall)
+        case "foundation_models_call_tool":
+            return try await handleCallTool(toolCall)
         default:
             throw AppleIntelligenceError.unknownTool(toolCall.name)
         }
@@ -125,14 +122,42 @@ public final class AppleIntelligenceClient: ObservableObject {
         }
     }
 
+    /// Handle dynamic tool call requests
+    private func handleCallTool(_ toolCall: ToolCall) async throws -> ToolCallResult {
+        guard let args = toolCall.args.value as? [String: Any],
+              let toolName = args["tool_name"] as? String else {
+            return ToolCallResult(
+                toolCallId: toolCall.toolCallId,
+                success: false,
+                error: "Invalid arguments: 'tool_name' is required"
+            )
+        }
+
+        let toolArgs = args["tool_args"] as? [String: Any] ?? [:]
+
+        do {
+            let response = try await callLocalTool(name: toolName, args: toolArgs)
+            return ToolCallResult(
+                toolCallId: toolCall.toolCallId,
+                success: true,
+                result: AnyCodable(response)
+            )
+        } catch {
+            return ToolCallResult(
+                toolCallId: toolCall.toolCallId,
+                success: false,
+                error: error.localizedDescription
+            )
+        }
+    }
+
     /// Perform text generation with Foundation Models
     private func performGeneration(prompt: String, maxTokens: Int, temperature: Double) async throws -> String {
         #if canImport(FoundationModels)
         #if os(iOS)
             if #available(iOS 26.0, *) {
-                guard let session = session as? LanguageModelSession else {
-                    throw AppleIntelligenceError.sessionError("Session not initialized")
-                }
+                // Create a fresh session per independent call to avoid context exhaustion and cross-task leakage
+                let session = LanguageModelSession()
 
                 // Note: Foundation Models API doesn't expose maxTokens or temperature directly
                 // These are handled by the system model
@@ -145,9 +170,8 @@ public final class AppleIntelligenceClient: ObservableObject {
             }
         #elseif os(macOS)
             if #available(macOS 26.0, *) {
-                guard let session = session as? LanguageModelSession else {
-                    throw AppleIntelligenceError.sessionError("Session not initialized")
-                }
+                // Create a fresh session per independent call to avoid context exhaustion and cross-task leakage
+                let session = LanguageModelSession()
 
                 do {
                     let response = try await session.respond(to: prompt)
@@ -169,8 +193,10 @@ public final class AppleIntelligenceClient: ObservableObject {
         #if canImport(FoundationModels)
         #if os(iOS)
             if #available(iOS 26.0, *) {
-                guard let session = session as? LanguageModelSession else {
-                    throw AppleIntelligenceError.sessionError("Session not initialized")
+                let session = LanguageModelSession()
+
+                guard JSONSerialization.isValidJSONObject(schema) else {
+                    throw AppleIntelligenceError.sessionError("Invalid JSON schema object")
                 }
 
                 // Convert schema to JSON string for prompt augmentation
@@ -203,8 +229,10 @@ public final class AppleIntelligenceClient: ObservableObject {
             }
         #elseif os(macOS)
             if #available(macOS 26.0, *) {
-                guard let session = session as? LanguageModelSession else {
-                    throw AppleIntelligenceError.sessionError("Session not initialized")
+                let session = LanguageModelSession()
+
+                guard JSONSerialization.isValidJSONObject(schema) else {
+                    throw AppleIntelligenceError.sessionError("Invalid JSON schema object")
                 }
 
                 let schemaData = try JSONSerialization.data(withJSONObject: schema)
@@ -250,9 +278,7 @@ public final class AppleIntelligenceClient: ObservableObject {
         #if canImport(FoundationModels)
         #if os(iOS)
             if #available(iOS 26.0, *) {
-                guard let session = session as? LanguageModelSession else {
-                    throw AppleIntelligenceError.sessionError("Session not initialized")
-                }
+                let session = LanguageModelSession()
 
                 do {
                     // Get full response
@@ -274,15 +300,14 @@ public final class AppleIntelligenceClient: ObservableObject {
 
                         startIndex = endIndex
                     }
+                    return
                 } catch {
                     throw AppleIntelligenceError.sessionError("Streaming generation failed: \(error.localizedDescription)")
                 }
             }
         #elseif os(macOS)
             if #available(macOS 26.0, *) {
-                guard let session = session as? LanguageModelSession else {
-                    throw AppleIntelligenceError.sessionError("Session not initialized")
-                }
+                let session = LanguageModelSession()
 
                 do {
                     let response = try await session.respond(to: prompt)
@@ -300,6 +325,7 @@ public final class AppleIntelligenceClient: ObservableObject {
 
                         startIndex = endIndex
                     }
+                    return
                 } catch {
                     throw AppleIntelligenceError.sessionError("Streaming generation failed: \(error.localizedDescription)")
                 }

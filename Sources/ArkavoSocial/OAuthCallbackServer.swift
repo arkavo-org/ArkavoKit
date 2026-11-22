@@ -33,94 +33,188 @@ public final class OAuthCallbackServer: @unchecked Sendable {
         }
     }
 
+    private static let queueKey = DispatchSpecificKey<Void>()
+    private static let maxHeaderBytes = 16 * 1024
+    private static let headerTerminator = Data("\r\n\r\n".utf8)
+
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "com.arkavo.oauth-callback-server")
-    private var connection: NWConnection?
+    private var connections: [ObjectIdentifier: NWConnection] = [:]
+    private var connectionBuffers: [ObjectIdentifier: Data] = [:]
     private var continuation: CheckedContinuation<String, Error>?
+    private var pendingResult: Result<String, Error>?
+    private var isCompleted = false
+    private var timeoutWorkItem: DispatchWorkItem?
     private var expectedState: String?
     private var startupError: Error?
+    private var startupSignaled = false
+    private var _port: UInt16 = 0
 
-    public private(set) var port: UInt16 = 0
+    public var port: UInt16 {
+        syncOnQueue { _port }
+    }
 
     public var redirectUri: String {
         "http://127.0.0.1:\(port)"
     }
 
-    public init() { /* Uses default property values */ }
+    public init() {
+        queue.setSpecific(key: Self.queueKey, value: ())
+    }
+
+    deinit {
+        stop()
+    }
+
+    private func syncOnQueue<T>(_ body: () -> T) -> T {
+        if DispatchQueue.getSpecific(key: Self.queueKey) != nil {
+            return body()
+        }
+        return queue.sync(execute: body)
+    }
+
+    /// Start listening on 127.0.0.1 with an ephemeral port and configure expected CSRF state.
+    /// Returns the bound port once the listener is `.ready`.
+    @discardableResult
+    public func startListening(state: String) throws -> UInt16 {
+        syncOnQueue {
+            stopListenerAndConnectionsLocked()
+            expectedState = state
+            isCompleted = false
+            pendingResult = nil
+            startupError = nil
+            startupSignaled = false
+            _port = 0
+        }
+
+        try startListener()
+        return port
+    }
+
+    /// Wait for the OAuth callback on a server already started with `startListening(state:)`.
+    public func waitForCallback(timeout: TimeInterval = 300) async throws -> String {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
+                let alreadyCancelled = Task.isCancelled
+                queue.async { [weak self] in
+                    guard let self else {
+                        cont.resume(throwing: OAuthError.cancelled)
+                        return
+                    }
+
+                    if alreadyCancelled {
+                        self.finishLocked(with: .failure(OAuthError.cancelled), delayConnectionCleanup: false)
+                        self.pendingResult = nil
+                        cont.resume(throwing: OAuthError.cancelled)
+                        return
+                    }
+
+                    if let pending = self.pendingResult {
+                        self.pendingResult = nil
+                        cont.resume(with: pending)
+                        return
+                    }
+
+                    if self.isCompleted {
+                        cont.resume(throwing: OAuthError.cancelled)
+                        return
+                    }
+
+                    self.continuation = cont
+
+                    let workItem = DispatchWorkItem { [weak self] in
+                        self?.finishLocked(with: .failure(OAuthError.timeout), delayConnectionCleanup: false)
+                    }
+                    self.timeoutWorkItem?.cancel()
+                    self.timeoutWorkItem = workItem
+                    self.queue.asyncAfter(deadline: .now() + timeout, execute: workItem)
+                }
+            }
+        } onCancel: { [weak self] in
+            guard let server = self else { return }
+            server.queue.async { [weak server] in
+                server?.finishLocked(with: .failure(OAuthError.cancelled), delayConnectionCleanup: false)
+            }
+        }
+    }
 
     /// Start the server and wait for OAuth callback
     /// - Parameter state: The state parameter to validate against CSRF
     /// - Parameter timeout: Maximum time to wait for callback (default 5 minutes)
     /// - Returns: The authorization code from the OAuth callback
     public func startAndWaitForCallback(state: String, timeout: TimeInterval = 300) async throws -> String {
-        expectedState = state
-
-        // Start the listener
-        try startListener()
-
-        // Wait for the callback with timeout
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { cont in
-                self.continuation = cont
-
-                // Set up timeout
-                queue.asyncAfter(deadline: .now() + timeout) { [weak self] in
-                    guard let self = self else { return }
-                    if self.continuation != nil {
-                        self.continuation?.resume(throwing: OAuthError.timeout)
-                        self.continuation = nil
-                        self.stop()
-                    }
-                }
-            }
-        } onCancel: {
-            self.continuation?.resume(throwing: OAuthError.cancelled)
-            self.continuation = nil
-            self.stop()
-        }
+        _ = try startListening(state: state)
+        return try await waitForCallback(timeout: timeout)
     }
 
     private func startListener() throws {
         let parameters = NWParameters.tcp
         parameters.allowLocalEndpointReuse = true
+        parameters.requiredLocalEndpoint = NWEndpoint.hostPort(
+            host: NWEndpoint.Host("127.0.0.1"),
+            port: .any
+        )
 
+        let newListener: NWListener
         do {
-            listener = try NWListener(using: parameters, on: .any)
+            newListener = try NWListener(using: parameters)
         } catch {
             throw OAuthError.serverStartFailed(error)
         }
 
-        listener?.newConnectionHandler = { [weak self] connection in
+        let semaphore = DispatchSemaphore(value: 0)
+
+        syncOnQueue {
+            listener = newListener
+            startupError = nil
+            startupSignaled = false
+            _port = 0
+        }
+
+        newListener.newConnectionHandler = { [weak self] connection in
             self?.handleNewConnection(connection)
         }
 
-        let semaphore = DispatchSemaphore(value: 0)
-        startupError = nil
-
-        listener?.stateUpdateHandler = { [weak self] state in
-            guard let self = self else { return }
+        newListener.stateUpdateHandler = { [weak self, weak newListener] state in
+            guard let self, let newListener else { return }
+            guard self.listener === newListener else { return }
             switch state {
             case .ready:
-                self.port = self.listener?.port?.rawValue ?? 0
-                print("[OAuthCallbackServer] Listening on port \(self.port)")
-                semaphore.signal()
+                self._port = newListener.port?.rawValue ?? 0
+                print("[OAuthCallbackServer] Listening on port \(self._port)")
+                if !self.startupSignaled {
+                    self.startupSignaled = true
+                    semaphore.signal()
+                }
             case let .failed(error):
                 print("[OAuthCallbackServer] Listener failed: \(error)")
                 self.startupError = error
-                semaphore.signal()
+                if !self.startupSignaled {
+                    self.startupSignaled = true
+                    semaphore.signal()
+                }
             case .cancelled:
                 print("[OAuthCallbackServer] Listener cancelled")
+                if !self.startupSignaled {
+                    self.startupSignaled = true
+                    semaphore.signal()
+                }
             default:
                 break
             }
         }
 
-        listener?.start(queue: queue)
+        newListener.start(queue: queue)
 
         // Wait for listener to be ready (with timeout)
         let result = semaphore.wait(timeout: .now() + 5)
 
         if result == .timedOut {
+            syncOnQueue {
+                if listener === newListener {
+                    stopListenerAndConnectionsLocked()
+                }
+            }
             throw OAuthError.serverStartFailed(NSError(
                 domain: "OAuthCallbackServer",
                 code: -1,
@@ -128,11 +222,25 @@ public final class OAuthCallbackServer: @unchecked Sendable {
             ))
         }
 
-        if let error = startupError {
+        let startOutcome: (error: Error?, ready: Bool) = syncOnQueue {
+            if let error = startupError {
+                if listener === newListener {
+                    stopListenerAndConnectionsLocked()
+                }
+                return (error, false)
+            }
+            let isReady = (listener === newListener) && newListener.state == .ready && _port > 0
+            if !isReady && listener === newListener {
+                stopListenerAndConnectionsLocked()
+            }
+            return (nil, isReady)
+        }
+
+        if let error = startOutcome.error {
             throw OAuthError.serverStartFailed(error)
         }
 
-        guard listener?.state == .ready else {
+        guard startOutcome.ready else {
             throw OAuthError.serverStartFailed(NSError(
                 domain: "OAuthCallbackServer",
                 code: -1,
@@ -142,35 +250,68 @@ public final class OAuthCallbackServer: @unchecked Sendable {
     }
 
     private func handleNewConnection(_ connection: NWConnection) {
-        self.connection = connection
+        let connectionID = ObjectIdentifier(connection)
+        connections[connectionID] = connection
+        connectionBuffers[connectionID] = Data()
 
         connection.stateUpdateHandler = { [weak self] state in
-            if case .failed = state {
-                self?.connection = nil
-            } else if case .cancelled = state {
-                self?.connection = nil
+            switch state {
+            case .failed, .cancelled:
+                self?.connections.removeValue(forKey: connectionID)
+                self?.connectionBuffers.removeValue(forKey: connectionID)
+            default:
+                break
             }
         }
 
         connection.start(queue: queue)
-        receiveRequest(on: connection)
+        receiveRequest(on: connection, id: connectionID)
     }
 
-    private func receiveRequest(on connection: NWConnection) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 8192) { [weak self] data, _, _, error in
+    private func receiveRequest(on connection: NWConnection, id connectionID: ObjectIdentifier) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: Self.maxHeaderBytes) { [weak self] data, _, isComplete, error in
             guard let self = self else { return }
 
             if let error = error {
                 print("[OAuthCallbackServer] Receive error: \(error)")
+                self.connectionBuffers.removeValue(forKey: connectionID)
+                connection.cancel()
                 return
             }
 
-            guard let data = data, let request = String(data: data, encoding: .utf8) else {
-                self.sendErrorResponse(to: connection, message: "Invalid request")
+            if let data = data, !data.isEmpty {
+                var buffer = self.connectionBuffers[connectionID] ?? Data()
+                if buffer.count + data.count > Self.maxHeaderBytes {
+                    self.connectionBuffers.removeValue(forKey: connectionID)
+                    self.sendErrorResponse(to: connection, message: "Request headers too large")
+                    return
+                }
+                buffer.append(data)
+                self.connectionBuffers[connectionID] = buffer
+
+                if let headerEnd = buffer.range(of: Self.headerTerminator) {
+                    self.connectionBuffers.removeValue(forKey: connectionID)
+                    let headerData = buffer[..<headerEnd.upperBound]
+                    guard let request = String(data: headerData, encoding: .utf8) else {
+                        self.sendErrorResponse(to: connection, message: "Invalid request")
+                        return
+                    }
+                    self.handleHTTPRequest(request, on: connection)
+                    return
+                }
+            }
+
+            if isComplete {
+                let remaining = self.connectionBuffers.removeValue(forKey: connectionID) ?? Data()
+                if remaining.isEmpty {
+                    connection.cancel()
+                } else {
+                    self.sendErrorResponse(to: connection, message: "Incomplete HTTP request")
+                }
                 return
             }
 
-            self.handleHTTPRequest(request, on: connection)
+            self.receiveRequest(on: connection, id: connectionID)
         }
     }
 
@@ -191,7 +332,7 @@ public final class OAuthCallbackServer: @unchecked Sendable {
         let pathAndQuery = parts[1]
 
         // Parse query parameters
-        guard let url = URL(string: "http://localhost\(pathAndQuery)"),
+        guard let url = URL(string: "http://127.0.0.1\(pathAndQuery)"),
               let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
         else {
             sendErrorResponse(to: connection, message: "Invalid request URL")
@@ -199,34 +340,39 @@ public final class OAuthCallbackServer: @unchecked Sendable {
         }
 
         let queryItems = components.queryItems ?? []
+        let hasCode = queryItems.contains(where: { $0.name == "code" })
+        let hasError = queryItems.contains(where: { $0.name == "error" })
+
+        // Ignore browser side requests (e.g., /favicon.ico) without aborting the OAuth flow.
+        if components.path == "/favicon.ico" || (!hasCode && !hasError && components.path != "/" && !components.path.isEmpty) {
+            sendNotFoundResponse(to: connection)
+            return
+        }
+
+        // Validate state parameter (CSRF protection) FIRST — MUST be present and match expectedState
+        // before handling `error=` or `code=`, so an attacker without state cannot abort sign-in
+        // or inject error text into the app UI. Respond with 400 and ignore the forged request
+        // without failing the active continuation or stopping the listener.
+        guard let expectedState = self.expectedState,
+              let state = queryItems.first(where: { $0.name == "state" })?.value,
+              state == expectedState
+        else {
+            sendErrorResponse(to: connection, message: "Invalid or missing state parameter")
+            return
+        }
 
         // Check for error response from OAuth provider
         if let error = queryItems.first(where: { $0.name == "error" })?.value {
             let errorDescription = queryItems.first(where: { $0.name == "error_description" })?.value ?? error
             sendErrorResponse(to: connection, message: errorDescription)
-            continuation?.resume(throwing: OAuthError.oauthError(errorDescription))
-            continuation = nil
-            stop()
+            finishLocked(with: .failure(OAuthError.oauthError(errorDescription)), delayConnectionCleanup: true)
             return
         }
 
-        // Validate state parameter (CSRF protection)
-        if let state = queryItems.first(where: { $0.name == "state" })?.value {
-            if state != expectedState {
-                sendErrorResponse(to: connection, message: "Invalid state parameter")
-                continuation?.resume(throwing: OAuthError.stateMismatch)
-                continuation = nil
-                stop()
-                return
-            }
-        }
-
         // Extract authorization code
-        guard let code = queryItems.first(where: { $0.name == "code" })?.value else {
+        guard let code = queryItems.first(where: { $0.name == "code" })?.value, !code.isEmpty else {
             sendErrorResponse(to: connection, message: "Missing authorization code")
-            continuation?.resume(throwing: OAuthError.missingAuthorizationCode)
-            continuation = nil
-            stop()
+            finishLocked(with: .failure(OAuthError.missingAuthorizationCode), delayConnectionCleanup: true)
             return
         }
 
@@ -234,13 +380,42 @@ public final class OAuthCallbackServer: @unchecked Sendable {
         sendSuccessResponse(to: connection)
 
         // Complete the continuation with the code
-        continuation?.resume(returning: code)
-        continuation = nil
+        finishLocked(with: .success(code), delayConnectionCleanup: true)
+    }
 
-        // Stop the server after a brief delay to ensure response is sent
-        queue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            self?.stop()
+    private func finishLocked(with result: Result<String, Error>, delayConnectionCleanup: Bool) {
+        guard !isCompleted else { return }
+        isCompleted = true
+
+        timeoutWorkItem?.cancel()
+        timeoutWorkItem = nil
+
+        if let cont = continuation {
+            continuation = nil
+            cont.resume(with: result)
+        } else {
+            pendingResult = result
         }
+
+        // Stop accepting new connections immediately
+        listener?.cancel()
+        listener = nil
+        _port = 0
+
+        if delayConnectionCleanup {
+            queue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.cancelAllConnectionsLocked()
+            }
+        } else {
+            cancelAllConnectionsLocked()
+        }
+    }
+
+    private func sendNotFoundResponse(to connection: NWConnection) {
+        let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        connection.send(content: Data(response.utf8), completion: .contentProcessed { _ in
+            connection.cancel()
+        })
     }
 
     private func sendSuccessResponse(to connection: NWConnection) {
@@ -314,7 +489,24 @@ public final class OAuthCallbackServer: @unchecked Sendable {
         })
     }
 
+    internal static func htmlEscape(_ string: String) -> String {
+        var escaped = ""
+        escaped.reserveCapacity(string.count)
+        for char in string {
+            switch char {
+            case "&": escaped += "&amp;"
+            case "<": escaped += "&lt;"
+            case ">": escaped += "&gt;"
+            case "\"": escaped += "&quot;"
+            case "'": escaped += "&#39;"
+            default: escaped.append(char)
+            }
+        }
+        return escaped
+    }
+
     private func sendErrorResponse(to connection: NWConnection, message: String) {
+        let escapedMessage = Self.htmlEscape(message)
         let html = """
             <!DOCTYPE html>
             <html>
@@ -363,7 +555,7 @@ public final class OAuthCallbackServer: @unchecked Sendable {
                     <div class="error-icon">✗</div>
                     <h1>Authorization Failed</h1>
                     <p>There was a problem connecting your YouTube account.</p>
-                    <div class="error-message">\(message)</div>
+                    <div class="error-message">\(escapedMessage)</div>
                     <p>Please close this window and try again.</p>
                 </div>
             </body>
@@ -385,10 +577,27 @@ public final class OAuthCallbackServer: @unchecked Sendable {
     }
 
     public func stop() {
+        syncOnQueue {
+            finishLocked(with: .failure(OAuthError.cancelled), delayConnectionCleanup: false)
+            stopListenerAndConnectionsLocked()
+        }
+    }
+
+    private func stopListenerAndConnectionsLocked() {
+        timeoutWorkItem?.cancel()
+        timeoutWorkItem = nil
         listener?.cancel()
         listener = nil
-        connection?.cancel()
-        connection = nil
+        _port = 0
+        cancelAllConnectionsLocked()
+    }
+
+    private func cancelAllConnectionsLocked() {
+        for (_, connection) in connections {
+            connection.cancel()
+        }
+        connections.removeAll()
+        connectionBuffers.removeAll()
     }
 }
 #endif

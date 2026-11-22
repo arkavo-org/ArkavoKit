@@ -283,14 +283,22 @@ public struct C2PASigningService: Sendable {
 
     /// Returns the signed manifest store (JUMBF) for the client to embed
     public func signManifest(_ signRequest: C2PASignRequest) async throws -> Data {
+        let bearerToken = try await accessToken?()
+        let entityToken = try await deviceToken?()
+        if (bearerToken != nil || entityToken != nil), !Self.isSecureTransportURL(serverURL) {
+            throw ServiceError.invalidResponse(
+                "refusing to send authentication tokens over insecure URL scheme: \(serverURL.scheme ?? "missing")"
+            )
+        }
+
         var request = URLRequest(url: serverURL.appendingPathComponent("c2pa/v1/sign"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(signRequest)
-        if let token = try await accessToken?() {
+        if let token = bearerToken {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
-        if let token = try await deviceToken?() {
+        if let token = entityToken {
             request.setValue(token, forHTTPHeaderField: "X-Entity-Token")
         }
 
@@ -340,6 +348,18 @@ public struct C2PASigningService: Sendable {
             let message = body?.error ?? String(decoding: data, as: UTF8.self)
             throw ServiceError.server(statusCode: http.statusCode, message: message)
         }
+    }
+
+    /// Whether `url` uses HTTPS (or plain HTTP to loopback for local testing).
+    static func isSecureTransportURL(_ url: URL) -> Bool {
+        let scheme = url.scheme?.lowercased()
+        if scheme == "https" {
+            return true
+        }
+        guard scheme == "http", let host = url.host?.lowercased() else {
+            return false
+        }
+        return host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]"
     }
 
     /// Whether the manifest names `sourceType`. c2pa-rs writes the URI as a CBOR text string;

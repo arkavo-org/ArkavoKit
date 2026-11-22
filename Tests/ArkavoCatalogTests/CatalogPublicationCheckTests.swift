@@ -325,4 +325,33 @@ struct CatalogPublicationCheckTests {
             }
         }
     }
+
+    @Test func strictJSONTreatsCanonicallyEquivalentStringsAsByteDistinct() throws {
+        let parsed = try #require(StrictJSON.parse(Data(#"{"K":1,"\u212A":2}"#.utf8))?.object)
+        #expect(parsed.count == 2)
+        #expect(parsed["K"] == .number("1"))
+        #expect(parsed["\u{212A}"] == .number("2"))
+        #expect(StrictJSON.string("K") != StrictJSON.string("\u{212A}"))
+        #expect(StrictJSON.string("\u{00E9}") != StrictJSON.string("e\u{0301}"))
+    }
+
+    @Test func publicationCheckUsesUTF8ByteEqualityForKASPolicyAndPolicyIDs() {
+        let recKAS = Self.manifest(Self.recordingPolicy(), kas: ["https://kas.example.com/K"], mimeType: "video/mp4")
+        let metaKAS = Self.manifest(Self.metadataPolicy(), kas: ["https://kas.example.com/\u{212A}"])
+        #expect(Self.check(metaKAS, recording: recKAS) == .policyMismatch)
+
+        let nfcAttr = [["attribute": "https://patreon.arkavo.com/attr/campaign/value/\u{00E9}"]]
+        let nfdAttr = [["attribute": "https://patreon.arkavo.com/attr/campaign/value/e\u{0301}"]]
+        let recAttr = Self.manifest(["uuid": "r", "body": ["dataAttributes": nfcAttr, "dissem": [String]()]], mimeType: "video/mp4")
+        let metaAttr = Self.manifest(Self.metadataPolicy(attributes: nfdAttr))
+        #expect(Self.check(metaAttr, recording: recAttr) == .policyMismatch)
+
+        // Byte-distinct but canonically equivalent policy IDs are distinct to KAS.
+        #expect(throws: Never.self) {
+            try Self.checkCatalog(Self.catalog(2, metadataIDs: ["K", "\u{212A}"]))
+        }
+        #expect(throws: CatalogPublicationError.duplicatePolicyID(1, first: 0)) {
+            try Self.checkCatalog(Self.catalog(2, metadataIDs: ["\u{212A}", "\u{212A}"]))
+        }
+    }
 }

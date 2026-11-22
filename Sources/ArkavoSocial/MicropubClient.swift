@@ -4,16 +4,18 @@ import SwiftUI
 public class MicropubClient: ObservableObject {
     // MARK: - Published Properties
 
-    @Published public var isAuthenticated = false
-    @Published public var isLoading = false
-    @Published public var error: MicropubError?
-    @Published public var siteConfig: MicropubConfig?
+    @MainActor @Published public var isAuthenticated = false
+    @MainActor @Published public var isLoading = false
+    @MainActor @Published public var error: MicropubError?
+    @MainActor @Published public var siteConfig: MicropubConfig?
 
     // MARK: - Private Properties
 
     private let clientId: String
     private let redirectUri: String
     private let keychainServiceBase = "com.arkavo.micropub"
+    @MainActor private var pendingOAuthState: String?
+    @MainActor private var sessionGeneration: UInt64 = 0
 
     private enum KeychainKey {
         static let accessToken = "access_token"
@@ -26,6 +28,45 @@ public class MicropubClient: ObservableObject {
     public init(clientId: String, redirectUri: String = "arkavocreator://oauth/micropub") {
         self.clientId = clientId
         self.redirectUri = redirectUri
+    }
+
+    // MARK: - Endpoint & Header Validation
+
+    static func validatedEndpointURL(_ string: String) throws -> URL {
+        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed),
+              let scheme = url.scheme?.lowercased(),
+              let host = url.host?.lowercased(),
+              !host.isEmpty
+        else {
+            throw MicropubError.badRequest("Invalid endpoint URL")
+        }
+
+        let isLoopback = host == "localhost" || host == "127.0.0.1" || host == "::1"
+        guard scheme == "https" || (scheme == "http" && isLoopback) else {
+            throw MicropubError.badRequest("Endpoint URL must use HTTPS")
+        }
+
+        return url
+    }
+
+    private static func sanitizeHeaderFilename(_ filename: String) -> String {
+        let stripped = filename
+            .replacingOccurrences(of: "\r", with: "")
+            .replacingOccurrences(of: "\n", with: "")
+            .replacingOccurrences(of: "\0", with: "")
+            .replacingOccurrences(of: "\"", with: "_")
+            .replacingOccurrences(of: "\\", with: "_")
+        return stripped.isEmpty ? "upload" : stripped
+    }
+
+    private static func sanitizeContentType(_ contentType: String) -> String {
+        let stripped = contentType
+            .replacingOccurrences(of: "\r", with: "")
+            .replacingOccurrences(of: "\n", with: "")
+            .replacingOccurrences(of: "\0", with: "")
+            .trimmingCharacters(in: .whitespaces)
+        return stripped.isEmpty ? "application/octet-stream" : stripped
     }
 
     // MARK: - Token Management
@@ -58,8 +99,9 @@ public class MicropubClient: ObservableObject {
                 )
             }
 
-            Task {
-                await fetchConfig()
+            let generation = sessionGeneration
+            Task { @MainActor in
+                await fetchConfig(expectedGeneration: generation)
             }
         }
     }
@@ -72,7 +114,10 @@ public class MicropubClient: ObservableObject {
         )
     }
 
+    @MainActor
     public func logout() {
+        sessionGeneration &+= 1
+        pendingOAuthState = nil
         try? KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.accessToken)
         try? KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.micropubEndpoint)
         try? KeychainManager.delete(service: keychainServiceBase, account: KeychainKey.mediaEndpoint)
@@ -82,45 +127,72 @@ public class MicropubClient: ObservableObject {
 
     // MARK: - Authentication
 
+    @MainActor
     public var authURL: URL {
+        let state: String
+        if let existing = pendingOAuthState {
+            state = existing
+        } else {
+            state = UUID().uuidString
+            pendingOAuthState = state
+        }
+
         var components = URLComponents(string: "https://micro.blog/indieauth/auth")!
         components.queryItems = [
             URLQueryItem(name: "client_id", value: clientId),
             URLQueryItem(name: "redirect_uri", value: redirectUri),
             URLQueryItem(name: "response_type", value: "code"),
             URLQueryItem(name: "scope", value: "create update delete"),
-            URLQueryItem(name: "state", value: UUID().uuidString),
+            URLQueryItem(name: "state", value: state),
         ]
         return components.url!
     }
 
     @MainActor
     public func handleCallback(_ url: URL) async throws {
-        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              let code = components.queryItems?.first(where: { $0.name == "code" })?.value
+        let generation = sessionGeneration
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            throw MicropubError.invalidCallback
+        }
+
+        let queryItems = components.queryItems ?? []
+        guard let expectedState = pendingOAuthState,
+              let returnedState = queryItems.first(where: { $0.name == "state" })?.value,
+              returnedState == expectedState
+        else {
+            throw MicropubError.invalidCallback
+        }
+        pendingOAuthState = nil
+
+        if queryItems.contains(where: { $0.name == "error" }) {
+            throw MicropubError.invalidCallback
+        }
+
+        guard let code = queryItems.first(where: { $0.name == "code" })?.value,
+              !code.isEmpty
         else {
             throw MicropubError.invalidCallback
         }
 
         isLoading = true
         error = nil
+        defer { isLoading = false }
 
         do {
-            try await exchangeCodeForToken(code)
-            await fetchConfig()
+            try await exchangeCodeForToken(code, expectedGeneration: generation)
+            guard sessionGeneration == generation else { return }
             isAuthenticated = true
-            // Immediately fetch config after getting token
-            await fetchConfig()
+            await fetchConfig(expectedGeneration: generation)
         } catch {
-            handleError(error)
+            if sessionGeneration == generation {
+                handleError(error)
+            }
             throw error
         }
-
-        isLoading = false
     }
 
     @MainActor
-    private func exchangeCodeForToken(_ code: String) async throws {
+    private func exchangeCodeForToken(_ code: String, expectedGeneration: UInt64) async throws {
         let tokenURL = URL(string: "https://micro.blog/indieauth/token")!
         var request = URLRequest(url: tokenURL)
         request.httpMethod = "POST"
@@ -137,12 +209,15 @@ public class MicropubClient: ObservableObject {
 
         let (data, response) = try await URLSession.shared.data(for: request)
 
+        guard sessionGeneration == expectedGeneration else { return }
+
         guard let httpResponse = response as? HTTPURLResponse else {
             throw MicropubError.invalidResponse
         }
 
         if httpResponse.statusCode == 200 {
             let tokenResponse = try JSONDecoder().decode(TokenResponse.self, from: data)
+            guard sessionGeneration == expectedGeneration else { return }
             saveTokens(accessToken: tokenResponse.access_token)
         } else {
             throw MicropubError.httpError(statusCode: httpResponse.statusCode)
@@ -152,9 +227,11 @@ public class MicropubClient: ObservableObject {
     // MARK: - API Methods
 
     @MainActor
-    private func fetchConfig() async {
+    private func fetchConfig(expectedGeneration: UInt64? = nil) async {
+        let generation = expectedGeneration ?? sessionGeneration
         do {
             let config = try await queryConfig()
+            guard sessionGeneration == generation else { return }
             siteConfig = config
 
             // Store endpoints in keychain
@@ -174,7 +251,9 @@ public class MicropubClient: ObservableObject {
                 )
             }
         } catch {
-            handleError(error)
+            if sessionGeneration == generation {
+                handleError(error)
+            }
         }
     }
 
@@ -188,6 +267,7 @@ public class MicropubClient: ObservableObject {
         guard let micropubEndpoint = siteConfig?.micropubEndpoint else {
             throw MicropubError.missingEndpoint
         }
+        let endpointURL = try Self.validatedEndpointURL(micropubEndpoint)
 
         // Format according to Micropub spec
         var properties: [String: [String]] = [
@@ -208,22 +288,13 @@ public class MicropubClient: ObservableObject {
         ]
 
         var request = try makeAuthorizedRequest(
-            url: URL(string: micropubEndpoint)!,
+            url: endpointURL,
             method: "POST",
             contentType: "application/json",
         )
 
-        // Log request for debugging
-//        print("Request URL: \(request.url?.absoluteString ?? "nil")")
-//        print("Request Headers: \(request.allHTTPHeaderFields ?? [:])")
-
         let jsonData = try JSONSerialization.data(withJSONObject: postData)
         request.httpBody = jsonData
-
-        // Log request body
-//        if let jsonString = String(data: jsonData, encoding: .utf8) {
-//            print("Request Body: \(jsonString)")
-//        }
 
         let (data, response) = try await URLSession.shared.data(for: request)
 
@@ -233,7 +304,7 @@ public class MicropubClient: ObservableObject {
 
         switch httpResponse.statusCode {
         case 200, 201, 202:
-            if let location = httpResponse.allHeaderFields["Location"] as? String,
+            if let location = httpResponse.value(forHTTPHeaderField: "Location"),
                let postURL = URL(string: location)
             {
                 return postURL
@@ -262,24 +333,29 @@ public class MicropubClient: ObservableObject {
         }
     }
 
+    @MainActor
     public func uploadMedia(data: Data, filename: String, contentType: String) async throws -> URL {
         guard let mediaEndpoint = siteConfig?.mediaEndpoint else {
             throw MicropubError.missingEndpoint
         }
+        let endpointURL = try Self.validatedEndpointURL(mediaEndpoint)
+
+        let safeFilename = Self.sanitizeHeaderFilename(filename)
+        let safeContentType = Self.sanitizeContentType(contentType)
 
         let boundary = UUID().uuidString
         var request = try makeAuthorizedRequest(
-            url: URL(string: mediaEndpoint)!,
+            url: endpointURL,
             method: "POST",
             contentType: "multipart/form-data; boundary=\(boundary)",
         )
 
         var bodyData = Data()
-        bodyData.append("--\(boundary)\r\n".data(using: .utf8)!)
-        bodyData.append("Content-Disposition: form-data; name=\"file\"; filename=\"\(filename)\"\r\n".data(using: .utf8)!)
-        bodyData.append("Content-Type: \(contentType)\r\n\r\n".data(using: .utf8)!)
+        bodyData.append(Data("--\(boundary)\r\n".utf8))
+        bodyData.append(Data("Content-Disposition: form-data; name=\"file\"; filename=\"\(safeFilename)\"\r\n".utf8))
+        bodyData.append(Data("Content-Type: \(safeContentType)\r\n\r\n".utf8))
         bodyData.append(data)
-        bodyData.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
+        bodyData.append(Data("\r\n--\(boundary)--\r\n".utf8))
 
         request.httpBody = bodyData
 
@@ -290,7 +366,7 @@ public class MicropubClient: ObservableObject {
         }
 
         if httpResponse.statusCode == 201,
-           let location = httpResponse.allHeaderFields["Location"] as? String,
+           let location = httpResponse.value(forHTTPHeaderField: "Location"),
            let mediaURL = URL(string: location)
         {
             return mediaURL
@@ -358,6 +434,7 @@ public class MicropubClient: ObservableObject {
         return request
     }
 
+    @MainActor
     private func handleError(_ error: Error) {
         if let micropubError = error as? MicropubError {
             self.error = micropubError
@@ -381,7 +458,7 @@ struct MicropubConfigResponse: Codable {
     }
 }
 
-public struct MicropubConfig: Codable {
+public struct MicropubConfig: Codable, Sendable {
     public let micropubEndpoint: String?
     public let mediaEndpoint: String?
     public let destinations: [Destination]
@@ -399,7 +476,7 @@ public struct MicropubConfig: Codable {
     }
 }
 
-public struct Destination: Codable, Identifiable {
+public struct Destination: Codable, Identifiable, Sendable {
     public var id: String { uid }
     public let uid: String
     public let name: String
@@ -415,20 +492,20 @@ public struct Destination: Codable, Identifiable {
     }
 }
 
-public struct PostType: Codable, Identifiable, Hashable {
+public struct PostType: Codable, Identifiable, Hashable, Sendable {
     public var id: String { type }
     public let type: String
     public let name: String
     public let properties: [String]
 }
 
-public struct Channel: Codable, Identifiable, Hashable {
+public struct Channel: Codable, Identifiable, Hashable, Sendable {
     public var id: String { uid }
     public let uid: String
     public let name: String
 }
 
-public struct SyndicationTarget: Codable, Identifiable {
+public struct SyndicationTarget: Codable, Identifiable, Sendable {
     public var id: String { uid }
     public let uid: String
     public let name: String

@@ -43,23 +43,42 @@ public struct AMF0: Sendable {
     /// Encode a string value
     public static func encodeString(_ value: String) -> Data {
         var data = Data()
-        let stringData = value.data(using: .utf8) ?? Data()
-        let length = UInt16(stringData.count)
+        let stringData = Data(value.utf8)
 
-        if length > UInt16.max {
-            // Use long string
+        if stringData.count > Int(UInt16.max) {
+            // Use long string (4-byte big-endian UTF-8 byte length)
+            let clamped = stringData.prefix(Int(UInt32.max))
             data.append(DataType.longString.rawValue)
-            var longLength = UInt32(stringData.count).bigEndian
+            var longLength = UInt32(clamped.count).bigEndian
             data.append(Data(bytes: &longLength, count: 4))
+            data.append(clamped)
         } else {
-            // Use regular string
+            // Use regular string (2-byte big-endian UTF-8 byte length)
             data.append(DataType.string.rawValue)
-            var shortLength = length.bigEndian
+            var shortLength = UInt16(stringData.count).bigEndian
             data.append(Data(bytes: &shortLength, count: 2))
+            data.append(stringData)
         }
 
-        data.append(stringData)
         return data
+    }
+
+    /// Truncate a string to at most `maxBytes` UTF-8 bytes on a Unicode scalar boundary.
+    static func truncateUTF8(_ value: String, maxBytes: Int) -> Data {
+        let full = Data(value.utf8)
+        if full.count <= maxBytes {
+            return full
+        }
+        var result = Data()
+        result.reserveCapacity(maxBytes)
+        for scalar in value.unicodeScalars {
+            let scalarBytes = scalar.utf8
+            if result.count + scalarBytes.count > maxBytes {
+                break
+            }
+            result.append(contentsOf: scalarBytes)
+        }
+        return result
     }
 
     /// Encode a null value
@@ -73,8 +92,8 @@ public struct AMF0: Sendable {
         data.append(DataType.object.rawValue)
 
         for (key, value) in object {
-            // Property name (without type marker, just length + string)
-            let keyData = key.data(using: .utf8) ?? Data()
+            // Property name (without type marker, 16-bit UTF-8 byte length + bytes)
+            let keyData = truncateUTF8(key, maxBytes: Int(UInt16.max))
             var keyLength = UInt16(keyData.count).bigEndian
             data.append(Data(bytes: &keyLength, count: 2))
             data.append(keyData)
@@ -94,7 +113,7 @@ public struct AMF0: Sendable {
         var data = Data()
         data.append(DataType.strictArray.rawValue)
 
-        var count = UInt32(array.count).bigEndian
+        var count = UInt32(clamping: array.count).bigEndian
         data.append(Data(bytes: &count, count: 4))
 
         for value in array {

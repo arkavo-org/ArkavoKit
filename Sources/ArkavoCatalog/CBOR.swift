@@ -41,7 +41,10 @@ struct CBORReader {
         switch major {
         case 0: return .uint(count)
         case 1: return .nint(count)
-        case 7: return .other
+        case 7:
+            // RFC 8949 §3.3: 1-byte simple values 0..31 (0xF8 0x00..0xF8 0x1F) are ill-formed.
+            if info == 24, count < 32 { throw Failure.invalid }
+            return .other
         case 2, 3:
             guard count <= UInt64(remaining) else { throw Failure.invalid }
             let end = cursor + Int(count)

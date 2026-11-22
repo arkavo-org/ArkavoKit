@@ -13,8 +13,26 @@ public final class CompositorManager: Sendable {
     private let commandQueue: MTLCommandQueue
     private let ciContext: CIContext
 
+    private struct Settings: @unchecked Sendable {
+        var outputSize: CGSize = CGSize(width: 1920, height: 1080)
+        var pipPosition: PiPPosition = .bottomRight
+        var pipScale: Float = 0.2
+        var watermarkEnabled: Bool = true // Enabled by default per MVP spec
+        var watermarkPosition: WatermarkPosition = .bottomCenter
+        var watermarkOpacity: Float = 0.6 // 60% opacity
+        var sceneOverlayText: String? = nil
+        var sceneOverlayIcon: String? = nil  // SF Symbol name
+        var sceneOverlayGradientColors: (start: CGColor, end: CGColor)? = nil
+        var floatingHeadEnabled: Bool = false
+    }
+
+    private let settingsLock = OSAllocatedUnfairLock(initialState: Settings())
+
     /// Output resolution for the composited frames (must match encoder resolution)
-    public nonisolated(unsafe) var outputSize: CGSize = CGSize(width: 1920, height: 1080)
+    public var outputSize: CGSize {
+        get { settingsLock.withLock { $0.outputSize } }
+        set { settingsLock.withLock { $0.outputSize = newValue } }
+    }
 
     /// A camera frame to composite. It's read on the main actor and composited off it.
     ///
@@ -36,9 +54,16 @@ public final class CompositorManager: Sendable {
     // Camera PiP configuration. Avatar and Muse are placed by their slots, not by these.
 
     /// The corner a camera PiP goes to when its layer names none.
-    public nonisolated(unsafe) var pipPosition: PiPPosition = .bottomRight
+    public var pipPosition: PiPPosition {
+        get { settingsLock.withLock { $0.pipPosition } }
+        set { settingsLock.withLock { $0.pipPosition = newValue } }
+    }
+
     /// A camera PiP's size, as a fraction of the output size.
-    public nonisolated(unsafe) var pipScale: Float = 0.2
+    public var pipScale: Float {
+        get { settingsLock.withLock { $0.pipScale } }
+        set { settingsLock.withLock { $0.pipScale = newValue } }
+    }
 
     // Avatar and Muse slot layers
 
@@ -92,23 +117,57 @@ public final class CompositorManager: Sendable {
     }
 
     // Watermark configuration
-    public nonisolated(unsafe) var watermarkEnabled: Bool = true // Enabled by default per MVP spec
-    public nonisolated(unsafe) var watermarkPosition: WatermarkPosition = .bottomCenter
-    public nonisolated(unsafe) var watermarkOpacity: Float = 0.6 // 60% opacity
+    public var watermarkEnabled: Bool {
+        get { settingsLock.withLock { $0.watermarkEnabled } }
+        set { settingsLock.withLock { $0.watermarkEnabled = newValue } }
+    }
+
+    public var watermarkPosition: WatermarkPosition {
+        get { settingsLock.withLock { $0.watermarkPosition } }
+        set { settingsLock.withLock { $0.watermarkPosition = newValue } }
+    }
+
+    public var watermarkOpacity: Float {
+        get { settingsLock.withLock { $0.watermarkOpacity } }
+        set { settingsLock.withLock { $0.watermarkOpacity = newValue } }
+    }
 
     // Scene overlay configuration (e.g. "Starting Soon...", "Be Right Back")
-    public nonisolated(unsafe) var sceneOverlayText: String? = nil
-    public nonisolated(unsafe) var sceneOverlayIcon: String? = nil  // SF Symbol name
-    public nonisolated(unsafe) var sceneOverlayGradientColors: (start: CGColor, end: CGColor)? = nil
-    private nonisolated(unsafe) var cachedSceneOverlay: CIImage?
-    private nonisolated(unsafe) var cachedSceneOverlayKey: String?
+    public var sceneOverlayText: String? {
+        get { settingsLock.withLock { $0.sceneOverlayText } }
+        set { settingsLock.withLock { $0.sceneOverlayText = newValue } }
+    }
+
+    public var sceneOverlayIcon: String? {
+        get { settingsLock.withLock { $0.sceneOverlayIcon } }
+        set { settingsLock.withLock { $0.sceneOverlayIcon = newValue } }
+    }
+
+    public var sceneOverlayGradientColors: (start: CGColor, end: CGColor)? {
+        get { settingsLock.withLockUnchecked { $0.sceneOverlayGradientColors } }
+        set { settingsLock.withLockUnchecked { $0.sceneOverlayGradientColors = newValue } }
+    }
+
+    private struct SceneOverlayCache: @unchecked Sendable {
+        var key: String?
+        var image: CIImage?
+    }
+
+    private let sceneOverlayCacheLock = OSAllocatedUnfairLock(initialState: SceneOverlayCache())
 
     // Floating head (person segmentation) configuration
-    public nonisolated(unsafe) var floatingHeadEnabled: Bool = false
-    private let segmentationProcessor = PersonSegmentationProcessor()
+    public var floatingHeadEnabled: Bool {
+        get { settingsLock.withLock { $0.floatingHeadEnabled } }
+        set { settingsLock.withLock { $0.floatingHeadEnabled = newValue } }
+    }
 
-    // Cached watermark image
-    private nonisolated(unsafe) var watermarkImage: CIImage?
+    /// Dedicated processor for preview segmentation
+    private let previewSegmentationProcessor = PersonSegmentationProcessor()
+    /// Per-camera processors so multi-camera compositing never shares one VNSequenceRequestHandler across cameras
+    private let cameraSegmentationProcessors = OSAllocatedUnfairLock<[String: PersonSegmentationProcessor]>(initialState: [:])
+
+    // Cached watermark image (immutable after init)
+    private let watermarkImage: CIImage?
 
     // MARK: - Initialization
 
@@ -126,7 +185,7 @@ public final class CompositorManager: Sendable {
         ciContext = CIContext(mtlDevice: device)
 
         // Generate watermark image
-        watermarkImage = createWatermarkImage()
+        watermarkImage = Self.createWatermarkImage()
     }
 
     // MARK: - Public Methods
@@ -146,7 +205,7 @@ public final class CompositorManager: Sendable {
         let screenImage = CIImage(cvPixelBuffer: screenPixelBuffer)
         let screenSize = screenImage.extent.size
 
-        guard screenSize.width > 0 && screenSize.height > 0 else {
+        guard Self.isValidSize(screenSize) else {
             return nil
         }
 
@@ -170,7 +229,7 @@ public final class CompositorManager: Sendable {
         canvasSize: CGSize,
         museTexture: CVPixelBuffer? = nil
     ) -> sending CVPixelBuffer? {
-        guard !cameraLayers.isEmpty else { return nil }
+        guard !cameraLayers.isEmpty, Self.isValidSize(canvasSize) else { return nil }
 
         // Use first camera as the base layer
         guard let firstLayer = cameraLayers.first,
@@ -180,9 +239,12 @@ public final class CompositorManager: Sendable {
         }
 
         let firstCameraImage = CIImage(cvPixelBuffer: firstPixelBuffer)
+        guard Self.isValidSize(firstCameraImage.extent.size) else { return nil }
 
         // Scale first camera to fill canvas (center crop to maintain aspect ratio)
-        let scaledBaseImage = scaleToFillCanvas(image: firstCameraImage, canvasSize: canvasSize)
+        guard let scaledBaseImage = scaleToFillCanvas(image: firstCameraImage, canvasSize: canvasSize) else {
+            return nil
+        }
 
         // Remaining cameras become PiP overlays
         let overlayLayers = Array(cameraLayers.dropFirst())
@@ -198,6 +260,7 @@ public final class CompositorManager: Sendable {
     ) -> sending CVPixelBuffer? {
         let avatarImage = CIImage(cvPixelBuffer: avatarTexture)
         let screenSize = avatarImage.extent.size
+        guard Self.isValidSize(screenSize) else { return nil }
 
         return compositeWithBase(baseImage: avatarImage, baseSize: screenSize, cameraLayers: cameraLayers, museTexture: museTexture)
     }
@@ -219,8 +282,13 @@ public final class CompositorManager: Sendable {
         avatarTexture: CVPixelBuffer? = nil,
         museTexture: CVPixelBuffer? = nil
     ) -> sending CVPixelBuffer? {
-        // Read once: the whole frame is composed against one output size.
-        let outputSize = self.outputSize
+        // Snapshot all mutable settings once so the whole frame sees one consistent state.
+        let settings = settingsLock.withLock { $0 }
+        let outputSize = settings.outputSize
+        guard Self.isValidSize(outputSize), Self.isValidSize(baseSize) else {
+            return nil
+        }
+
         let outputRect = CGRect(origin: .zero, size: outputSize)
 
         var composited = fittedBase(baseImage, baseSize: baseSize, outputSize: outputSize)
@@ -244,62 +312,93 @@ public final class CompositorManager: Sendable {
             composited = muse.composited(over: composited)
         }
 
+        if !settings.floatingHeadEnabled {
+            cameraSegmentationProcessors.withLock { $0.removeAll() }
+        } else {
+            let activeIDs = Set(cameraLayers.map(\.id))
+            cameraSegmentationProcessors.withLock { processors in
+                for key in processors.keys where !activeIDs.contains(key) {
+                    processors.removeValue(forKey: key)
+                }
+            }
+        }
+
         for (index, layer) in cameraLayers.enumerated() {
             guard let cameraPixelBuffer = CMSampleBufferGetImageBuffer(layer.buffer) else {
                 continue
             }
 
             var cameraImage = CIImage(cvPixelBuffer: cameraPixelBuffer)
+            guard Self.isValidSize(cameraImage.extent.size) else {
+                continue
+            }
 
             // Apply person segmentation if floating head mode is enabled
-            if floatingHeadEnabled {
-                segmentationProcessor.isEnabled = true
-                if let mask = segmentationProcessor.processFrame(cameraPixelBuffer) {
-                    cameraImage = segmentationProcessor.applyMask(to: cameraImage, mask: mask)
+            if settings.floatingHeadEnabled {
+                let processor = segmentationProcessor(for: layer.id)
+                processor.isEnabled = true
+                if let mask = processor.processFrame(cameraPixelBuffer) {
+                    cameraImage = processor.applyMask(to: cameraImage, mask: mask)
                 }
-            } else {
-                segmentationProcessor.isEnabled = false
             }
 
             // Calculate PiP dimensions and position
-            let pipSize = pipSize(for: outputSize, cameraCount: cameraLayers.count)
+            let targetPiPSize = pipSize(for: outputSize, cameraCount: cameraLayers.count, pipScale: settings.pipScale)
+            guard Self.isValidSize(targetPiPSize) else {
+                continue
+            }
 
             // Scale camera to PiP size maintaining aspect ratio
             let cameraAspect = cameraImage.extent.width / cameraImage.extent.height
-            let pipAspect = pipSize.width / pipSize.height
+            let pipAspect = targetPiPSize.width / targetPiPSize.height
 
-            var scaledCameraSize = pipSize
+            var scaledCameraSize = targetPiPSize
             if cameraAspect > pipAspect {
-                scaledCameraSize.height = pipSize.width / cameraAspect
+                scaledCameraSize.height = targetPiPSize.width / cameraAspect
             } else {
-                scaledCameraSize.width = pipSize.height * cameraAspect
+                scaledCameraSize.width = targetPiPSize.height * cameraAspect
+            }
+
+            guard Self.isValidSize(scaledCameraSize) else {
+                continue
             }
 
             let scaleX = scaledCameraSize.width / cameraImage.extent.width
             let scaleY = scaledCameraSize.height / cameraImage.extent.height
-            let scaledCamera = cameraImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+            var scaledCamera = cameraImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+            if scaledCamera.extent.origin != .zero {
+                scaledCamera = scaledCamera.transformed(by: CGAffineTransform(
+                    translationX: -scaledCamera.extent.minX,
+                    y: -scaledCamera.extent.minY
+                ))
+            }
 
-            // Calculate position based on PiP setting or provided override
-            let corner = layer.position ?? pipPosition
+            // Use explicit corner directly when specified; only auto-distribute when layer.position == nil
             let position: CGPoint
-            if cameraLayers.count > 1 {
+            if let explicitPosition = layer.position {
+                position = calculatePiPPosition(
+                    screenSize: outputSize,
+                    pipSize: scaledCameraSize,
+                    position: explicitPosition
+                )
+            } else if cameraLayers.count > 1 {
                 position = multiCameraPosition(
                     screenSize: outputSize,
                     pipSize: scaledCameraSize,
-                    preferred: corner,
+                    preferred: settings.pipPosition,
                     index: index
                 )
             } else {
                 position = calculatePiPPosition(
                     screenSize: outputSize,
                     pipSize: scaledCameraSize,
-                    position: corner
+                    position: settings.pipPosition
                 )
             }
 
             // Add rounded corners BEFORE positioning (mask needs to be at same origin as image)
             // Skip rounded corners when floating head is enabled (person shape is the border)
-            let cameraWithEffects = floatingHeadEnabled ? scaledCamera : addPiPEffects(to: scaledCamera, size: scaledCameraSize)
+            let cameraWithEffects = settings.floatingHeadEnabled ? scaledCamera : addPiPEffects(to: scaledCamera, size: scaledCameraSize)
 
             // Position the camera overlay
             let positionedCamera = cameraWithEffects.transformed(by: CGAffineTransform(translationX: position.x, y: position.y))
@@ -309,19 +408,45 @@ public final class CompositorManager: Sendable {
         }
 
         // Add watermark if enabled
-        if watermarkEnabled {
-            composited = addWatermark(to: composited, screenSize: outputSize)
+        if settings.watermarkEnabled {
+            composited = addWatermark(
+                to: composited,
+                screenSize: outputSize,
+                position: settings.watermarkPosition,
+                opacity: settings.watermarkOpacity
+            )
         }
 
         // Add scene overlay if active (Starting Soon, BRB, Ending)
         #if os(macOS)
-        if let overlayText = sceneOverlayText, !overlayText.isEmpty {
-            composited = addSceneOverlay(to: composited, screenSize: outputSize, text: overlayText)
+        if let overlayText = settings.sceneOverlayText, !overlayText.isEmpty {
+            composited = addSceneOverlay(
+                to: composited,
+                screenSize: outputSize,
+                text: overlayText,
+                icon: settings.sceneOverlayIcon,
+                gradientColors: settings.sceneOverlayGradientColors
+            )
         }
         #endif
 
         // Everything is already in output space; clip whatever overhangs the output.
         return renderToPixelBuffer(image: composited.cropped(to: outputRect), size: outputSize)
+    }
+
+    private func segmentationProcessor(for cameraID: String) -> PersonSegmentationProcessor {
+        cameraSegmentationProcessors.withLock { processors in
+            if let existing = processors[cameraID] {
+                return existing
+            }
+            let created = PersonSegmentationProcessor()
+            processors[cameraID] = created
+            return created
+        }
+    }
+
+    private static func isValidSize(_ size: CGSize) -> Bool {
+        size.width > 0 && size.height > 0 && size.width.isFinite && size.height.isFinite
     }
 
     /// An avatar or Muse texture placed in its slot: the whole texture, drawn at the slot's
@@ -334,11 +459,11 @@ public final class CompositorManager: Sendable {
     ) -> CIImage? {
         let image = CIImage(cvPixelBuffer: buffer)
         let extent = image.extent
-        guard extent.width > 0, extent.height > 0 else { return nil }
+        guard Self.isValidSize(extent.size) else { return nil }
         let textureFrame = AvatarSlotLayout.frame(
             slot: slot, visibleRect: visibleRect, textureSize: extent.size, output: outputSize
         ).textureFrame
-        guard textureFrame.width > 0, textureFrame.height > 0 else { return nil }
+        guard Self.isValidSize(textureFrame.size) else { return nil }
         let target = AvatarSlotLayout.coreImageRect(textureFrame, outputHeight: outputSize.height)
         let scale = textureFrame.width / extent.width
         let scaled = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
@@ -350,9 +475,10 @@ public final class CompositorManager: Sendable {
     /// unused axis. The base is not stretched, except that an axis within a pixel of the output
     /// fills it (`AvatarSlotLayout.aspectFit`), so no sub-pixel bar darkens the edge.
     private func fittedBase(_ base: CIImage, baseSize: CGSize, outputSize: CGSize) -> CIImage {
+        guard Self.isValidSize(baseSize), Self.isValidSize(outputSize) else { return base }
         let fit = AvatarSlotLayout.coreImageRect(
             AvatarSlotLayout.aspectFit(baseSize, in: outputSize), outputHeight: outputSize.height)
-        guard fit.width > 0, fit.height > 0 else { return base }
+        guard Self.isValidSize(fit.size) else { return base }
         let scaled = base.transformed(by: CGAffineTransform(
             scaleX: fit.width / baseSize.width, y: fit.height / baseSize.height))
         return scaled.transformed(by: CGAffineTransform(
@@ -360,27 +486,37 @@ public final class CompositorManager: Sendable {
     }
 
     /// Scales an image to fill the canvas size (center crop)
-    private func scaleToFillCanvas(image: CIImage, canvasSize: CGSize) -> CIImage {
-        let imageAspect = image.extent.width / image.extent.height
+    private func scaleToFillCanvas(image: CIImage, canvasSize: CGSize) -> CIImage? {
+        let extent = image.extent
+        guard Self.isValidSize(extent.size), Self.isValidSize(canvasSize) else {
+            return nil
+        }
+
+        let imageAspect = extent.width / extent.height
         let canvasAspect = canvasSize.width / canvasSize.height
 
         let scale: CGFloat
         if imageAspect > canvasAspect {
             // Image is wider - scale by height
-            scale = canvasSize.height / image.extent.height
+            scale = canvasSize.height / extent.height
         } else {
             // Image is taller - scale by width
-            scale = canvasSize.width / image.extent.width
+            scale = canvasSize.width / extent.width
         }
 
         let scaledImage = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        // Normalize origin to (0, 0) before cropping
+        let normalized = scaledImage.transformed(by: CGAffineTransform(
+            translationX: -scaledImage.extent.minX,
+            y: -scaledImage.extent.minY
+        ))
 
         // Center crop to canvas size
-        let offsetX = (scaledImage.extent.width - canvasSize.width) / 2
-        let offsetY = (scaledImage.extent.height - canvasSize.height) / 2
+        let offsetX = (normalized.extent.width - canvasSize.width) / 2
+        let offsetY = (normalized.extent.height - canvasSize.height) / 2
         let cropRect = CGRect(x: offsetX, y: offsetY, width: canvasSize.width, height: canvasSize.height)
 
-        return scaledImage.cropped(to: cropRect).transformed(by: CGAffineTransform(translationX: -offsetX, y: -offsetY))
+        return normalized.cropped(to: cropRect).transformed(by: CGAffineTransform(translationX: -offsetX, y: -offsetY))
     }
 
     // MARK: - Private Methods
@@ -411,12 +547,12 @@ public final class CompositorManager: Sendable {
     public nonisolated func applyFloatingHeadSegmentation(to image: CIImage, pixelBuffer: CVPixelBuffer) -> CIImage? {
         guard floatingHeadEnabled else { return nil }
 
-        segmentationProcessor.isEnabled = true
-        guard let mask = segmentationProcessor.processFrame(pixelBuffer) else {
+        previewSegmentationProcessor.isEnabled = true
+        guard let mask = previewSegmentationProcessor.processFrame(pixelBuffer) else {
             return nil
         }
 
-        return segmentationProcessor.applyMask(to: image, mask: mask)
+        return previewSegmentationProcessor.applyMask(to: image, mask: mask)
     }
 
     private func addPiPEffects(to image: CIImage, size: CGSize) -> CIImage {
@@ -443,6 +579,11 @@ public final class CompositorManager: Sendable {
     /// Renders into a new buffer the compositor keeps no reference to, so every composite's caller
     /// owns its frame and can send it on (to the encoder).
     private func renderToPixelBuffer(image: CIImage, size: CGSize) -> sending CVPixelBuffer? {
+        guard Self.isValidSize(size) else { return nil }
+        let width = Int(size.width)
+        let height = Int(size.height)
+        guard width > 0, height > 0 else { return nil }
+
         var pixelBuffer: CVPixelBuffer?
 
         let attributes: [String: Any] = [
@@ -453,8 +594,8 @@ public final class CompositorManager: Sendable {
 
         let status = CVPixelBufferCreate(
             kCFAllocatorDefault,
-            Int(size.width),
-            Int(size.height),
+            width,
+            height,
             kCVPixelFormatType_32BGRA,
             attributes as CFDictionary,
             &pixelBuffer,
@@ -471,7 +612,7 @@ public final class CompositorManager: Sendable {
     // MARK: - Watermark Methods
 
     /// Creates the watermark image with "Recorded with Arkavo Creator" text
-    private func createWatermarkImage() -> CIImage? {
+    private static func createWatermarkImage() -> CIImage? {
         #if os(macOS)
             // Create attributed string for watermark text
             let text = "Recorded with Arkavo Creator"
@@ -519,6 +660,7 @@ public final class CompositorManager: Sendable {
             }
 
             NSGraphicsContext.saveGraphicsState()
+            defer { NSGraphicsContext.restoreGraphicsState() }
             NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
 
             // Draw text centered
@@ -529,8 +671,6 @@ public final class CompositorManager: Sendable {
                 height: textSize.height,
             )
             attributedString.draw(in: textRect)
-
-            NSGraphicsContext.restoreGraphicsState()
 
             // Convert to CIImage
             guard let cgImage = rep.cgImage else {
@@ -543,18 +683,57 @@ public final class CompositorManager: Sendable {
         #endif
     }
 
-    /// Adds watermark to the composited image
+    /// Cache key for scene overlays, incorporating text, icon, gradient color components, and size.
+    static func sceneOverlayCacheKey(
+        text: String,
+        icon: String?,
+        gradientColors: (start: CGColor, end: CGColor)?,
+        size: CGSize
+    ) -> String {
+        let gradientKey: String
+        if let colors = gradientColors {
+            gradientKey = "\(colorCacheKey(colors.start))->\(colorCacheKey(colors.end))"
+        } else {
+            gradientKey = "default"
+        }
+        return "\(text)|\(icon ?? "")|\(gradientKey)|\(Int(size.width))x\(Int(size.height))"
+    }
+
+    private static func colorCacheKey(_ color: CGColor) -> String {
+        let spaceName = (color.colorSpace?.name as String?) ?? "unknown"
+        let components = (color.components ?? []).map { String(format: "%.4f", $0) }.joined(separator: ",")
+        return "\(spaceName):\(components):a=\(String(format: "%.4f", color.alpha))"
+    }
+
     #if os(macOS)
     /// Renders a full-screen scene overlay (gradient background + icon + centered text)
-    private func addSceneOverlay(to image: CIImage, screenSize: CGSize, text: String) -> CIImage {
-        let cacheKey = "\(text)|\(sceneOverlayIcon ?? "")"
-        if cacheKey == cachedSceneOverlayKey, let cached = cachedSceneOverlay,
-           cached.extent.size == screenSize {
-            return cached.composited(over: image)
-        }
-
+    private func addSceneOverlay(
+        to image: CIImage,
+        screenSize: CGSize,
+        text: String,
+        icon iconName: String?,
+        gradientColors: (start: CGColor, end: CGColor)?
+    ) -> CIImage {
         let width = Int(screenSize.width)
         let height = Int(screenSize.height)
+        guard width > 0, height > 0 else { return image }
+
+        let cacheKey = Self.sceneOverlayCacheKey(
+            text: text,
+            icon: iconName,
+            gradientColors: gradientColors,
+            size: screenSize
+        )
+
+        let cachedImage: CIImage? = sceneOverlayCacheLock.withLockUnchecked { cache in
+            guard cache.key == cacheKey, let cached = cache.image, cached.extent.size == screenSize else {
+                return nil
+            }
+            return cached
+        }
+        if let cachedImage {
+            return cachedImage.composited(over: image)
+        }
 
         // Create bitmap context for the overlay
         let colorSpace = CGColorSpaceCreateDeviceRGB()
@@ -571,8 +750,8 @@ public final class CompositorManager: Sendable {
         }
 
         // Draw gradient background
-        let startColor = sceneOverlayGradientColors?.start ?? CGColor(red: 0.2, green: 0.2, blue: 0.6, alpha: 0.85)
-        let endColor = sceneOverlayGradientColors?.end ?? CGColor(red: 0.4, green: 0.1, blue: 0.5, alpha: 0.85)
+        let startColor = gradientColors?.start ?? CGColor(red: 0.2, green: 0.2, blue: 0.6, alpha: 0.85)
+        let endColor = gradientColors?.end ?? CGColor(red: 0.4, green: 0.1, blue: 0.5, alpha: 0.85)
 
         if let gradient = CGGradient(
             colorsSpace: colorSpace,
@@ -587,12 +766,6 @@ public final class CompositorManager: Sendable {
             )
         }
 
-        // Use NSGraphicsContext for drawing both icon and text
-        ctx.saveGState()
-        ctx.textMatrix = .identity
-        let nsContext = NSGraphicsContext(cgContext: ctx, flipped: false)
-        NSGraphicsContext.current = nsContext
-
         // Measure text
         let fontSize: CGFloat = CGFloat(height) / 14.0
         let textAttributes: [NSAttributedString.Key: Any] = [
@@ -602,60 +775,74 @@ public final class CompositorManager: Sendable {
         let attrString = NSAttributedString(string: text, attributes: textAttributes)
         let textSize = attrString.size()
 
-        // Measure icon
+        // Measure icon (thread-safe: extract CGImage without NSImage.lockFocus/unlockFocus)
         let iconSize: CGFloat = CGFloat(height) / 10.0
         let spacing: CGFloat = CGFloat(height) / 40.0
-        var iconImage: NSImage?
+        var symbolCGImage: CGImage?
         var iconRect = CGRect.zero
 
-        if let iconName = sceneOverlayIcon {
+        if let iconName {
             let config = NSImage.SymbolConfiguration(pointSize: iconSize, weight: .regular)
             if let symbol = NSImage(systemSymbolName: iconName, accessibilityDescription: nil)?.withSymbolConfiguration(config) {
-                iconImage = symbol
-                iconRect.size = symbol.size
+                var proposedRect = NSRect(origin: .zero, size: symbol.size)
+                if let cgSymbol = symbol.cgImage(forProposedRect: &proposedRect, context: nil, hints: nil) {
+                    symbolCGImage = cgSymbol
+                    iconRect.size = symbol.size
+                }
             }
         }
 
         // Calculate total content height (icon + spacing + text)
-        let totalHeight = iconRect.height + (iconImage != nil ? spacing : 0) + textSize.height
+        let totalHeight = iconRect.height + (symbolCGImage != nil ? spacing : 0) + textSize.height
         let centerY = (CGFloat(height) - totalHeight) / 2
 
-        // Draw icon centered above text
-        if let icon = iconImage {
+        // Draw icon centered above text using pure CoreGraphics mask clipping (thread-safe)
+        if let cgSymbol = symbolCGImage {
             let iconOrigin = CGPoint(
                 x: (CGFloat(width) - iconRect.width) / 2,
                 y: centerY + textSize.height + spacing
             )
-            // Tint the icon white by drawing it with a color
-            icon.lockFocus()
-            NSColor.white.withAlphaComponent(0.9).set()
-            let imageRect = NSRect(origin: .zero, size: icon.size)
-            imageRect.fill(using: .sourceAtop)
-            icon.unlockFocus()
-            icon.draw(in: NSRect(origin: iconOrigin, size: iconRect.size))
+            let drawRect = CGRect(origin: iconOrigin, size: iconRect.size)
+            ctx.saveGState()
+            ctx.clip(to: drawRect, mask: cgSymbol)
+            ctx.setFillColor(CGColor(red: 1.0, green: 1.0, blue: 1.0, alpha: 0.9))
+            ctx.fill(drawRect)
+            ctx.restoreGState()
         }
 
-        // Draw text centered below icon
+        // Draw text centered below icon, properly saving and restoring NSGraphicsContext state
+        ctx.saveGState()
+        ctx.textMatrix = .identity
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
+
         let textOrigin = CGPoint(
             x: (CGFloat(width) - textSize.width) / 2,
             y: centerY
         )
         attrString.draw(at: textOrigin)
 
-        NSGraphicsContext.current = nil
+        NSGraphicsContext.restoreGraphicsState()
         ctx.restoreGState()
 
         guard let cgImage = ctx.makeImage() else { return image }
 
         let overlayImage = CIImage(cgImage: cgImage)
-        cachedSceneOverlay = overlayImage
-        cachedSceneOverlayKey = cacheKey
+        sceneOverlayCacheLock.withLockUnchecked { cache in
+            cache.key = cacheKey
+            cache.image = overlayImage
+        }
 
         return overlayImage.composited(over: image)
     }
     #endif
 
-    private func addWatermark(to image: CIImage, screenSize: CGSize) -> CIImage {
+    private func addWatermark(
+        to image: CIImage,
+        screenSize: CGSize,
+        position watermarkPos: WatermarkPosition,
+        opacity: Float
+    ) -> CIImage {
         guard let watermark = watermarkImage else {
             return image
         }
@@ -664,7 +851,7 @@ public final class CompositorManager: Sendable {
         let position = calculateWatermarkPosition(
             screenSize: screenSize,
             watermarkSize: watermark.extent.size,
-            position: watermarkPosition,
+            position: watermarkPos,
         )
 
         // Position watermark
@@ -674,7 +861,7 @@ public final class CompositorManager: Sendable {
 
         // Apply opacity
         let transparentWatermark = positionedWatermark.applyingFilter("CIColorMatrix", parameters: [
-            "inputAVector": CIVector(x: 0, y: 0, z: 0, w: CGFloat(watermarkOpacity)),
+            "inputAVector": CIVector(x: 0, y: 0, z: 0, w: CGFloat(opacity)),
         ])
 
         // Composite watermark over image
@@ -733,7 +920,9 @@ public final class CompositorManager: Sendable {
         return calculatePiPPosition(screenSize: screenSize, pipSize: pipSize, position: resolved)
     }
 
-    private func pipSize(for screenSize: CGSize, cameraCount: Int) -> CGSize {
+    private func pipSize(for screenSize: CGSize, cameraCount: Int, pipScale: Float) -> CGSize {
+        guard pipScale.isFinite, pipScale > 0 else { return .zero }
+
         let multiplier: CGFloat
         switch cameraCount {
         case 0, 1:

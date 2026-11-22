@@ -21,8 +21,8 @@ public struct CatalogEntryMetadata: Sendable, Equatable {
     public static let mimeType = "application/vnd.arkavo.catalog-entry+json"
     public static let maxBytes = CreatorCatalog.maxMetadataSize
 
-    private static let keys: Set<String> = ["contentID", "version", "payloadHash", "title", "publishedAt",
-                                            "attributeFQNs"]
+    private static let keys: Set<StrictJSON.Key> = ["contentID", "version", "payloadHash", "title", "publishedAt",
+                                                    "attributeFQNs"]
 
     public let contentID: String
     public let version: UInt64

@@ -1,23 +1,41 @@
 import AVFoundation
 import CoreMedia
+import os
 
 /// Audio source for remote camera audio received over the network
-public final class RemoteCameraAudioSource: AudioSource {
+public final class RemoteCameraAudioSource: AudioSource, @unchecked Sendable {
     // MARK: - AudioSource Protocol
 
     public let sourceID: String
     public let sourceName: String
 
-    nonisolated(unsafe) public private(set) var format: AudioFormat
+    public var format: AudioFormat {
+        state.withLockUnchecked { $0.format }
+    }
 
-    nonisolated(unsafe) public private(set) var isActive: Bool = false
+    public var isActive: Bool {
+        state.withLockUnchecked { $0.isActive }
+    }
 
-    nonisolated(unsafe) public var onSample: ((CMSampleBuffer) -> Void)?
+    public var onSample: ((CMSampleBuffer) -> Void)? {
+        get { state.withLockUnchecked { $0.onSample } }
+        set { state.withLockUnchecked { $0.onSample = newValue } }
+    }
 
     // MARK: - Properties
 
-    nonisolated(unsafe) private var referenceTime: CMTime?
-    nonisolated(unsafe) private var formatDescription: CMAudioFormatDescription?
+    private struct SharedState {
+        var format: AudioFormat
+        var isActive: Bool = false
+        var onSample: ((CMSampleBuffer) -> Void)?
+        var referenceTime: CMTime?
+        var formatDescription: CMAudioFormatDescription?
+    }
+
+    private let state: OSAllocatedUnfairLock<SharedState>
+
+    private static let validChannelRange = 1...8
+    private static let validSampleRateRange: ClosedRange<Double> = 8_000...192_000
 
     // MARK: - Initialization
 
@@ -31,12 +49,13 @@ public final class RemoteCameraAudioSource: AudioSource {
         self.sourceName = sourceName
 
         // Default format, will be updated when actual audio arrives
-        self.format = initialFormat ?? AudioFormat(
+        let defaultFormat = initialFormat ?? AudioFormat(
             sampleRate: 48000.0,
             channels: 2,
             bitDepth: 16,
             formatID: kAudioFormatLinearPCM
         )
+        self.state = OSAllocatedUnfairLock(uncheckedState: SharedState(format: defaultFormat))
 
         print("📡 RemoteCameraAudioSource [\(sourceID)] initialized: \(sourceName)")
     }
@@ -44,14 +63,16 @@ public final class RemoteCameraAudioSource: AudioSource {
     // MARK: - AudioSource Protocol Methods
 
     public func start() async throws {
-        isActive = true
+        state.withLockUnchecked { $0.isActive = true }
         print("📡 RemoteCameraAudioSource [\(sourceID)] started")
     }
 
     public func stop() async throws {
-        isActive = false
-        referenceTime = nil
-        formatDescription = nil
+        state.withLockUnchecked { state in
+            state.isActive = false
+            state.referenceTime = nil
+            state.formatDescription = nil
+        }
         print("📡 RemoteCameraAudioSource [\(sourceID)] stopped")
     }
 
@@ -60,31 +81,50 @@ public final class RemoteCameraAudioSource: AudioSource {
     /// Process an audio payload received from the remote camera
     /// - Parameter payload: AudioPayload from RemoteCameraMessage
     public func processAudioPayload(_ payload: RemoteCameraMessage.AudioPayload) {
-        guard isActive else {
+        guard state.withLockUnchecked({ $0.isActive }) else {
             print("⚠️ RemoteCameraAudioSource [\(sourceID)]: Received audio while not active")
             return
         }
 
-        // Update format if it changed
+        // Validate untrusted network fields before integer casts or frame math
+        guard Self.validChannelRange.contains(payload.channels),
+              payload.sampleRate.isFinite, Self.validSampleRateRange.contains(payload.sampleRate),
+              payload.timestamp.isFinite,
+              !payload.audioData.isEmpty
+        else {
+            print("⚠️ RemoteCameraAudioSource [\(sourceID)]: Rejecting invalid audio payload (channels=\(payload.channels), sampleRate=\(payload.sampleRate), bytes=\(payload.audioData.count))")
+            return
+        }
+
+        let bitDepth: UInt32 = 16 // Assuming 16-bit PCM
+        let channels = UInt32(payload.channels)
+        let (bytesPerFrame, overflow) = (bitDepth / 8).multipliedReportingOverflow(by: channels)
+        guard !overflow, bytesPerFrame > 0 else { return }
+
         let newFormat = AudioFormat(
             sampleRate: payload.sampleRate,
-            channels: UInt32(payload.channels),
-            bitDepth: 16, // Assuming 16-bit PCM
+            channels: channels,
+            bitDepth: bitDepth,
             formatID: kAudioFormatLinearPCM
         )
 
-        if newFormat.sampleRate != format.sampleRate || newFormat.channels != format.channels {
-            print("🔄 RemoteCameraAudioSource [\(sourceID)]: Format changed to \(newFormat.sampleRate)Hz, \(newFormat.channels)ch")
-            format = newFormat
-            formatDescription = nil // Force recreation
+        let (formatDesc, callback): (CMAudioFormatDescription?, ((CMSampleBuffer) -> Void)?) = state.withLockUnchecked { state in
+            guard state.isActive else { return (nil, nil) }
+
+            if newFormat.sampleRate != state.format.sampleRate || newFormat.channels != state.format.channels {
+                print("🔄 RemoteCameraAudioSource [\(sourceID)]: Format changed to \(newFormat.sampleRate)Hz, \(newFormat.channels)ch")
+                state.format = newFormat
+                state.formatDescription = nil // Force recreation
+            }
+
+            if state.formatDescription == nil {
+                state.formatDescription = createFormatDescription(for: state.format)
+            }
+
+            return (state.formatDescription, state.onSample)
         }
 
-        // Create format description if needed
-        if formatDescription == nil {
-            formatDescription = createFormatDescription(for: format)
-        }
-
-        guard let formatDesc = formatDescription else {
+        guard let formatDesc else {
             print("⚠️ RemoteCameraAudioSource [\(sourceID)]: Failed to create format description")
             return
         }
@@ -103,20 +143,32 @@ public final class RemoteCameraAudioSource: AudioSource {
         }
 
         // Forward sample
-        onSample?(sampleBuffer)
+        callback?(sampleBuffer)
     }
 
     // MARK: - Private Methods
 
     private func createFormatDescription(for format: AudioFormat) -> CMAudioFormatDescription? {
+        guard format.sampleRate.isFinite, Self.validSampleRateRange.contains(format.sampleRate),
+              format.channels >= 1, format.channels <= UInt32(Self.validChannelRange.upperBound),
+              format.bitDepth >= 8
+        else {
+            return nil
+        }
+
+        let (bytesPerFrame, overflow) = (format.bitDepth / 8).multipliedReportingOverflow(by: format.channels)
+        guard !overflow, bytesPerFrame > 0 else {
+            return nil
+        }
+
         var asbd = AudioStreamBasicDescription()
         asbd.mSampleRate = format.sampleRate
         asbd.mFormatID = format.formatID
         asbd.mChannelsPerFrame = format.channels
         asbd.mBitsPerChannel = format.bitDepth
-        asbd.mBytesPerFrame = (format.bitDepth / 8) * format.channels
+        asbd.mBytesPerFrame = bytesPerFrame
         asbd.mFramesPerPacket = 1
-        asbd.mBytesPerPacket = asbd.mBytesPerFrame * asbd.mFramesPerPacket
+        asbd.mBytesPerPacket = bytesPerFrame
         asbd.mFormatFlags = kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked
 
         var formatDesc: CMAudioFormatDescription?
@@ -144,12 +196,18 @@ public final class RemoteCameraAudioSource: AudioSource {
         formatDescription: CMAudioFormatDescription,
         presentationTime: CMTime
     ) -> CMSampleBuffer? {
-        guard let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription)?.pointee else {
+        guard !audioData.isEmpty,
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription)?.pointee
+        else {
             return nil
         }
 
         let bytesPerFrame = Int(asbd.mBytesPerFrame)
+        guard bytesPerFrame > 0 else { return nil }
+
         let frameCount = audioData.count / bytesPerFrame
+        guard frameCount > 0 else { return nil }
+        let byteCount = frameCount * bytesPerFrame
 
         var blockBuffer: CMBlockBuffer?
         var blockBufferStatus: OSStatus = noErr
@@ -163,11 +221,11 @@ public final class RemoteCameraAudioSource: AudioSource {
             blockBufferStatus = CMBlockBufferCreateWithMemoryBlock(
                 allocator: kCFAllocatorDefault,
                 memoryBlock: nil,
-                blockLength: audioData.count,
+                blockLength: byteCount,
                 blockAllocator: kCFAllocatorDefault,
                 customBlockSource: nil,
                 offsetToData: 0,
-                dataLength: audioData.count,
+                dataLength: byteCount,
                 flags: 0,
                 blockBufferOut: &blockBuffer
             )
@@ -180,7 +238,7 @@ public final class RemoteCameraAudioSource: AudioSource {
                 with: baseAddress,
                 blockBuffer: blockBuffer,
                 offsetIntoDestination: 0,
-                dataLength: audioData.count
+                dataLength: byteCount
             )
         }
 

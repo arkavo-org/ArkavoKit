@@ -30,6 +30,29 @@ public final class LocalAIAgent: NSObject, ObservableObject {
     private let writingTools: WritingToolsIntegration
     private let imagePlayground: ImagePlaygroundIntegration
     private var connections: [UUID: NWConnection] = [:]
+    private var connectionMetadata: [UUID: ConnectionMetadata] = [:]
+    private var partialMessages: [UUID: Data] = [:]
+    private var configuredAuthToken: String?
+    private var listenerGeneration: UInt64 = 0
+
+    /// Maximum WebSocket message size (16 MiB)
+    static let maxMessageSize = 16 * 1024 * 1024
+
+    /// Read-only discovery and health RPC methods permitted from unauthenticated non-loopback peers
+    nonisolated static let unauthenticatedDiscoveryMethods: Set<String> = [
+        "agent_card",
+        "agent_info",
+        "ping",
+        "capabilities",
+        "rpc.discover",
+        "agent.discover",
+    ]
+
+    private struct ConnectionMetadata: Sendable {
+        let isLoopback: Bool
+        let isAuthenticated: Bool
+        let listenerGeneration: UInt64
+    }
 
     // Unique agent ID based on device
     private let agentId: String
@@ -101,27 +124,33 @@ public final class LocalAIAgent: NSObject, ObservableObject {
 
     /// Send a message and get response (in-process, no WebSocket)
     public func sendDirectMessage(sessionId: String, content: String) async throws -> String {
-        guard var session = inProcessSessions[sessionId] else {
+        guard inProcessSessions[sessionId] != nil else {
             throw LocalAIAgentError.sessionNotFound
         }
 
         print("[LocalAIAgent] Processing direct message in session: \(sessionId)")
 
-        // Add user message
+        // Mutate live session directly before awaiting to prevent actor-reentrancy message loss
         let userMessage = ChatMessage(role: "user", content: content)
-        session.messages.append(userMessage)
+        inProcessSessions[sessionId]?.messages.append(userMessage)
+
+        guard let sessionSnapshot = inProcessSessions[sessionId] else {
+            throw LocalAIAgentError.sessionNotFound
+        }
 
         // Generate response using Foundation Models
-        let response = try await generateResponse(for: content, session: session)
+        let response = try await generateResponse(for: content, session: sessionSnapshot)
 
         print("[LocalAIAgent] Generated response: \(response)")
 
-        // Add assistant message
-        let assistantMessage = ChatMessage(role: "assistant", content: response)
-        session.messages.append(assistantMessage)
+        // Re-verify session still exists after suspension so closed sessions are never resurrected
+        guard inProcessSessions[sessionId] != nil else {
+            throw LocalAIAgentError.sessionNotFound
+        }
 
-        // Update session
-        inProcessSessions[sessionId] = session
+        // Append assistant message directly to live session
+        let assistantMessage = ChatMessage(role: "assistant", content: response)
+        inProcessSessions[sessionId]?.messages.append(assistantMessage)
 
         print("[LocalAIAgent] Returning response of length: \(response.count)")
         return response
@@ -158,14 +187,23 @@ public final class LocalAIAgent: NSObject, ObservableObject {
                 locality: .local
             )
             let result = try await executeLocalToolCall(toolCall)
+            guard result.success else {
+                throw LocalAIAgentError.toolExecutionFailed(result.error ?? "Tool '\(name)' failed")
+            }
             return result.result?.value as? [String: Any] ?? [:]
         }
     }
 
     // MARK: - WebSocket Server (for cross-device A2A)
 
-    /// Start publishing the LocalAIAgent as an A2A service
-    public func startPublishing(port: UInt16 = 0) throws {
+    /// Start publishing the LocalAIAgent as an A2A service over LAN/mDNS.
+    /// Pass `allowLAN: false` to restrict binding to loopback (`127.0.0.1`) without mDNS advertising,
+    /// and optionally pass `authToken` to require `Authorization: Bearer <token>` on WebSocket upgrade.
+    public func startPublishing(
+        port: UInt16 = 0,
+        allowLAN: Bool = true,
+        authToken: String? = nil
+    ) throws {
         guard !isPublishing else {
             print("[LocalAIAgent] Already publishing")
             return
@@ -173,15 +211,86 @@ public final class LocalAIAgent: NSObject, ObservableObject {
 
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
-        params.includePeerToPeer = true
+        params.includePeerToPeer = allowLAN
 
-        // Configure WebSocket options with client request handler
+        let nwPort: NWEndpoint.Port = port == 0 ? .any : NWEndpoint.Port(integerLiteral: port)
+        if !allowLAN {
+            params.requiredLocalEndpoint = NWEndpoint.hostPort(
+                host: NWEndpoint.Host("127.0.0.1"),
+                port: nwPort
+            )
+        }
+
+        // Configure WebSocket options with client request handler and message size cap
         // Without this handler, NWListener rejects URLSession WebSocket clients
         // with "client request doesn't match expected value" error
+        let normalizedToken: String? = if let authToken, !authToken.isEmpty {
+            authToken
+        } else {
+            nil
+        }
+        let options = Self.makeWebSocketOptions(authToken: normalizedToken)
+        params.defaultProtocolStack.applicationProtocols.insert(options, at: 0)
+
+        if allowLAN {
+            listener = try NWListener(using: params, on: nwPort)
+            listener?.service = NWListener.Service(
+                name: agentName,
+                type: "_a2a._tcp",
+                txtRecord: buildTxtRecord()
+            )
+        } else {
+            listener = try NWListener(using: params)
+        }
+
+        configuredAuthToken = normalizedToken
+        listenerGeneration &+= 1
+        let activeGeneration = listenerGeneration
+        let listenerAuthenticated = normalizedToken != nil
+
+        listener?.stateUpdateHandler = { [weak self] state in
+            Task { @MainActor [weak self] in
+                guard let self, self.listenerGeneration == activeGeneration else { return }
+                self.handleListenerState(state)
+            }
+        }
+
+        listener?.newConnectionHandler = { [weak self] connection in
+            Task { @MainActor [weak self] in
+                self?.handleNewConnection(
+                    connection,
+                    listenerGeneration: activeGeneration,
+                    isAuthenticated: listenerAuthenticated
+                )
+            }
+        }
+
+        listener?.start(queue: .main)
+        isPublishing = true
+
+        print("[LocalAIAgent] Started publishing on port \(port) (allowLAN: \(allowLAN))")
+    }
+
+    /// Build `NWProtocolWebSocket.Options` enforcing `maxMessageSize` and optional Bearer auth
+    static func makeWebSocketOptions(authToken: String?) -> NWProtocolWebSocket.Options {
+        let expectedToken = authToken
         let options = NWProtocolWebSocket.Options()
         options.autoReplyPing = true
-        options.setClientRequestHandler(DispatchQueue.main) { subprotocols, _ in
-            // Accept all valid WebSocket upgrade requests
+        options.maximumMessageSize = Self.maxMessageSize
+        options.setClientRequestHandler(DispatchQueue.main) { subprotocols, headers in
+            if let expectedToken, !expectedToken.isEmpty {
+                let authHeader = headers.first {
+                    $0.name.caseInsensitiveCompare("Authorization") == .orderedSame
+                }?.value
+                guard Self.verifyBearerAuthorization(authHeader, expectedToken: expectedToken) else {
+                    return NWProtocolWebSocket.Response(
+                        status: .reject,
+                        subprotocol: nil,
+                        additionalHeaders: nil
+                    )
+                }
+            }
+
             // Return the first requested subprotocol if any, otherwise accept with no subprotocol
             let selectedSubprotocol = subprotocols.first
             return NWProtocolWebSocket.Response(
@@ -190,36 +299,137 @@ public final class LocalAIAgent: NSObject, ObservableObject {
                 additionalHeaders: nil
             )
         }
-        params.defaultProtocolStack.applicationProtocols.insert(options, at: 0)
+        return options
+    }
 
-        listener = try NWListener(using: params, on: NWEndpoint.Port(integerLiteral: port))
-
-        listener?.service = NWListener.Service(
-            name: agentName,
-            type: "_a2a._tcp",
-            txtRecord: buildTxtRecord()
-        )
-
-        listener?.stateUpdateHandler = { [weak self] state in
-            Task { @MainActor [weak self] in
-                self?.handleListenerState(state)
+    /// Verify an HTTP `Authorization` header against `expectedToken` using case-insensitive
+    /// `"Bearer "` scheme matching (RFC 7235 / 6750) and constant-time byte comparison.
+    nonisolated static func verifyBearerAuthorization(
+        _ headerValue: String?,
+        expectedToken: String
+    ) -> Bool {
+        guard !expectedToken.isEmpty, let headerValue else {
+            return false
+        }
+        let bytes = Array(headerValue.utf8)
+        // "Bearer " is 7 ASCII bytes ("bearer" + single space)
+        guard bytes.count > 7 else {
+            return false
+        }
+        let scheme: [UInt8] = [0x62, 0x65, 0x61, 0x72, 0x65, 0x72] // "bearer"
+        for i in 0..<6 {
+            let lower = (bytes[i] >= 0x41 && bytes[i] <= 0x5A) ? (bytes[i] + 32) : bytes[i]
+            if lower != scheme[i] {
+                return false
             }
         }
-
-        listener?.newConnectionHandler = { [weak self] connection in
-            Task { @MainActor [weak self] in
-                self?.handleNewConnection(connection)
-            }
+        guard bytes[6] == 0x20 else {
+            return false
         }
+        return constantTimeBytesEqual(Array(bytes[7...]), Array(expectedToken.utf8))
+    }
 
-        listener?.start(queue: .main)
-        isPublishing = true
+    /// Constant-time byte-by-byte XOR comparison (never short-circuits on mismatched bytes).
+    nonisolated static func constantTimeBytesEqual(_ lhs: [UInt8], _ rhs: [UInt8]) -> Bool {
+        let maxLen = max(lhs.count, rhs.count)
+        var diff: UInt8 = lhs.count == rhs.count ? 0 : 1
+        for i in 0..<maxLen {
+            let a: UInt8 = i < lhs.count ? lhs[i] : 0
+            let b: UInt8 = i < rhs.count ? rhs[i] : 0
+            diff |= a ^ b
+        }
+        return diff == 0
+    }
 
-        print("[LocalAIAgent] Started publishing on port \(port)")
+    /// Determine whether a peer endpoint refers to the local loopback interface.
+    /// Recognizes IPv4 `127.0.0.0/8`, IPv6 `::1`, IPv4-mapped `::ffff:127.0.0.0/104`,
+    /// and host names `"localhost"`, `"127.0.0.1"`, `"::1"` (or equivalent loopback literals).
+    nonisolated static func isLoopbackEndpoint(_ endpoint: NWEndpoint) -> Bool {
+        switch endpoint {
+        case .hostPort(let host, _):
+            switch host {
+            case .ipv4(let address):
+                return isLoopbackIPv4(address)
+            case .ipv6(let address):
+                return isLoopbackIPv6(address)
+            case .name(let name, _):
+                var normalized = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if normalized.hasPrefix("[") && normalized.hasSuffix("]") {
+                    normalized = String(normalized.dropFirst().dropLast())
+                }
+                if let percentIndex = normalized.firstIndex(of: "%") {
+                    normalized = String(normalized[..<percentIndex])
+                }
+                if normalized == "localhost" {
+                    return true
+                }
+                if let ipv4 = IPv4Address(normalized) {
+                    return isLoopbackIPv4(ipv4)
+                }
+                if let ipv6 = IPv6Address(normalized) {
+                    return isLoopbackIPv6(ipv6)
+                }
+                return false
+            @unknown default:
+                return false
+            }
+        default:
+            return false
+        }
+    }
+
+    nonisolated private static func isLoopbackIPv4(_ address: IPv4Address) -> Bool {
+        if address.isLoopback {
+            return true
+        }
+        let bytes = Array(address.rawValue)
+        return bytes.first == 127
+    }
+
+    nonisolated private static func isLoopbackIPv6(_ address: IPv6Address) -> Bool {
+        if address.isLoopback {
+            return true
+        }
+        if address.isIPv4Mapped, let mapped = address.asIPv4 {
+            return isLoopbackIPv4(mapped)
+        }
+        let bytes = Array(address.rawValue)
+        if bytes.count == 16,
+           bytes[0] == 0, bytes[1] == 0, bytes[2] == 0, bytes[3] == 0, bytes[4] == 0,
+           bytes[5] == 0, bytes[6] == 0, bytes[7] == 0, bytes[8] == 0, bytes[9] == 0,
+           bytes[10] == 0xff, bytes[11] == 0xff, bytes[12] == 127 {
+            return true
+        }
+        return false
+    }
+
+    /// Returns `true` for any RPC method outside the read-only discovery/health allowlist.
+    nonisolated static func requiresAuthentication(forMethod method: String) -> Bool {
+        !unauthenticatedDiscoveryMethods.contains(method)
+    }
+
+    /// Authorization policy for incoming RPC calls.
+    /// - When `authTokenRequired` is `true`, every connection must have authenticated with the token.
+    /// - When `authTokenRequired` is `false`, loopback peers are permitted for all methods while
+    ///   unauthenticated non-loopback peers are restricted to read-only discovery/health methods.
+    nonisolated static func isAuthorized(
+        method: String,
+        isLoopback: Bool,
+        isAuthenticated: Bool,
+        authTokenRequired: Bool = false
+    ) -> Bool {
+        if authTokenRequired {
+            return isAuthenticated
+        }
+        if isAuthenticated || isLoopback {
+            return true
+        }
+        return !requiresAuthentication(forMethod: method)
     }
 
     /// Stop publishing the A2A service
     public func stopPublishing() {
+        listenerGeneration &+= 1
         listener?.cancel()
         listener = nil
 
@@ -227,6 +437,9 @@ public final class LocalAIAgent: NSObject, ObservableObject {
             connection.cancel()
         }
         connections.removeAll()
+        connectionMetadata.removeAll()
+        partialMessages.removeAll()
+        configuredAuthToken = nil
 
         isPublishing = false
         print("[LocalAIAgent] Stopped publishing")
@@ -262,9 +475,25 @@ public final class LocalAIAgent: NSObject, ObservableObject {
         }
     }
 
-    private func handleNewConnection(_ connection: NWConnection) {
+    private func handleNewConnection(
+        _ connection: NWConnection,
+        listenerGeneration generation: UInt64,
+        isAuthenticated: Bool
+    ) {
+        guard generation == listenerGeneration else {
+            connection.cancel()
+            return
+        }
+
         let connectionId = UUID()
         connections[connectionId] = connection
+
+        let remoteEndpoint = connection.currentPath?.remoteEndpoint ?? connection.endpoint
+        connectionMetadata[connectionId] = ConnectionMetadata(
+            isLoopback: Self.isLoopbackEndpoint(remoteEndpoint),
+            isAuthenticated: isAuthenticated,
+            listenerGeneration: generation
+        )
 
         connection.stateUpdateHandler = { [weak self] state in
             Task { @MainActor [weak self] in
@@ -282,16 +511,84 @@ public final class LocalAIAgent: NSObject, ObservableObject {
     private func handleConnectionState(_ connectionId: UUID, state: NWConnection.State) {
         switch state {
         case .ready:
+            if let connection = connections[connectionId],
+               let remoteEndpoint = connection.currentPath?.remoteEndpoint,
+               let existing = connectionMetadata[connectionId] {
+                connectionMetadata[connectionId] = ConnectionMetadata(
+                    isLoopback: Self.isLoopbackEndpoint(remoteEndpoint),
+                    isAuthenticated: existing.isAuthenticated,
+                    listenerGeneration: existing.listenerGeneration
+                )
+            }
             print("[LocalAIAgent] Connection ready: \(connectionId)")
         case let .failed(error):
             print("[LocalAIAgent] Connection failed: \(connectionId), error: \(error)")
             connections.removeValue(forKey: connectionId)
+            connectionMetadata.removeValue(forKey: connectionId)
+            partialMessages.removeValue(forKey: connectionId)
         case .cancelled:
             print("[LocalAIAgent] Connection cancelled: \(connectionId)")
             connections.removeValue(forKey: connectionId)
+            connectionMetadata.removeValue(forKey: connectionId)
+            partialMessages.removeValue(forKey: connectionId)
         default:
             break
         }
+    }
+
+    private func cleanupConnection(_ connectionId: UUID, connection: NWConnection) {
+        connections.removeValue(forKey: connectionId)
+        connectionMetadata.removeValue(forKey: connectionId)
+        partialMessages.removeValue(forKey: connectionId)
+        connection.cancel()
+    }
+
+    enum IncomingFrameAction: Equatable, Sendable {
+        case deliver(Data)
+        case buffered
+        case empty
+        case rejectOversized
+    }
+
+    /// Accumulate WebSocket frame(s) while enforcing `Self.maxMessageSize` on both unfragmented and fragmented messages.
+    func accumulateFrame(
+        _ data: Data?,
+        isComplete: Bool,
+        for connectionId: UUID
+    ) -> IncomingFrameAction {
+        if let data, !data.isEmpty {
+            if isComplete {
+                if var buffered = partialMessages.removeValue(forKey: connectionId) {
+                    guard buffered.count + data.count <= Self.maxMessageSize else {
+                        return .rejectOversized
+                    }
+                    buffered.append(data)
+                    return .deliver(buffered)
+                } else {
+                    guard data.count <= Self.maxMessageSize else {
+                        return .rejectOversized
+                    }
+                    return .deliver(data)
+                }
+            } else {
+                var buffer = partialMessages[connectionId] ?? Data()
+                guard buffer.count + data.count <= Self.maxMessageSize else {
+                    partialMessages.removeValue(forKey: connectionId)
+                    return .rejectOversized
+                }
+                buffer.append(data)
+                partialMessages[connectionId] = buffer
+                return .buffered
+            }
+        } else if isComplete,
+                  let buffered = partialMessages.removeValue(forKey: connectionId),
+                  !buffered.isEmpty {
+            guard buffered.count <= Self.maxMessageSize else {
+                return .rejectOversized
+            }
+            return .deliver(buffered)
+        }
+        return .empty
     }
 
     private func receiveMessage(from connection: NWConnection, connectionId: UUID) {
@@ -301,14 +598,40 @@ public final class LocalAIAgent: NSObject, ObservableObject {
 
                 if let error {
                     print("[LocalAIAgent] Receive error: \(error)")
+                    self.cleanupConnection(connectionId, connection: connection)
                     return
                 }
 
-                if let data = completeContent {
-                    await self.handleMessage(data, from: connection, connectionId: connectionId)
+                // Close cleanly on WebSocket close opcode
+                if let metadata = contentContext?.protocolMetadata(definition: NWProtocolWebSocket.definition) as? NWProtocolWebSocket.Metadata,
+                   metadata.opcode == .close {
+                    print("[LocalAIAgent] WebSocket close frame received: \(connectionId)")
+                    self.cleanupConnection(connectionId, connection: connection)
+                    return
                 }
 
-                if !isComplete {
+                // Close cleanly on EOF
+                if contentContext?.isFinal == true && (completeContent == nil || completeContent?.isEmpty == true) {
+                    print("[LocalAIAgent] Connection EOF: \(connectionId)")
+                    self.cleanupConnection(connectionId, connection: connection)
+                    return
+                }
+
+                switch self.accumulateFrame(completeContent, isComplete: isComplete, for: connectionId) {
+                case .deliver(let fullMessage):
+                    await self.handleMessage(fullMessage, from: connection, connectionId: connectionId)
+                case .buffered, .empty:
+                    break
+                case .rejectOversized:
+                    print("[LocalAIAgent] Message exceeded size limit on connection: \(connectionId)")
+                    self.cleanupConnection(connectionId, connection: connection)
+                    return
+                }
+
+                // Always schedule next read while connection remains open
+                if contentContext?.isFinal == true {
+                    self.cleanupConnection(connectionId, connection: connection)
+                } else if self.connections[connectionId] != nil {
                     self.receiveMessage(from: connection, connectionId: connectionId)
                 }
             }
@@ -316,32 +639,79 @@ public final class LocalAIAgent: NSObject, ObservableObject {
     }
 
     private func handleMessage(_ data: Data, from connection: NWConnection, connectionId: UUID) async {
+        guard data.count <= Self.maxMessageSize else {
+            print("[LocalAIAgent] Message exceeded size limit on connection: \(connectionId)")
+            cleanupConnection(connectionId, connection: connection)
+            return
+        }
+
+        var requestRpcId: JSONRPCID?
         do {
             guard let jsonString = String(data: data, encoding: .utf8) else {
                 throw LocalAIAgentError.invalidMessageEncoding
             }
 
-            let request = try JSONDecoder().decode(AgentRequest.self, from: Data(jsonString.utf8))
+            let requestData = Data(jsonString.utf8)
+            if let partial = try? JSONDecoder().decode(PartialRPCId.self, from: requestData) {
+                requestRpcId = partial.id
+            }
 
-            print("[LocalAIAgent] Received request: \(request.method)")
+            let request = try JSONDecoder().decode(AgentRequest.self, from: requestData)
+            requestRpcId = request.rpcId
 
-            let response = try await processRequest(request)
+            print("[LocalAIAgent] Received request: \(request.method) (connection: \(connectionId))")
 
-            try await sendResponse(response, to: connection)
+            guard let metadata = connectionMetadata[connectionId],
+                  metadata.listenerGeneration == listenerGeneration else {
+                print("[LocalAIAgent] Rejecting message from stale or closed connection: \(connectionId)")
+                cleanupConnection(connectionId, connection: connection)
+                return
+            }
+
+            let response = try await processRequest(
+                request,
+                isLoopback: metadata.isLoopback,
+                isAuthenticated: metadata.isAuthenticated,
+                authTokenRequired: configuredAuthToken != nil
+            )
+
+            try await sendResponse(response, rpcId: request.rpcId, to: connection)
         } catch {
             print("[LocalAIAgent] Error handling message: \(error)")
 
+            let effectiveRpcId = requestRpcId ?? .string(UUID().uuidString)
             let errorResponse = AgentResponse.error(
-                id: UUID().uuidString,
+                id: effectiveRpcId.stringValue,
                 code: -32603,
                 message: error.localizedDescription
             )
 
-            try? await sendResponse(errorResponse, to: connection)
+            try? await sendResponse(errorResponse, rpcId: effectiveRpcId, to: connection)
         }
     }
 
-    private func processRequest(_ request: AgentRequest) async throws -> AgentResponse {
+    func processRequest(
+        _ request: AgentRequest,
+        isLoopback: Bool,
+        isAuthenticated: Bool,
+        authTokenRequired: Bool = false
+    ) async throws -> AgentResponse {
+        guard Self.isAuthorized(
+            method: request.method,
+            isLoopback: isLoopback,
+            isAuthenticated: isAuthenticated,
+            authTokenRequired: authTokenRequired
+        ) else {
+            return AgentResponse.error(
+                id: request.id,
+                code: -32001,
+                message: "Unauthorized: authentication token required for non-loopback requests"
+            )
+        }
+        return try await processRequest(request)
+    }
+
+    func processRequest(_ request: AgentRequest) async throws -> AgentResponse {
         switch request.method {
         case "sensor_request":
             return try await handleSensorRequest(request)
@@ -360,10 +730,11 @@ public final class LocalAIAgent: NSObject, ObservableObject {
         let sensorRequest = try decodeParams(SensorRequest.self, from: request.params)
 
         let sensorResponse = try await sensorBridge.requestSensorData(sensorRequest)
+        let encodedResult = try encodeToAnyCodable(sensorResponse)
 
         return AgentResponse.success(
             id: request.id,
-            result: AnyCodable(sensorResponse)
+            result: encodedResult
         )
     }
 
@@ -375,10 +746,11 @@ public final class LocalAIAgent: NSObject, ObservableObject {
         }
 
         let result = try await executeLocalToolCall(toolCall)
+        let encodedResult = try encodeToAnyCodable(result)
 
         return AgentResponse.success(
             id: request.id,
-            result: AnyCodable(result)
+            result: encodedResult
         )
     }
 
@@ -418,27 +790,53 @@ public final class LocalAIAgent: NSObject, ObservableObject {
             capabilities: capabilities,
             createdAt: Date()
         )
+        let encodedSession = try encodeToAnyCodable(session)
 
         return AgentResponse.success(
             id: request.id,
-            result: AnyCodable(session)
+            result: encodedSession
         )
     }
 
-    private func sendResponse(_ response: AgentResponse, to connection: NWConnection) async throws {
+    /// Encode any `Encodable` value into a JSON-backed `AnyCodable` so structs never serialize as `null`
+    func encodeToAnyCodable<T: Encodable>(_ value: T) throws -> AnyCodable {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(value)
+        return try JSONDecoder().decode(AnyCodable.self, from: data)
+    }
 
-        let data = try encoder.encode(response)
+    /// Encode a JSON-RPC response while preserving the wire type (numeric vs string) of `rpcId`
+    func encodeResponse(_ response: AgentResponse, rpcId: JSONRPCID? = nil) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        if let rpcId {
+            return try encoder.encode(AgentResponseEnvelope(response: response, rpcId: rpcId))
+        }
+        return try encoder.encode(response)
+    }
+
+    private func sendResponse(_ response: AgentResponse, rpcId: JSONRPCID? = nil, to connection: NWConnection) async throws {
+        let data = try encodeResponse(response, rpcId: rpcId)
+        let metadata = NWProtocolWebSocket.Metadata(opcode: .text)
+        let context = NWConnection.ContentContext(
+            identifier: "textMessage",
+            metadata: [metadata]
+        )
 
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            connection.send(content: data, completion: .contentProcessed { error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume()
+            connection.send(
+                content: data,
+                contentContext: context,
+                isComplete: true,
+                completion: .contentProcessed { error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                    } else {
+                        continuation.resume()
+                    }
                 }
-            })
+            )
         }
     }
 
@@ -624,18 +1022,23 @@ public final class LocalAIAgent: NSObject, ObservableObject {
 
         let length = args["length"] as? String ?? "medium"
 
-        // Use Writing Tools if available
-        let toolCall = ToolCall(
-            toolCallId: UUID().uuidString,
-            name: "writing_tools_summarize",
-            args: AnyCodable(["text": text, "length": length]),
-            locality: .local
-        )
+        // Use Writing Tools if available; fall back gracefully when unavailable
+        if writingTools.isAvailable {
+            let toolCall = ToolCall(
+                toolCallId: UUID().uuidString,
+                name: "writing_tools_summarize",
+                args: AnyCodable(["text": text, "length": length]),
+                locality: .local
+            )
 
-        let result = try await writingTools.executeToolCall(toolCall)
-
-        if result.success, let summary = result.result?.value as? [String: Any] {
-            return summary
+            do {
+                let result = try await writingTools.executeToolCall(toolCall)
+                if result.success, let summary = result.result?.value as? [String: Any] {
+                    return summary
+                }
+            } catch WritingToolsError.notAvailable {
+                // Fall through to sentence extraction fallback
+            }
         }
 
         // Fallback: Simple sentence extraction
@@ -656,25 +1059,41 @@ public final class LocalAIAgent: NSObject, ObservableObject {
             throw LocalAIAgentError.invalidArguments("Missing 'text' parameter")
         }
 
-        // Use Writing Tools
-        let toolCall = ToolCall(
-            toolCallId: UUID().uuidString,
-            name: "writing_tools_proofread",
-            args: AnyCodable(["text": text]),
-            locality: .local
-        )
+        // Use Writing Tools if available; fall back gracefully when unavailable
+        if writingTools.isAvailable {
+            let toolCall = ToolCall(
+                toolCallId: UUID().uuidString,
+                name: "writing_tools_proofread",
+                args: AnyCodable(["text": text]),
+                locality: .local
+            )
 
-        let result = try await writingTools.executeToolCall(toolCall)
-
-        if result.success, let proofread = result.result?.value as? [String: Any] {
-            return proofread
+            do {
+                let result = try await writingTools.executeToolCall(toolCall)
+                if result.success, var proofread = result.result?.value as? [String: Any] {
+                    // Ensure consistent key schema ("corrected_text" and "text")
+                    if proofread["corrected_text"] == nil, let textValue = proofread["text"] as? String {
+                        proofread["corrected_text"] = textValue
+                    }
+                    if proofread["text"] == nil, let correctedValue = proofread["corrected_text"] as? String {
+                        proofread["text"] = correctedValue
+                    }
+                    return proofread
+                }
+            } catch WritingToolsError.notAvailable {
+                // Fall through to passthrough fallback
+            }
         }
 
-        return ["corrected_text": text, "corrections": []]
+        return ["corrected_text": text, "text": text, "corrections": []]
     }
 }
 
 // MARK: - Supporting Types
+
+private struct PartialRPCId: Decodable, Sendable {
+    let id: JSONRPCID?
+}
 
 /// In-process chat session (no WebSocket)
 struct InProcessChatSession {
@@ -699,6 +1118,7 @@ public enum LocalAIAgentError: Error, LocalizedError {
     case unknownMethod(String)
     case remoteToolCallNotSupported
     case toolNotImplemented(String)
+    case toolExecutionFailed(String)
     case orchestratorRequired
     case notImplemented
     case sessionNotFound
@@ -714,6 +1134,8 @@ public enum LocalAIAgentError: Error, LocalizedError {
             return "Remote tool calls must be sent to Orchestrator"
         case let .toolNotImplemented(name):
             return "Tool not yet implemented: \(name)"
+        case let .toolExecutionFailed(detail):
+            return "Tool execution failed: \(detail)"
         case .orchestratorRequired:
             return "Task offers must be sent to Orchestrator for planning"
         case .notImplemented:
