@@ -105,13 +105,17 @@ public actor VideoEncoder {
     public private(set) var streamConnectionErrors: [String: String] = [:]
     private var ntdfStreamingManager: NTDFStreamingManager?
     private var isNTDFStreaming: Bool = false
-    /// Guards against concurrent/reentrant `startStreaming` and `startNTDFStreaming` calls across awaits
+    /// Guards against concurrent/reentrant `startStreaming` and `startNTDFStreaming` calls across awaits.
+    /// Concurrent callers join the in-flight start and receive its success or failure outcome.
     private var isStartingStream: Bool = false
+    private var streamStartWaiters: [CheckedContinuation<Void, any Error>] = []
 
     /// Tests: streaming with no RTMP destination (see `startStreamingForTesting(onEncodedVideo:)`)
     private var streamsWithoutDestinationForTesting = false
     /// Tests: awaited once `finishRecording()` has begun, before the file is finished
     private var finishingHookForTesting: (@Sendable () async -> Void)?
+    /// Tests: awaited once `startStreaming` has marked `isStartingStream = true`, before connecting
+    private var streamStartHookForTesting: (@Sendable () async -> Void)?
     /// Tests: what the next appends to the file get instead of the writer's answer, in order
     private var refusalsForTesting: [RefusalForTesting] = []
 
@@ -860,14 +864,41 @@ public actor VideoEncoder {
         try await startStreaming(to: [(id: destination.platform, destination: destination, streamKey: streamKey)])
     }
 
+    private func finishStreamStart(with result: Result<Void, any Error>) {
+        isStartingStream = false
+        let waiters = streamStartWaiters
+        streamStartWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume(with: result)
+        }
+    }
+
     /// Start streaming to multiple RTMP destinations simultaneously (simulcast)
     public func startStreaming(to destinations: [(id: String, destination: RTMPPublisher.Destination, streamKey: String)]) async throws {
-        guard !isStartingStream, !isStreaming, !isNTDFStreaming else {
-            print("⚠️ Already streaming or starting a stream")
+        if isStartingStream {
+            try await withCheckedThrowingContinuation { continuation in
+                streamStartWaiters.append(continuation)
+            }
+            return
+        }
+        guard !isStreaming, !isNTDFStreaming else {
+            print("⚠️ Already streaming")
             return
         }
         isStartingStream = true
-        defer { isStartingStream = false }
+        do {
+            try await performStartStreaming(to: destinations)
+            finishStreamStart(with: .success(()))
+        } catch {
+            finishStreamStart(with: .failure(error))
+            throw error
+        }
+    }
+
+    private func performStartStreaming(to destinations: [(id: String, destination: RTMPPublisher.Destination, streamKey: String)]) async throws {
+        if let streamStartHookForTesting {
+            await streamStartHookForTesting()
+        }
 
         // Deduplicate destination IDs so duplicate entries never open and leak extra RTMPPublishers
         var seenIDs = Set<String>()
@@ -1105,6 +1136,11 @@ public actor VideoEncoder {
         finishingHookForTesting = hook
     }
 
+    /// Tests: `hook` is awaited while `isStartingStream` is true, before destinations connect.
+    func setStreamStartHookForTesting(_ hook: (@Sendable () async -> Void)?) {
+        streamStartHookForTesting = hook
+    }
+
     /// Tests: how the writer refuses a buffer. `notReady`: `appendImmediately` returns false,
     /// as for a real-time input that fell behind. `failed`: it throws, as for a failed writer.
     enum RefusalForTesting: Sendable { case notReady, failed }
@@ -1269,12 +1305,27 @@ public actor VideoEncoder {
     ///   - rtmpURL: RTMP server URL (e.g., rtmp://platform.arkavo.net:1935)
     ///   - streamKey: Stream key (e.g., live/test)
     public func startNTDFStreaming(kasURL: URL, rtmpURL: String, streamKey: String) async throws {
-        guard !isStartingStream, !isNTDFStreaming, !isStreaming else {
-            print("⚠️ Already streaming or starting a stream")
+        if isStartingStream {
+            try await withCheckedThrowingContinuation { continuation in
+                streamStartWaiters.append(continuation)
+            }
+            return
+        }
+        guard !isNTDFStreaming, !isStreaming else {
+            print("⚠️ Already streaming")
             return
         }
         isStartingStream = true
-        defer { isStartingStream = false }
+        do {
+            try await performStartNTDFStreaming(kasURL: kasURL, rtmpURL: rtmpURL, streamKey: streamKey)
+            finishStreamStart(with: .success(()))
+        } catch {
+            finishStreamStart(with: .failure(error))
+            throw error
+        }
+    }
+
+    private func performStartNTDFStreaming(kasURL: URL, rtmpURL: String, streamKey: String) async throws {
 
         print("🔐 Starting NTDF-encrypted stream...")
 

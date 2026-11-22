@@ -32,8 +32,8 @@ public final class LocalAIAgent: NSObject, ObservableObject {
     private var connections: [UUID: NWConnection] = [:]
     private var partialMessages: [UUID: Data] = [:]
 
-    /// Maximum accumulated fragmented WebSocket message size (16 MiB)
-    private static let maxWebSocketMessageBytes = 16 * 1024 * 1024
+    /// Maximum WebSocket message size (16 MiB)
+    static let maxMessageSize = 16 * 1024 * 1024
 
     // Unique agent ID based on device
     private let agentId: String
@@ -177,12 +177,12 @@ public final class LocalAIAgent: NSObject, ObservableObject {
 
     // MARK: - WebSocket Server (for cross-device A2A)
 
-    /// Start publishing the LocalAIAgent as an A2A service.
-    /// Defaults to loopback (`127.0.0.1`) to avoid exposing an unauthenticated LAN control service;
-    /// pass `allowLAN: true` (ideally with an `authToken`) to advertise over LAN/mDNS.
+    /// Start publishing the LocalAIAgent as an A2A service over LAN/mDNS.
+    /// Pass `allowLAN: false` to restrict binding to loopback (`127.0.0.1`) without mDNS advertising,
+    /// and optionally pass `authToken` to require `Authorization: Bearer <token>` on WebSocket upgrade.
     public func startPublishing(
         port: UInt16 = 0,
-        allowLAN: Bool = false,
+        allowLAN: Bool = true,
         authToken: String? = nil
     ) throws {
         guard !isPublishing else {
@@ -346,6 +346,54 @@ public final class LocalAIAgent: NSObject, ObservableObject {
         connection.cancel()
     }
 
+    enum IncomingFrameAction: Equatable, Sendable {
+        case deliver(Data)
+        case buffered
+        case empty
+        case rejectOversized
+    }
+
+    /// Accumulate WebSocket frame(s) while enforcing `Self.maxMessageSize` on both unfragmented and fragmented messages.
+    func accumulateFrame(
+        _ data: Data?,
+        isComplete: Bool,
+        for connectionId: UUID
+    ) -> IncomingFrameAction {
+        if let data, !data.isEmpty {
+            if isComplete {
+                if var buffered = partialMessages.removeValue(forKey: connectionId) {
+                    guard buffered.count + data.count <= Self.maxMessageSize else {
+                        return .rejectOversized
+                    }
+                    buffered.append(data)
+                    return .deliver(buffered)
+                } else {
+                    guard data.count <= Self.maxMessageSize else {
+                        return .rejectOversized
+                    }
+                    return .deliver(data)
+                }
+            } else {
+                var buffer = partialMessages[connectionId] ?? Data()
+                guard buffer.count + data.count <= Self.maxMessageSize else {
+                    partialMessages.removeValue(forKey: connectionId)
+                    return .rejectOversized
+                }
+                buffer.append(data)
+                partialMessages[connectionId] = buffer
+                return .buffered
+            }
+        } else if isComplete,
+                  let buffered = partialMessages.removeValue(forKey: connectionId),
+                  !buffered.isEmpty {
+            guard buffered.count <= Self.maxMessageSize else {
+                return .rejectOversized
+            }
+            return .deliver(buffered)
+        }
+        return .empty
+    }
+
     private func receiveMessage(from connection: NWConnection, connectionId: UUID) {
         connection.receiveMessage { [weak self] completeContent, contentContext, isComplete, error in
             Task { @MainActor [weak self] in
@@ -372,35 +420,15 @@ public final class LocalAIAgent: NSObject, ObservableObject {
                     return
                 }
 
-                if let data = completeContent, !data.isEmpty {
-                    if isComplete {
-                        let fullMessage: Data
-                        if var buffered = self.partialMessages.removeValue(forKey: connectionId) {
-                            guard buffered.count + data.count <= Self.maxWebSocketMessageBytes else {
-                                print("[LocalAIAgent] Message exceeded size limit on connection: \(connectionId)")
-                                self.cleanupConnection(connectionId, connection: connection)
-                                return
-                            }
-                            buffered.append(data)
-                            fullMessage = buffered
-                        } else {
-                            fullMessage = data
-                        }
-                        await self.handleMessage(fullMessage, from: connection, connectionId: connectionId)
-                    } else {
-                        var buffer = self.partialMessages[connectionId] ?? Data()
-                        guard buffer.count + data.count <= Self.maxWebSocketMessageBytes else {
-                            print("[LocalAIAgent] Fragmented message exceeded size limit on connection: \(connectionId)")
-                            self.cleanupConnection(connectionId, connection: connection)
-                            return
-                        }
-                        buffer.append(data)
-                        self.partialMessages[connectionId] = buffer
-                    }
-                } else if isComplete,
-                          let buffered = self.partialMessages.removeValue(forKey: connectionId),
-                          !buffered.isEmpty {
-                    await self.handleMessage(buffered, from: connection, connectionId: connectionId)
+                switch self.accumulateFrame(completeContent, isComplete: isComplete, for: connectionId) {
+                case .deliver(let fullMessage):
+                    await self.handleMessage(fullMessage, from: connection, connectionId: connectionId)
+                case .buffered, .empty:
+                    break
+                case .rejectOversized:
+                    print("[LocalAIAgent] Message exceeded size limit on connection: \(connectionId)")
+                    self.cleanupConnection(connectionId, connection: connection)
+                    return
                 }
 
                 // Always schedule next read while connection remains open
@@ -414,39 +442,42 @@ public final class LocalAIAgent: NSObject, ObservableObject {
     }
 
     private func handleMessage(_ data: Data, from connection: NWConnection, connectionId: UUID) async {
-        var requestId: String?
+        guard data.count <= Self.maxMessageSize else {
+            print("[LocalAIAgent] Message exceeded size limit on connection: \(connectionId)")
+            cleanupConnection(connectionId, connection: connection)
+            return
+        }
+
+        var requestRpcId: JSONRPCID?
         do {
             guard let jsonString = String(data: data, encoding: .utf8) else {
                 throw LocalAIAgentError.invalidMessageEncoding
             }
 
             let requestData = Data(jsonString.utf8)
-            if let rawJSON = try? JSONSerialization.jsonObject(with: requestData) as? [String: Any] {
-                if let idString = rawJSON["id"] as? String {
-                    requestId = idString
-                } else if let idInt = rawJSON["id"] as? Int {
-                    requestId = String(idInt)
-                }
+            if let partial = try? JSONDecoder().decode(PartialRPCId.self, from: requestData) {
+                requestRpcId = partial.id
             }
 
             let request = try JSONDecoder().decode(AgentRequest.self, from: requestData)
-            requestId = request.id
+            requestRpcId = request.rpcId
 
             print("[LocalAIAgent] Received request: \(request.method) (connection: \(connectionId))")
 
             let response = try await processRequest(request)
 
-            try await sendResponse(response, to: connection)
+            try await sendResponse(response, rpcId: request.rpcId, to: connection)
         } catch {
             print("[LocalAIAgent] Error handling message: \(error)")
 
+            let effectiveRpcId = requestRpcId ?? .string(UUID().uuidString)
             let errorResponse = AgentResponse.error(
-                id: requestId ?? UUID().uuidString,
+                id: effectiveRpcId.stringValue,
                 code: -32603,
                 message: error.localizedDescription
             )
 
-            try? await sendResponse(errorResponse, to: connection)
+            try? await sendResponse(errorResponse, rpcId: effectiveRpcId, to: connection)
         }
     }
 
@@ -545,11 +576,18 @@ public final class LocalAIAgent: NSObject, ObservableObject {
         return try JSONDecoder().decode(AnyCodable.self, from: data)
     }
 
-    private func sendResponse(_ response: AgentResponse, to connection: NWConnection) async throws {
+    /// Encode a JSON-RPC response while preserving the wire type (numeric vs string) of `rpcId`
+    func encodeResponse(_ response: AgentResponse, rpcId: JSONRPCID? = nil) throws -> Data {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
+        if let rpcId {
+            return try encoder.encode(AgentResponseEnvelope(response: response, rpcId: rpcId))
+        }
+        return try encoder.encode(response)
+    }
 
-        let data = try encoder.encode(response)
+    private func sendResponse(_ response: AgentResponse, rpcId: JSONRPCID? = nil, to connection: NWConnection) async throws {
+        let data = try encodeResponse(response, rpcId: rpcId)
         let metadata = NWProtocolWebSocket.Metadata(opcode: .text)
         let context = NWConnection.ContentContext(
             identifier: "textMessage",
@@ -822,6 +860,10 @@ public final class LocalAIAgent: NSObject, ObservableObject {
 }
 
 // MARK: - Supporting Types
+
+private struct PartialRPCId: Decodable, Sendable {
+    let id: JSONRPCID?
+}
 
 /// In-process chat session (no WebSocket)
 struct InProcessChatSession {

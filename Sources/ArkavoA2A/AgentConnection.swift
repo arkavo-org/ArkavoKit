@@ -47,14 +47,16 @@ public actor AgentConnection: AgentWebSocketTransportDelegate {
         endpoint: AgentEndpoint,
         maxReconnectAttempts: Int = 10,
         initialBackoffMs: UInt64 = 1000,
-        maxBackoffMs: UInt64 = 60000
+        maxBackoffMs: UInt64 = 60000,
+        authToken: String? = nil
     ) {
         self.endpoint = endpoint
         self.transport = AgentWebSocketTransport(
             timeoutMs: 30000,
             requireTLS: false,
             heartbeatIntervalMs: 30000,
-            missedPongThreshold: 2
+            missedPongThreshold: 2,
+            authToken: authToken
         )
         self.maxReconnectAttempts = maxReconnectAttempts
         self.initialBackoffMs = initialBackoffMs
@@ -106,7 +108,9 @@ public actor AgentConnection: AgentWebSocketTransportDelegate {
             print("Successfully connected to agent \(endpoint.id)")
         } catch {
             isReconnectingAttempt = false
-            await updateStatus(.failed(reason: error.localizedDescription))
+            if reconnectTask == nil {
+                await updateStatus(.failed(reason: error.localizedDescription))
+            }
             throw error
         }
     }
@@ -129,6 +133,10 @@ public actor AgentConnection: AgentWebSocketTransportDelegate {
 
     /// Start automatic reconnection
     public func startWithReconnection() {
+        startWithReconnection(afterInitialFailure: false)
+    }
+
+    func startWithReconnection(afterInitialFailure: Bool) {
         // Cancel any existing reconnect task to prevent duplicate loops
         reconnectTaskGeneration &+= 1
         let currentGeneration = reconnectTaskGeneration
@@ -138,6 +146,10 @@ public actor AgentConnection: AgentWebSocketTransportDelegate {
         reconnectionEnabled = true
         disconnectRequested = false
 
+        if afterInitialFailure {
+            status = .reconnecting(attempt: 1)
+        }
+
         reconnectTask = Task {
             defer {
                 self.clearReconnectTaskIfCurrent(generation: currentGeneration)
@@ -145,8 +157,25 @@ public actor AgentConnection: AgentWebSocketTransportDelegate {
 
             await self.transport.setDelegate(self)
 
-            var attempt = 0
+            var attempt = afterInitialFailure ? 1 : 0
             var backoff = initialBackoffMs
+
+            if afterInitialFailure {
+                if attempt >= maxReconnectAttempts {
+                    print("Max reconnection attempts reached for agent \(endpoint.id)")
+                    await updateStatus(.failed(reason: "Max reconnection attempts (\(maxReconnectAttempts)) exceeded"))
+                    return
+                }
+
+                await updateStatus(.reconnecting(attempt: attempt))
+
+                let jitter = UInt64.random(in: 0...1000)
+                let delay = min(backoff + jitter, maxBackoffMs)
+                print("Reconnecting to agent \(endpoint.id) in \(delay)ms (attempt \(attempt)/\(maxReconnectAttempts))")
+
+                try? await Task.sleep(nanoseconds: delay * 1_000_000)
+                backoff = min(backoff * 2, maxBackoffMs)
+            }
 
             while !Task.isCancelled && reconnectionEnabled && !disconnectRequested {
                 do {
@@ -240,6 +269,16 @@ public actor AgentConnection: AgentWebSocketTransportDelegate {
         await transport.setNotificationHandler(handler)
     }
 
+    /// Clear the notification handler only if it matches the given handler instance
+    public func clearNotificationHandler(ifMatching handler: any AgentNotificationHandler) async {
+        await transport.clearNotificationHandler(ifMatching: handler)
+    }
+
+    /// Current notification handler (internal for testing)
+    func getNotificationHandler() async -> (any AgentNotificationHandler)? {
+        await transport.getNotificationHandler()
+    }
+
     // MARK: - AgentWebSocketTransportDelegate
 
     nonisolated public func transportDidConnect() async {
@@ -259,14 +298,15 @@ public actor AgentConnection: AgentWebSocketTransportDelegate {
         if case .reconnecting = status {
             wasReconnecting = true
         }
+        let shouldNotifyReconnect = hasEverConnected && wasReconnecting
         isReconnectingAttempt = false
         hasEverConnected = true
 
         await updateStatus(.connected)
-        print("[AgentConnection] Transport connected (was reconnecting: \(wasReconnecting))")
+        print("[AgentConnection] Transport connected (was reconnecting: \(shouldNotifyReconnect))")
 
         // Notify delegate if this was a reconnection
-        if wasReconnecting, let delegate = connectionDelegate {
+        if shouldNotifyReconnect, let delegate = connectionDelegate {
             await delegate.connectionDidReconnect(agentId: endpoint.id)
         }
     }

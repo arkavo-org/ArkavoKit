@@ -349,21 +349,23 @@ public final class OAuthCallbackServer: @unchecked Sendable {
             return
         }
 
-        // Check for error response from OAuth provider
-        if let error = queryItems.first(where: { $0.name == "error" })?.value {
-            let errorDescription = queryItems.first(where: { $0.name == "error_description" })?.value ?? error
-            sendErrorResponse(to: connection, message: errorDescription)
-            finishLocked(with: .failure(OAuthError.oauthError(errorDescription)), delayConnectionCleanup: true)
-            return
-        }
-
-        // Validate state parameter (CSRF protection) — MUST be present and match expectedState
+        // Validate state parameter (CSRF protection) FIRST — MUST be present and match expectedState
+        // before handling `error=` or `code=`, so an attacker without state cannot abort sign-in
+        // or inject error text into the app UI.
         guard let expectedState = self.expectedState,
               let state = queryItems.first(where: { $0.name == "state" })?.value,
               state == expectedState
         else {
             sendErrorResponse(to: connection, message: "Invalid or missing state parameter")
             finishLocked(with: .failure(OAuthError.stateMismatch), delayConnectionCleanup: true)
+            return
+        }
+
+        // Check for error response from OAuth provider
+        if let error = queryItems.first(where: { $0.name == "error" })?.value {
+            let errorDescription = queryItems.first(where: { $0.name == "error_description" })?.value ?? error
+            sendErrorResponse(to: connection, message: errorDescription)
+            finishLocked(with: .failure(OAuthError.oauthError(errorDescription)), delayConnectionCleanup: true)
             return
         }
 

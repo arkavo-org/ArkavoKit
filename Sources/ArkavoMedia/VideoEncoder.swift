@@ -70,15 +70,27 @@ public final class VideoEncoder: @unchecked Sendable {
             self.state = Mutex(State(isActive: true, onFrame: onFrame))
         }
 
-        func setOnFrame(_ handler: (@Sendable (EncodedVideoFrame) -> Void)?) {
-            state.withLock { $0.onFrame = handler }
+        var isActive: Bool {
+            state.withLock { $0.isActive }
+        }
+
+        @discardableResult
+        func setOnFrame(_ handler: (@Sendable (EncodedVideoFrame) -> Void)?) -> (@Sendable (EncodedVideoFrame) -> Void)? {
+            state.withLock { state in
+                let previous = state.onFrame
+                state.onFrame = handler
+                return previous
+            }
         }
 
         func deactivate() {
-            state.withLock {
-                $0.isActive = false
-                $0.onFrame = nil
+            let previous = state.withLock { state -> (@Sendable (EncodedVideoFrame) -> Void)? in
+                state.isActive = false
+                let old = state.onFrame
+                state.onFrame = nil
+                return old
             }
+            _ = previous
         }
 
         func activeHandler() -> (@Sendable (EncodedVideoFrame) -> Void)? {
@@ -89,20 +101,16 @@ public final class VideoEncoder: @unchecked Sendable {
     private struct SessionState {
         var compressionSession: VTCompressionSession?
         var callbackContextPtr: UnsafeMutableRawPointer?
+        var activeContext: CallbackContext?
+        var onFrame: (@Sendable (EncodedVideoFrame) -> Void)?
         var isEncoding: Bool = false
         var sentSequenceHeader: Bool = false
-    }
-
-    private struct CallbackBinding {
-        var onFrame: (@Sendable (EncodedVideoFrame) -> Void)?
-        var activeContext: CallbackContext?
     }
 
     // MARK: - Properties
 
     private let sessionLock = NSLock()
     private var sessionState = SessionState()
-    private let callbackBinding = Mutex(CallbackBinding())
 
     private let width: Int
     private let height: Int
@@ -112,14 +120,34 @@ public final class VideoEncoder: @unchecked Sendable {
 
     /// Callback invoked when an H.264 frame is ready
     public var onFrame: (@Sendable (EncodedVideoFrame) -> Void)? {
-        get { callbackBinding.withLock { $0.onFrame } }
-        set {
-            let context = callbackBinding.withLock { binding -> CallbackContext? in
-                binding.onFrame = newValue
-                return binding.activeContext
-            }
-            context?.setOnFrame(newValue)
+        get {
+            sessionLock.lock()
+            defer { sessionLock.unlock() }
+            return sessionState.onFrame
         }
+        set {
+            sessionLock.lock()
+            let previousHandler = sessionState.onFrame
+            sessionState.onFrame = newValue
+            let previousContextHandler = sessionState.activeContext?.setOnFrame(newValue)
+            sessionLock.unlock()
+            _ = previousHandler
+            _ = previousContextHandler
+        }
+    }
+
+    /// Internal test inspection of active session/callback context state.
+    var isRunning: Bool {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        return sessionState.compressionSession != nil && sessionState.isEncoding
+    }
+
+    /// Internal test inspection of whether the active session's callback context is active.
+    var hasActiveCallbackContext: Bool {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        return sessionState.activeContext?.isActive ?? false
     }
 
     // MARK: - Initialization
@@ -148,8 +176,7 @@ public final class VideoEncoder: @unchecked Sendable {
 
         guard sessionState.compressionSession == nil else { return }
 
-        let currentOnFrame = callbackBinding.withLock { $0.onFrame }
-        let context = CallbackContext(onFrame: currentOnFrame)
+        let context = CallbackContext(onFrame: sessionState.onFrame)
         let retainedPtr = Unmanaged.passRetained(context).toOpaque()
 
         let enableHardwareAcceleration: CFBoolean = kCFBooleanTrue
@@ -185,39 +212,32 @@ public final class VideoEncoder: @unchecked Sendable {
 
         sessionState.compressionSession = session
         sessionState.callbackContextPtr = retainedPtr
+        sessionState.activeContext = context
         sessionState.isEncoding = true
         sessionState.sentSequenceHeader = false
-
-        callbackBinding.withLock { binding in
-            binding.activeContext = context
-            context.setOnFrame(binding.onFrame)
-        }
 
         print("✅ VTCompressionSession created: \(width)x\(height)@\(fps)fps, bitrate=\(bitrate/1000)kbps (max=\(maxBitrate/1000)kbps), profile=High")
     }
 
     /// Stop encoding
     public func stop() {
-        let tornDown: (VTCompressionSession, UnsafeMutableRawPointer?)? = {
+        let tornDown: (VTCompressionSession, UnsafeMutableRawPointer?, CallbackContext?)? = {
             sessionLock.lock()
             defer { sessionLock.unlock() }
             guard let session = sessionState.compressionSession else { return nil }
             let ptr = sessionState.callbackContextPtr
+            let context = sessionState.activeContext
             sessionState.compressionSession = nil
             sessionState.callbackContextPtr = nil
+            sessionState.activeContext = nil
             sessionState.isEncoding = false
             sessionState.sentSequenceHeader = false
-            return (session, ptr)
+            return (session, ptr, context)
         }()
 
-        guard let (session, contextPtr) = tornDown else { return }
+        guard let (session, contextPtr, activeContext) = tornDown else { return }
 
-        let context = callbackBinding.withLock { binding -> CallbackContext? in
-            let active = binding.activeContext
-            binding.activeContext = nil
-            return active
-        }
-        context?.deactivate()
+        activeContext?.deactivate()
 
         VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
         VTCompressionSessionInvalidate(session)

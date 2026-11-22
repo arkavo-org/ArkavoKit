@@ -169,6 +169,69 @@ struct RecorderAudioSessionAuditFixesTests {
         #expect(received.withLock { $0 } == 1)
     }
 
+    @Test("RemoteCameraAudioSource rejects tiny and huge sample rates outside 8kHz...192kHz")
+    func remoteCameraAudioSourceRejectsOutOfRangeSampleRates() async throws {
+        let source = RemoteCameraAudioSource(sourceID: "remote-rate", sourceName: "Remote Rate Test")
+        try await source.start()
+
+        let received = OSAllocatedUnfairLock(initialState: 0)
+        source.onSample = { _ in
+            received.withLock { $0 += 1 }
+        }
+
+        let pcmBytes = Data(repeating: 0x02, count: 64)
+        for badRate in [1.0, 7_999.0, 192_001.0, 1_000_000.0] {
+            let payload = RemoteCameraMessage.AudioPayload(
+                sourceID: "remote-rate",
+                timestamp: 1.0,
+                sampleRate: badRate,
+                channels: 2,
+                audioData: pcmBytes
+            )
+            source.processAudioPayload(payload)
+        }
+        #expect(received.withLock { $0 } == 0)
+
+        for validRate in [8_000.0, 48_000.0, 192_000.0] {
+            let payload = RemoteCameraMessage.AudioPayload(
+                sourceID: "remote-rate",
+                timestamp: 1.0,
+                sampleRate: validRate,
+                channels: 2,
+                audioData: pcmBytes
+            )
+            source.processAudioPayload(payload)
+        }
+        #expect(received.withLock { $0 } == 3)
+    }
+
+    #if os(macOS)
+    @Test("RecordingSession wires remote camera audio into AudioRouter and cleans up on disconnect")
+    @MainActor
+    func recordingSessionWiresAndCleansUpRemoteCameraAudio() async throws {
+        let session = try RecordingSession()
+        let server = RemoteCameraServer()
+        let pcmBytes = Data(repeating: 0x01, count: 64)
+        let payload = RemoteCameraMessage.AudioPayload(
+            sourceID: "iphone-1",
+            timestamp: 1.0,
+            sampleRate: 48_000,
+            channels: 2,
+            audioData: pcmBytes
+        )
+
+        session.remoteCameraServer(server, didReceiveAudio: payload, sourceID: "iphone-1")
+        #expect(session.registeredAudioSourceIDs.contains("remote-camera-iphone-1"))
+
+        session.remoteCameraServer(server, didUpdateSources: [])
+        let deadline = ContinuousClock.now + .seconds(2)
+        while session.registeredAudioSourceIDs.contains("remote-camera-iphone-1") && .now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(!session.registeredAudioSourceIDs.contains("remote-camera-iphone-1"))
+    }
+    #endif
+
     // MARK: - M9 & C6: AudioManager & MicrophoneAudioSource 0-byte, Float32, and non-contiguous level
 
     @Test("AudioManager and MicrophoneAudioSource return 0.0 (not 1.0/NaN) on 0-byte audio buffers")

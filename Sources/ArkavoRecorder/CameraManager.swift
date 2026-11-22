@@ -18,7 +18,10 @@ public final class CameraManager: NSObject, Sendable {
     }
 
     private struct FrameDeliveryState: Sendable {
+        var pendingCaptureID: UUID? = nil
         var activeCaptureID: UUID? = nil
+        var activeInput: ObjectIdentifier? = nil
+        var acceptingFrames: Bool = false
         var firstFrameDelivered: Bool = false
     }
 
@@ -30,8 +33,12 @@ public final class CameraManager: NSObject, Sendable {
 
     // MARK: - Initialization
 
-    public override init() {
-        self.graph = CameraSessionGraph(session: AVCaptureSession())
+    public override convenience init() {
+        self.init(captureSession: AVCaptureSession())
+    }
+
+    init(captureSession: AVCaptureSession) {
+        self.graph = CameraSessionGraph(session: captureSession)
 
         super.init()
 
@@ -73,7 +80,12 @@ public final class CameraManager: NSObject, Sendable {
     public func startCapture(with deviceID: String?) throws {
         #if os(macOS) || os(iOS)
         let request = try prepareStartRequest(with: deviceID)
-        enqueueStart(request)
+        try Self.attachInputSynchronously(request, graph: graph, frameStateLock: frameStateLock)
+        let graph = graph
+        let captureID = request.captureID
+        graph.queue.async {
+            graph.startRunningIfAttached(captureID: captureID)
+        }
         #else
         throw RecorderError.cameraUnavailable
         #endif
@@ -83,6 +95,7 @@ public final class CameraManager: NSObject, Sendable {
     /// This ensures the camera is actually producing frames before returning
     public func startCaptureAndWaitForFirstFrame(with deviceID: String?) async throws {
         #if os(macOS) || os(iOS)
+        try Task.checkCancellation()
         let request = try prepareStartRequest(with: deviceID)
         let captureID = request.captureID
 
@@ -90,11 +103,11 @@ public final class CameraManager: NSObject, Sendable {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
                 if Task.isCancelled {
                     continuation.resume(throwing: CancellationError())
-                } else {
-                    // Never overwrite a pending continuation without resuming it first
-                    endFirstFrameWait()
-                    firstFrameWaiter = (captureID, continuation)
+                    return
                 }
+                // Never overwrite a pending continuation without resuming it first
+                endFirstFrameWait()
+                firstFrameWaiter = (captureID, continuation)
 
                 enqueueStart(request) { [weak self] result in
                     guard case .failure(let error) = result else { return }
@@ -220,14 +233,34 @@ public final class CameraManager: NSObject, Sendable {
         let input = try AVCaptureDeviceInput(device: camera)
         let captureID = UUID()
 
-        // Reset first-frame tracking and end any stale waiter before queueing start
-        hasDeliveredFirstFrame = false
-        endFirstFrameWait()
-        frameStateLock.withLock {
-            $0 = FrameDeliveryState(activeCaptureID: captureID, firstFrameDelivered: false)
-        }
+        // Pause frame acceptance until the new input is committed on `graph.queue`.
+        beginInputSwitch(captureID: captureID)
 
         return StartRequest(input: input, captureID: captureID)
+    }
+
+    private nonisolated static func attachInputSynchronously(
+        _ request: StartRequest,
+        graph: CameraSessionGraph,
+        frameStateLock: OSAllocatedUnfairLock<FrameDeliveryState>
+    ) throws {
+        try graph.queue.sync {
+            do {
+                try graph.attachInput(request.input, captureID: request.captureID)
+                activateCapture(
+                    captureID: request.captureID,
+                    inputID: ObjectIdentifier(request.input),
+                    in: frameStateLock
+                )
+            } catch {
+                restoreCaptureAfterFailure(
+                    failedCaptureID: request.captureID,
+                    restored: graph.attachedCapture,
+                    in: frameStateLock
+                )
+                throw error
+            }
+        }
     }
 
     private func enqueueStart(
@@ -238,19 +271,98 @@ public final class CameraManager: NSObject, Sendable {
         let frameStateLock = frameStateLock
         graph.queue.async {
             do {
-                try graph.start(with: request.input)
+                try graph.attachInput(request.input, captureID: request.captureID)
+                Self.activateCapture(
+                    captureID: request.captureID,
+                    inputID: ObjectIdentifier(request.input),
+                    in: frameStateLock
+                )
+                graph.startRunningIfAttached(captureID: request.captureID)
                 completion(.success(()))
             } catch {
-                frameStateLock.withLock { state in
-                    if state.activeCaptureID == request.captureID {
-                        state = FrameDeliveryState()
-                    }
-                }
+                Self.restoreCaptureAfterFailure(
+                    failedCaptureID: request.captureID,
+                    restored: graph.attachedCapture,
+                    in: frameStateLock
+                )
                 completion(.failure(error))
             }
         }
     }
     #endif
+
+    /// Disables frame acceptance and clears any previous waiter while switching to `captureID`.
+    func beginInputSwitch(captureID: UUID) {
+        hasDeliveredFirstFrame = false
+        endFirstFrameWait()
+        frameStateLock.withLock {
+            $0 = FrameDeliveryState(
+                pendingCaptureID: captureID,
+                activeCaptureID: nil,
+                activeInput: nil,
+                acceptingFrames: false,
+                firstFrameDelivered: false
+            )
+        }
+    }
+
+    /// Marks `captureID` as committed and accepting frames from `inputID`.
+    nonisolated func commitInputSwitch(captureID: UUID, inputID: ObjectIdentifier?) {
+        Self.activateCapture(captureID: captureID, inputID: inputID, in: frameStateLock)
+    }
+
+    private nonisolated static func activateCapture(
+        captureID: UUID,
+        inputID: ObjectIdentifier?,
+        in frameStateLock: OSAllocatedUnfairLock<FrameDeliveryState>
+    ) {
+        frameStateLock.withLock { state in
+            guard state.pendingCaptureID == captureID else { return }
+            state.activeCaptureID = captureID
+            state.activeInput = inputID
+            state.acceptingFrames = true
+            state.firstFrameDelivered = false
+        }
+    }
+
+    private nonisolated static func restoreCaptureAfterFailure(
+        failedCaptureID: UUID,
+        restored: (input: ObjectIdentifier, captureID: UUID)?,
+        in frameStateLock: OSAllocatedUnfairLock<FrameDeliveryState>
+    ) {
+        frameStateLock.withLock { state in
+            guard state.pendingCaptureID == failedCaptureID else { return }
+            if let restored {
+                state = FrameDeliveryState(
+                    pendingCaptureID: restored.captureID,
+                    activeCaptureID: restored.captureID,
+                    activeInput: restored.input,
+                    acceptingFrames: true,
+                    firstFrameDelivered: true
+                )
+            } else {
+                state = FrameDeliveryState()
+            }
+        }
+    }
+
+    /// Tests: awaits the first accepted frame for `captureID`.
+    func waitForFirstFrameForTesting(captureID: UUID) async throws {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                endFirstFrameWait()
+                firstFrameWaiter = (captureID, continuation)
+            }
+        } onCancel: { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.endFirstFrameWait(of: captureID)
+            }
+        }
+    }
 
     private func endFirstFrameWait(of captureID: UUID? = nil, throwing error: any Error = CancellationError()) {
         guard let waiter = firstFrameWaiter, captureID == nil || waiter.captureID == captureID else { return }
@@ -260,12 +372,41 @@ public final class CameraManager: NSObject, Sendable {
 
     /// Signal that first frame was received (called once per capture)
     private func signalFirstFrame(captureID: UUID) {
-        let isCurrent = frameStateLock.withLock { $0.activeCaptureID == captureID }
+        let isCurrent = frameStateLock.withLock { $0.acceptingFrames && $0.activeCaptureID == captureID }
         guard isCurrent, !hasDeliveredFirstFrame else { return }
         hasDeliveredFirstFrame = true
         guard let waiter = firstFrameWaiter, waiter.captureID == captureID else { return }
         firstFrameWaiter = nil
         waiter.continuation.resume()
+    }
+
+    nonisolated func handleOutputFrame(_ sampleBuffer: CMSampleBuffer, fromInput inputID: ObjectIdentifier?) {
+        let decision: (accept: Bool, firstFrameCaptureID: UUID?) = frameStateLock.withLock { state in
+            guard state.acceptingFrames, let captureID = state.activeCaptureID else {
+                return (false, nil)
+            }
+            if let expectedInput = state.activeInput, let inputID, inputID != expectedInput {
+                return (false, nil)
+            }
+            if !state.firstFrameDelivered {
+                state.firstFrameDelivered = true
+                return (true, captureID)
+            }
+            return (true, nil)
+        }
+
+        guard decision.accept else { return }
+
+        // Forward frame to handler using lock-protected snapshot
+        let handler = onFrameLock.withLock { $0 }
+        handler?(sampleBuffer)
+
+        // Hop to MainActor only once for the first frame of each capture
+        if let captureID = decision.firstFrameCaptureID {
+            Task { @MainActor [weak self] in
+                self?.signalFirstFrame(captureID: captureID)
+            }
+        }
     }
 }
 
@@ -277,24 +418,8 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
-        // Forward frame to handler using lock-protected snapshot
-        let handler = onFrameLock.withLock { $0 }
-        handler?(sampleBuffer)
-
-        // Hop to MainActor only once for the first frame of each capture
-        let firstFrameCaptureID: UUID? = frameStateLock.withLock { state in
-            guard let captureID = state.activeCaptureID, !state.firstFrameDelivered else {
-                return nil
-            }
-            state.firstFrameDelivered = true
-            return captureID
-        }
-
-        if let captureID = firstFrameCaptureID {
-            Task { @MainActor [weak self] in
-                self?.signalFirstFrame(captureID: captureID)
-            }
-        }
+        let inputID = connection.inputPorts.first.map { ObjectIdentifier($0.input) }
+        handleOutputFrame(sampleBuffer, fromInput: inputID)
     }
 }
 
@@ -307,7 +432,12 @@ private final class CameraSessionGraph: @unchecked Sendable {
     let session: AVCaptureSession
 
     private let videoOutput = AVCaptureVideoDataOutput()
-    private var cameraInput: AVCaptureDeviceInput?
+    private var attached: (input: AVCaptureDeviceInput, captureID: UUID)?
+
+    var attachedCapture: (input: ObjectIdentifier, captureID: UUID)? {
+        dispatchPrecondition(condition: .onQueue(queue))
+        return attached.map { (ObjectIdentifier($0.input), $0.captureID) }
+    }
 
     init(session: AVCaptureSession) {
         self.session = session
@@ -341,26 +471,37 @@ private final class CameraSessionGraph: @unchecked Sendable {
         session.commitConfiguration()
     }
 
-    func start(with input: AVCaptureDeviceInput) throws {
+    func attachInput(_ input: AVCaptureDeviceInput, captureID: UUID) throws {
         dispatchPrecondition(condition: .onQueue(queue))
         session.beginConfiguration()
 
-        // Remove existing input and clear reference before checking canAddInput
-        if let existingInput = cameraInput {
-            session.removeInput(existingInput)
-            cameraInput = nil
+        // Swap within one configuration block; restore the previous input if adding the new one fails.
+        let previous = attached
+        if let previous {
+            session.removeInput(previous.input)
         }
 
         guard session.canAddInput(input) else {
+            if let previous, session.canAddInput(previous.input) {
+                session.addInput(previous.input)
+            } else {
+                attached = nil
+            }
             session.commitConfiguration()
             throw RecorderError.cannotAddInput
         }
 
         session.addInput(input)
-        cameraInput = input
+        attached = (input, captureID)
         session.commitConfiguration()
+    }
 
-        session.startRunning()
+    func startRunningIfAttached(captureID: UUID) {
+        dispatchPrecondition(condition: .onQueue(queue))
+        guard attached?.captureID == captureID else { return }
+        if !session.isRunning {
+            session.startRunning()
+        }
     }
 
     func stop() {
@@ -370,9 +511,9 @@ private final class CameraSessionGraph: @unchecked Sendable {
         }
 
         session.beginConfiguration()
-        if let input = cameraInput {
+        if let input = attached?.input {
             session.removeInput(input)
-            cameraInput = nil
+            attached = nil
         }
         session.commitConfiguration()
     }

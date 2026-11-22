@@ -638,28 +638,55 @@ struct LocalHTTPServerPlaybackTests {
         #expect(foundSenc, "Encrypted segment must have senc box")
     }
 
-    @Test("Server handles path traversal attempt safely")
+    @Test("Server handles path traversal, prefix collision, and symlink escape safely")
     func serverPreventsPathTraversal() async throws {
-        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let parentDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("local-http-traversal-\(UUID().uuidString)")
+        let rootName = "content"
+        let contentDir = parentDir.appendingPathComponent(rootName)
+        let siblingEvilDir = parentDir.appendingPathComponent("\(rootName)-evil")
+        try FileManager.default.createDirectory(at: contentDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: siblingEvilDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: parentDir) }
 
-        try "test".write(to: tempDir.appendingPathComponent("test.txt"), atomically: true, encoding: .utf8)
+        let parentSentinel = "PARENT-SENTINEL-SECRET-9f8e7d"
+        let siblingSentinel = "SIBLING-SENTINEL-SECRET-3c2b1a"
+        let parentSecretURL = parentDir.appendingPathComponent("secret.txt")
+        let siblingSecretURL = siblingEvilDir.appendingPathComponent("secret.txt")
+        try parentSentinel.write(to: parentSecretURL, atomically: true, encoding: .utf8)
+        try siblingSentinel.write(to: siblingSecretURL, atomically: true, encoding: .utf8)
 
-        let server = LocalHTTPServer(contentDirectory: tempDir)
+        // Symlink inside contentDirectory pointing outside to parentDir/secret.txt
+        let escapeSymlinkURL = contentDir.appendingPathComponent("escape.txt")
+        try FileManager.default.createSymbolicLink(at: escapeSymlinkURL, withDestinationURL: parentSecretURL)
+
+        try "test".write(to: contentDir.appendingPathComponent("test.txt"), atomically: true, encoding: .utf8)
+
+        let server = LocalHTTPServer(contentDirectory: contentDir)
         _ = try server.start()
         defer { server.stop() }
 
-        // Send a raw percent-encoded traversal request directly over TCP so URLComponents/URLSession
+        // Send raw traversal/prefix-collision/symlink requests directly over TCP so URLComponents/URLSession
         // neither double-encode `%2e` nor collapse `..` segments before they reach the server.
-        let rawRequest = "GET /%2e%2e/%2e%2e/%2e%2e/%2e%2e/etc/passwd HTTP/1.1\r\nHost: 127.0.0.1:\(server.port)\r\nConnection: close\r\n\r\n"
-        let responseText = try await sendRawHTTPRequest(rawRequest, port: server.port)
-        let statusLine = responseText.components(separatedBy: "\r\n").first ?? ""
-        #expect(
-            statusLine.contains(" 403 ") || statusLine.contains(" 404 "),
-            "Path traversal must be blocked with 403 or 404, got: \(statusLine)"
-        )
-        #expect(!responseText.contains("root:"), "Server must never disclose /etc/passwd contents")
+        let attempts: [(label: String, path: String)] = [
+            ("raw dot-dot traversal", "/../secret.txt"),
+            ("percent-encoded dot-dot traversal", "/%2e%2e/secret.txt"),
+            ("prefix-collision sibling traversal", "/../\(rootName)-evil/secret.txt"),
+            ("percent-encoded prefix-collision sibling traversal", "/%2e%2e/\(rootName)-evil/secret.txt"),
+            ("symlink escape", "/escape.txt"),
+        ]
+
+        for attempt in attempts {
+            let rawRequest = "GET \(attempt.path) HTTP/1.1\r\nHost: 127.0.0.1:\(server.port)\r\nConnection: close\r\n\r\n"
+            let responseText = try await sendRawHTTPRequest(rawRequest, port: server.port)
+            let statusLine = responseText.components(separatedBy: "\r\n").first ?? ""
+            #expect(
+                statusLine.contains(" 403 ") || statusLine.contains(" 404 "),
+                "\(attempt.label) must be blocked with 403 or 404, got: \(statusLine)"
+            )
+            #expect(!responseText.contains(parentSentinel), "\(attempt.label) must never disclose parent sentinel")
+            #expect(!responseText.contains(siblingSentinel), "\(attempt.label) must never disclose sibling sentinel")
+        }
     }
 
     private func sendRawHTTPRequest(_ rawRequest: String, port: UInt16) async throws -> String {

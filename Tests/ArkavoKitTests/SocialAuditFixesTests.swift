@@ -391,20 +391,376 @@ final class SocialAuditFixesTests: XCTestCase {
                 "parent": { "$type": "app.bsky.feed.defs#notFoundPost", "uri": "at://did:plc:x/app.bsky.feed.post/1", "notFound": true },
                 "root": { "$type": "app.bsky.feed.defs#blockedPost", "uri": "at://did:plc:x/app.bsky.feed.post/0", "blocked": true }
               }
+            },
+            {
+              "post": {
+                "uri": "at://did:plc:abc/app.bsky.feed.post/456",
+                "cid": "bafy456",
+                "author": { "did": "did:plc:abc", "handle": "alice.bsky.social" },
+                "record": { "text": "reply", "createdAt": "2026-01-01T00:00:02Z" },
+                "likeCount": 7,
+                "repostCount": 3,
+                "indexedAt": "2026-01-01T00:00:03Z"
+              },
+              "reply": {
+                "parent": {
+                  "uri": "at://did:plc:abc/app.bsky.feed.post/123",
+                  "cid": "bafy123",
+                  "author": { "did": "did:plc:abc", "handle": "alice.bsky.social" },
+                  "record": { "text": "hello", "createdAt": "2026-01-01T00:00:00Z" },
+                  "indexedAt": "2026-01-01T00:00:01Z"
+                },
+                "root": {
+                  "uri": "at://did:plc:abc/app.bsky.feed.post/123",
+                  "cid": "bafy123",
+                  "author": { "did": "did:plc:abc", "handle": "alice.bsky.social" },
+                  "record": { "text": "hello", "createdAt": "2026-01-01T00:00:00Z" },
+                  "indexedAt": "2026-01-01T00:00:01Z"
+                }
+              }
             }
           ]
         }
         """
 
         let timeline = try JSONDecoder().decode(TimelineResponse.self, from: Data(json.utf8))
-        XCTAssertEqual(timeline.feed.count, 1)
-        XCTAssertNil(timeline.feed[0].post.likeCount)
-        XCTAssertNil(timeline.feed[0].post.repostCount)
-        XCTAssertNil(timeline.feed[0].reply?.parent)
-        XCTAssertNil(timeline.feed[0].reply?.root)
+        XCTAssertEqual(timeline.feed.count, 2)
+        // Missing counts default to 0 while preserving non-optional Int API for downstream callers.
+        XCTAssertEqual(timeline.feed[0].post.likeCount, 0)
+        XCTAssertEqual(timeline.feed[0].post.repostCount, 0)
+        // Non-post reply unions decode FeedViewPost.reply as nil without failing the timeline.
+        XCTAssertNil(timeline.feed[0].reply)
+        // Valid reply decodes non-optional parent and root.
+        XCTAssertEqual(timeline.feed[1].post.likeCount, 7)
+        XCTAssertEqual(timeline.feed[1].post.repostCount, 3)
+        XCTAssertEqual(timeline.feed[1].reply?.parent.uri, "at://did:plc:abc/app.bsky.feed.post/123")
+        XCTAssertEqual(timeline.feed[1].reply?.root.uri, "at://did:plc:abc/app.bsky.feed.post/123")
+
+        // ProfileViewResponse missing counts also default to 0 as non-optional Int.
+        let profileJSON = #"{"did":"did:plc:abc","handle":"alice.bsky.social"}"#
+        let profile = try JSONDecoder().decode(ProfileViewResponse.self, from: Data(profileJSON.utf8))
+        XCTAssertEqual(profile.followersCount, 0)
+        XCTAssertEqual(profile.followsCount, 0)
+        XCTAssertEqual(profile.postsCount, 0)
+    }
+
+    func testBlueskyCreatePostRequestRejectsMalformedReplyTo() throws {
+        for malformed in ["|", "at://did:plc:alice/app.bsky.feed.post/1", "|bafy123", "at://did:plc:alice/app.bsky.feed.post/1|"] {
+            XCTAssertThrowsError(try CreatePostRequest(did: "did:plc:alice", text: "hello", replyTo: malformed)) { error in
+                XCTAssertTrue(error is BlueskyError, "Expected BlueskyError for malformed replyTo '\(malformed)', got \(error)")
+            }
+        }
+
+        let valid = try CreatePostRequest(
+            did: "did:plc:alice",
+            text: "hello",
+            replyTo: "at://did:plc:alice/app.bsky.feed.post/1|bafy123"
+        )
+        XCTAssertEqual(valid.record.reply?.parent, StrongRef(uri: "at://did:plc:alice/app.bsky.feed.post/1", cid: "bafy123"))
+        XCTAssertEqual(valid.record.reply?.root, StrongRef(uri: "at://did:plc:alice/app.bsky.feed.post/1", cid: "bafy123"))
+    }
+
+    @MainActor
+    func testBlueskyUnlikePostNeverDeletesPostRecordAndResolvesLikeURI() async throws {
+        let myDID = "did:plc:alice"
+        let postWithoutLike = "at://\(myDID)/app.bsky.feed.post/own-post-1"
+        let likedPostURI = "at://\(myDID)/app.bsky.feed.post/post-2"
+        let cachedLikeURI = "at://\(myDID)/app.bsky.feed.like/like-cached"
+        let serverResolvedPostURI = "at://\(myDID)/app.bsky.feed.post/post-3"
+        let serverResolvedLikeURI = "at://\(myDID)/app.bsky.feed.like/like-from-server"
+
+        let mockHTTP = AuditMockBlueskyHTTP { url, _, _ in
+            if url.path.hasSuffix("com.atproto.repo.createRecord") {
+                return Data(#"{"uri":"\#(cachedLikeURI)","cid":"bafylike1"}"#.utf8)
+            }
+            if url.path.hasSuffix("app.bsky.feed.getPosts") {
+                if url.absoluteString.contains("post-3") {
+                    return Data(#"{"posts":[{"uri":"\#(serverResolvedPostURI)","viewer":{"like":"\#(serverResolvedLikeURI)"}}]}"#.utf8)
+                }
+                return Data(#"{"posts":[{"uri":"\#(postWithoutLike)","viewer":{}}]}"#.utf8)
+            }
+            if url.path.hasSuffix("com.atproto.repo.deleteRecord") {
+                return Data("{}".utf8)
+            }
+            throw URLError(.badURL)
+        }
+
+        let client = BlueskyClient(
+            httpClient: mockHTTP,
+            accessTokenProvider: { "access-token" },
+            didProvider: { myDID }
+        )
+
+        // 1. Passing a post URI that has no like record MUST NOT call deleteRecord on the post!
+        await client.unlikePost(uri: postWithoutLike)
+        XCTAssertNotNil(client.error)
+        let deletesAfterUnlikedPost = mockHTTP.recorded.filter { $0.endpoint.hasSuffix("com.atproto.repo.deleteRecord") }
+        XCTAssertTrue(deletesAfterUnlikedPost.isEmpty, "unlikePost must NEVER delete an app.bsky.feed.post record")
+
+        // 2. Passing another user's like URI MUST be refused without calling deleteRecord!
+        await client.unlikePost(uri: "at://did:plc:other/app.bsky.feed.like/foreign-like")
+        XCTAssertNotNil(client.error)
+        XCTAssertTrue(
+            mockHTTP.recorded.filter { $0.endpoint.hasSuffix("com.atproto.repo.deleteRecord") }.isEmpty,
+            "unlikePost must NEVER delete a like record owned by another DID"
+        )
+
+        // 3. likePost caches the created like URI; unlikePost(postURI) deletes ONLY app.bsky.feed.like/like-cached.
+        await client.likePost(uri: likedPostURI, cid: "bafypost2")
+        XCTAssertNil(client.error)
+        await client.unlikePost(uri: likedPostURI)
+        XCTAssertNil(client.error)
+
+        // 4. Uncached post URI resolves viewer.like via getPosts and deletes ONLY app.bsky.feed.like/like-from-server.
+        await client.unlikePost(uri: serverResolvedPostURI)
+        XCTAssertNil(client.error)
+
+        let deleteRequests = mockHTTP.recorded.filter { $0.endpoint.hasSuffix("com.atproto.repo.deleteRecord") }
+        XCTAssertEqual(deleteRequests.count, 2)
+        let decodedBodies = try deleteRequests.map { req -> [String: String] in
+            let bodyData = try XCTUnwrap(req.bodyData)
+            return try JSONDecoder().decode([String: String].self, from: bodyData)
+        }
+        for payload in decodedBodies {
+            XCTAssertEqual(payload["collection"], "app.bsky.feed.like", "Expected like collection, got \(payload)")
+            XCTAssertEqual(payload["repo"], myDID, "Expected current user's DID, got \(payload)")
+        }
+        XCTAssertEqual(decodedBodies[0]["rkey"], "like-cached")
+        XCTAssertEqual(decodedBodies[1]["rkey"], "like-from-server")
+    }
+
+    func testYouTubeModerationEventAndHiddenSubscribersDecodeNonOptionalDefaults() throws {
+        let chatJSON = """
+        {
+          "items": [
+            {
+              "id": "msg-mod-1",
+              "snippet": {
+                "type": "messageDeletedEvent",
+                "publishedAt": "2026-01-01T00:00:00Z"
+              },
+              "authorDetails": {
+                "channelId": "UC123",
+                "displayName": "Mod",
+                "isChatOwner": false,
+                "isChatModerator": true,
+                "isChatSponsor": false
+              }
+            }
+          ]
+        }
+        """
+        let chatResponse = try JSONDecoder().decode(YouTubeLiveChatResponse.self, from: Data(chatJSON.utf8))
+        XCTAssertEqual(chatResponse.items.count, 1)
+        let displayMessage: String = chatResponse.items[0].snippet.displayMessage
+        XCTAssertEqual(displayMessage, "")
+
+        let channelJSON = """
+        {
+          "items": [
+            {
+              "id": "UC123",
+              "snippet": {
+                "title": "Hidden Subs Channel",
+                "description": "desc",
+                "thumbnails": { "default": { "url": "https://example.com/thumb.png" } }
+              },
+              "statistics": {
+                "viewCount": "42",
+                "videoCount": "3"
+              }
+            }
+          ]
+        }
+        """
+        let channelResponse = try JSONDecoder().decode(YouTubeChannelResponse.self, from: Data(channelJSON.utf8))
+        XCTAssertEqual(channelResponse.items.count, 1)
+        let subscriberCount: String = channelResponse.items[0].statistics.subscriberCount
+        XCTAssertEqual(subscriberCount, "0")
+    }
+
+    @MainActor
+    func testYouTubeFetchChannelInfoDoesNotRestoreAfterLogout() async throws {
+        let store = AuditMemoryYouTubeStore()
+        store.save("access-1", for: "access_token")
+        store.save("refresh-1", for: "refresh_token")
+        store.save(ISO8601DateFormatter().string(from: Date().addingTimeInterval(3600)), for: "token_expiration")
+
+        let (arrivedStream, arrivedCont) = AsyncStream.makeStream(of: Void.self)
+        let (replyStream, replyCont) = AsyncStream.makeStream(of: Void.self)
+
+        let client = YouTubeClient(
+            clientId: "client",
+            clientSecret: "secret",
+            store: store,
+            send: { request in
+                arrivedCont.yield()
+                for await _ in replyStream { break }
+                let body = """
+                {
+                  "items": [
+                    {
+                      "id": "UC-LOGOUT-TEST",
+                      "snippet": {
+                        "title": "Stale Channel",
+                        "description": "desc",
+                        "thumbnails": { "default": { "url": "https://example.com/a.png" } }
+                      },
+                      "statistics": {
+                        "viewCount": "10",
+                        "subscriberCount": "5",
+                        "videoCount": "1"
+                      }
+                    }
+                  ]
+                }
+                """
+                let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+                return (Data(body.utf8), resp)
+            }
+        )
+
+        let fetchTask = Task {
+            await client.fetchChannelInfo()
+        }
+
+        for await _ in arrivedStream { break }
+        client.logout()
+        replyCont.yield()
+
+        await fetchTask.value
+        XCTAssertNil(client.channelInfo, "Stale fetchChannelInfo must not publish channelInfo after logout")
+        XCTAssertNil(store.value(for: "channel_id"), "Stale fetchChannelInfo must not write channel_id after logout")
+    }
+
+    @MainActor
+    func testYouTubeExchangeCodeForTokensThrowsCancellationErrorAfterLogout() async throws {
+        let store = AuditMemoryYouTubeStore()
+        let (arrivedStream, arrivedCont) = AsyncStream.makeStream(of: Void.self)
+        let (replyStream, replyCont) = AsyncStream.makeStream(of: Void.self)
+
+        let client = YouTubeClient(
+            clientId: "client",
+            clientSecret: "secret",
+            store: store,
+            send: { request in
+                arrivedCont.yield()
+                for await _ in replyStream { break }
+                let body = #"{"access_token":"a1","expires_in":3600,"refresh_token":"r1","scope":"s","token_type":"Bearer"}"#
+                let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+                return (Data(body.utf8), resp)
+            }
+        )
+        await client.setRedirectUriForTesting("http://127.0.0.1:8080")
+
+        let exchangeTask = Task {
+            try await client.exchangeCodeForTokens("code-1")
+        }
+
+        for await _ in arrivedStream { break }
+        client.logout()
+        replyCont.yield()
+
+        do {
+            try await exchangeTask.value
+            XCTFail("Expected CancellationError when logout occurs during exchangeCodeForTokens")
+        } catch is CancellationError {
+            // expected
+        }
+        XCTAssertNil(store.value(for: "access_token"))
+    }
+
+    #if os(macOS)
+    func testOAuthCallbackServerRejectsErrorWithoutValidState() async throws {
+        let server = OAuthCallbackServer()
+        let port = try server.startListening(state: "expected-csrf-state")
+        defer { server.stop() }
+
+        let waitTask = Task {
+            try await server.waitForCallback(timeout: 5)
+        }
+
+        let response = try await Self.sendRawHTTP(
+            chunks: ["GET /?error=access_denied&error_description=attacker_injected_text HTTP/1.1\r\nHost: 127.0.0.1:\(port)\r\nConnection: close\r\n\r\n"],
+            port: port
+        )
+        XCTAssertTrue(response.hasPrefix("HTTP/1.1 400"), "Expected 400 for error callback without valid state")
+        XCTAssertFalse(response.contains("attacker_injected_text"), "Unauthenticated error text must not be reflected")
+
+        do {
+            _ = try await waitTask.value
+            XCTFail("Error callback without valid state must fail with stateMismatch")
+        } catch OAuthCallbackServer.OAuthError.stateMismatch {
+            // expected
+        } catch {
+            XCTFail("Expected OAuthError.stateMismatch, got \(error)")
+        }
+    }
+    #endif
+
+    @MainActor
+    func testRedditAndMicropubAuthURLReusePendingStateUntilLogout() throws {
+        func stateQueryValue(from url: URL) -> String? {
+            URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?
+                .first(where: { $0.name == "state" })?
+                .value
+        }
+
+        let reddit = RedditClient(clientId: "reddit-client")
+        let redditState1 = try XCTUnwrap(stateQueryValue(from: reddit.authURL))
+        let redditState2 = try XCTUnwrap(stateQueryValue(from: reddit.authURL))
+        XCTAssertFalse(redditState1.isEmpty)
+        XCTAssertEqual(redditState1, redditState2, "Repeated Reddit authURL reads must reuse pendingOAuthState")
+        reddit.logout()
+        let redditState3 = try XCTUnwrap(stateQueryValue(from: reddit.authURL))
+        XCTAssertNotEqual(redditState1, redditState3, "logout() must invalidate pendingOAuthState")
+
+        let micropub = MicropubClient(clientId: "micropub-client")
+        let micropubState1 = try XCTUnwrap(stateQueryValue(from: micropub.authURL))
+        let micropubState2 = try XCTUnwrap(stateQueryValue(from: micropub.authURL))
+        XCTAssertFalse(micropubState1.isEmpty)
+        XCTAssertEqual(micropubState1, micropubState2, "Repeated Micropub authURL reads must reuse pendingOAuthState")
+        micropub.logout()
+        let micropubState3 = try XCTUnwrap(stateQueryValue(from: micropub.authURL))
+        XCTAssertNotEqual(micropubState1, micropubState3, "logout() must invalidate pendingOAuthState")
     }
 
     // MARK: - Helpers
+
+    private struct AuditRecordedBlueskyRequest: Sendable {
+        let endpoint: String
+        let method: String
+        let bodyData: Data?
+    }
+
+    private final class AuditMockBlueskyHTTP: HTTPClient, Sendable {
+        private let lock = Mutex<[AuditRecordedBlueskyRequest]>([])
+        private let handler: @Sendable (URL, String, Data?) throws -> Data
+
+        init(handler: @escaping @Sendable (URL, String, Data?) throws -> Data) {
+            self.handler = handler
+        }
+
+        var recorded: [AuditRecordedBlueskyRequest] { lock.withLock { $0 } }
+
+        func sendRequest<T: Decodable & Sendable>(
+            _ url: URL,
+            method: String,
+            body: (any Encodable & Sendable)?,
+            headers _: [String: String]
+        ) async throws -> T {
+            let bodyData = try body.map { try JSONEncoder().encode($0) }
+            lock.withLock {
+                $0.append(AuditRecordedBlueskyRequest(endpoint: url.path, method: method, bodyData: bodyData))
+            }
+            let data = try handler(url, method, bodyData)
+            if data.isEmpty, let empty = try? JSONDecoder().decode(T.self, from: Data("{}".utf8)) {
+                return empty
+            }
+            return try JSONDecoder().decode(T.self, from: data)
+        }
+    }
 
     private final class AuditMemoryYouTubeStore: YouTubeSessionStore {
         private let storage = Mutex<[String: String]>([:])

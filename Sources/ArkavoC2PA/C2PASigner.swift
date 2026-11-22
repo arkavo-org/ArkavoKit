@@ -42,7 +42,7 @@ public actor C2PASigner {
         }
     }
 
-    public init(signingMode: SigningMode) throws {
+    public init(signingMode: SigningMode = .selfSigned) throws {
         switch signingMode {
         case .pemFiles(let certPEM, let keyPEM):
             guard !certPEM.isEmpty, !keyPEM.isEmpty else {

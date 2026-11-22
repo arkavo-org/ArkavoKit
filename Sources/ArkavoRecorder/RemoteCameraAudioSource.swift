@@ -35,6 +35,7 @@ public final class RemoteCameraAudioSource: AudioSource, @unchecked Sendable {
     private let state: OSAllocatedUnfairLock<SharedState>
 
     private static let validChannelRange = 1...8
+    private static let validSampleRateRange: ClosedRange<Double> = 8_000...192_000
 
     // MARK: - Initialization
 
@@ -87,7 +88,7 @@ public final class RemoteCameraAudioSource: AudioSource, @unchecked Sendable {
 
         // Validate untrusted network fields before integer casts or frame math
         guard Self.validChannelRange.contains(payload.channels),
-              payload.sampleRate.isFinite, payload.sampleRate > 0,
+              payload.sampleRate.isFinite, Self.validSampleRateRange.contains(payload.sampleRate),
               payload.timestamp.isFinite,
               !payload.audioData.isEmpty
         else {
@@ -148,7 +149,7 @@ public final class RemoteCameraAudioSource: AudioSource, @unchecked Sendable {
     // MARK: - Private Methods
 
     private func createFormatDescription(for format: AudioFormat) -> CMAudioFormatDescription? {
-        guard format.sampleRate.isFinite, format.sampleRate > 0,
+        guard format.sampleRate.isFinite, Self.validSampleRateRange.contains(format.sampleRate),
               format.channels >= 1, format.channels <= UInt32(Self.validChannelRange.upperBound),
               format.bitDepth >= 8
         else {

@@ -4,6 +4,7 @@ import CoreImage
 import CoreMedia
 import CoreVideo
 import Foundation
+import os
 import Testing
 @testable import ArkavoRecorder
 
@@ -294,6 +295,109 @@ struct RecorderVideoAuditFixesTests {
         #expect(bluePixel.b > 200 && bluePixel.r < 40, "Expected blue overlay corner after gradient change, got \(bluePixel)")
     }
     #endif
+
+    // MARK: - PR #88 Review Fixes: Concurrent stream startup & CameraManager input-switch gating
+
+    @Test("VideoEncoder concurrent startStreaming propagates failure to joiners instead of silently succeeding")
+    func videoEncoderConcurrentStartStreamingPropagatesFailureToJoiners() async throws {
+        let encoder = VideoEncoder(quality: .performance)
+        let hookState = OSAllocatedUnfairLock(initialState: (entered: false, release: false))
+        await encoder.setStreamStartHookForTesting {
+            hookState.withLock { $0.entered = true }
+            while !hookState.withLock({ $0.release }) {
+                try? await Task.sleep(for: .milliseconds(5))
+            }
+        }
+
+        let first = Task {
+            try await encoder.startStreaming(to: [])
+        }
+
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !hookState.withLock({ $0.entered }) && .now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(hookState.withLock { $0.entered })
+
+        let secondFinished = OSAllocatedUnfairLock(initialState: false)
+        let second = Task {
+            defer { secondFinished.withLock { $0 = true } }
+            try await encoder.startStreaming(to: [])
+        }
+
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(!secondFinished.withLock { $0 }, "Concurrent joiner must wait for in-flight start rather than returning early")
+
+        hookState.withLock { $0.release = true }
+
+        await #expect(throws: VideoEncoder.StreamingError.self) {
+            try await first.value
+        }
+        await #expect(throws: VideoEncoder.StreamingError.self) {
+            try await second.value
+        }
+        let streamingActive = await encoder.isStreamingActive
+        #expect(!streamingActive)
+    }
+
+    @Test("CameraManager ignores stale frames received before input switch completes")
+    @MainActor
+    func cameraManagerIgnoresFramesUntilInputSwitchCompletes() async throws {
+        let manager = CameraManager()
+        let deliveredCount = OSAllocatedUnfairLock(initialState: 0)
+        manager.onFrame = { _ in
+            deliveredCount.withLock { $0 += 1 }
+        }
+
+        let pixel = try #require(Self.makePixelBuffer(width: 64, height: 64, r: 0, g: 255, b: 0))
+        let sample = try #require(Self.makeVideoSampleBuffer(from: pixel))
+
+        let oldInputToken = NSObject()
+        let newInputToken = NSObject()
+        let oldInputID = ObjectIdentifier(oldInputToken)
+        let newInputID = ObjectIdentifier(newInputToken)
+
+        // Establish initial active capture A
+        let captureA = UUID()
+        manager.beginInputSwitch(captureID: captureA)
+        manager.commitInputSwitch(captureID: captureA, inputID: oldInputID)
+        manager.handleOutputFrame(sample, fromInput: oldInputID)
+        #expect(deliveredCount.withLock { $0 } == 1)
+
+        // Begin switching to capture B and await its first frame
+        let captureB = UUID()
+        manager.beginInputSwitch(captureID: captureB)
+
+        let firstFrameReceived = OSAllocatedUnfairLock(initialState: false)
+        let waitTask = Task { @MainActor in
+            try await manager.waitForFirstFrameForTesting(captureID: captureB)
+            firstFrameReceived.withLock { $0 = true }
+        }
+        await Task.yield()
+
+        // Stale frames received before commitConfiguration must be ignored
+        manager.handleOutputFrame(sample, fromInput: oldInputID)
+        manager.handleOutputFrame(sample, fromInput: newInputID)
+        try await Task.sleep(for: .milliseconds(30))
+        #expect(deliveredCount.withLock { $0 } == 1)
+        #expect(!firstFrameReceived.withLock { $0 })
+
+        // Commit input switch to capture B
+        manager.commitInputSwitch(captureID: captureB, inputID: newInputID)
+
+        // Late frame from the old input after commit must still be ignored
+        manager.handleOutputFrame(sample, fromInput: oldInputID)
+        try await Task.sleep(for: .milliseconds(30))
+        #expect(deliveredCount.withLock { $0 } == 1)
+        #expect(!firstFrameReceived.withLock { $0 })
+
+        // Frame from the new committed input is delivered and satisfies first-frame wait
+        manager.handleOutputFrame(sample, fromInput: newInputID)
+        try await waitTask.value
+        #expect(deliveredCount.withLock { $0 } == 2)
+        #expect(firstFrameReceived.withLock { $0 })
+        _ = (oldInputToken, newInputToken)
+    }
 
     // MARK: - Helpers
 

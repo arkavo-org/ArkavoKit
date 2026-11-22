@@ -101,11 +101,23 @@ public final class ArkavoClient: NSObject {
     private var primaryMessageHandlerIDs: [UInt8: UUID] = [:]
     private var queuedMessageHandlers: [UInt8: [QueuedMessageWaiter]] = [:]
     private var decryptTail: Task<Void, Never>?
+    private var disconnectGeneration: UInt64 = 0
     private let profileCache = ProfileCache(capacity: 100)
 
     private struct QueuedMessageWaiter {
         let id: UUID
         let continuation: CheckedContinuation<Data, Error>
+    }
+
+    @MainActor
+    private final class WaiterSendState {
+        var initiated = false
+        var sendTask: Task<Void, Never>?
+        weak var socket: URLSessionWebSocketTask?
+
+        init(socket: URLSessionWebSocketTask) {
+            self.socket = socket
+        }
     }
 
     private enum KASPublicKey {
@@ -362,8 +374,9 @@ public final class ArkavoClient: NSObject {
             // OK to proceed
             break
         case .error:
-            // First disconnect if we're in error state
-            await disconnect()
+            // Tear down the failed socket/session WITHOUT wiping the cached auth token
+            // so transient network drops can reconnect using the cached session.
+            tearDownConnection(error: ArkavoError.connectionFailed("Reconnecting after error"))
         case .connected:
             let handle = KeychainManager.getArkavoHandle()
             if Self.keepsConnectedSession(token: KeychainManager.getAuthenticationToken(), handle: handle, account: account),
@@ -380,6 +393,8 @@ public final class ArkavoClient: NSObject {
             throw ArkavoError.invalidState
         }
 
+        let gen = disconnectGeneration
+
         // Fast path: try the cached CWT before running the passkey ceremony.
         // Server is authoritative — if the handshake succeeds, we skip the
         // WebAuthn ceremony entirely. If it fails for any reason (expired,
@@ -392,27 +407,40 @@ public final class ArkavoClient: NSObject {
             do {
                 currentState = .connecting
                 try await openAndWaitForWebSocketConnection()
+                guard disconnectGeneration == gen else {
+                    tearDownConnection(error: ArkavoError.connectionFailed("Connection disconnected"))
+                    throw ArkavoError.connectionFailed("Connection disconnected")
+                }
                 try await sendInitialMessages()
+                guard disconnectGeneration == gen else {
+                    tearDownConnection(error: ArkavoError.connectionFailed("Connection disconnected"))
+                    throw ArkavoError.connectionFailed("Connection disconnected")
+                }
                 return cachedHandle
             } catch {
+                guard disconnectGeneration == gen else {
+                    throw ArkavoError.connectionFailed("Connection disconnected")
+                }
                 print("ArkavoClient: cached token rejected (\(error)); falling back to passkey ceremony")
                 KeychainManager.deleteAuthenticationToken()
-                webSocket?.cancel()
-                webSocket = nil
-                session?.invalidateAndCancel()
-                session = nil
-                failPendingWaiters(ArkavoError.connectionFailed("Cached session handshake failed"))
-                currentState = .disconnected
+                tearDownConnection(error: ArkavoError.connectionFailed("Cached session handshake failed"))
             }
         } else if cachedToken != nil {
             print("ArkavoClient: cached token does not fit this sign-in; dropping it")
             KeychainManager.deleteAuthenticationToken()
         }
 
+        guard disconnectGeneration == gen else {
+            throw ArkavoError.connectionFailed("Connection disconnected")
+        }
+
         do {
             // First authenticate
             currentState = .authenticating
             let reply = try await passkeyCeremony(account: account)
+            guard disconnectGeneration == gen else {
+                throw ArkavoError.connectionFailed("Connection disconnected")
+            }
             // The handle first: should the token's write fail, no token is left
             // beside a stale handle, so the next connect runs the ceremony.
             try KeychainManager.saveArkavoHandle(reply.handle)
@@ -420,14 +448,28 @@ public final class ArkavoClient: NSObject {
             // Within the 300 s the token can open a session. A failed open is
             // only no session: the sign-in goes on.
             await passkeySessions.open(token: reply.token, via: passkeySessionEndpoint)
+            guard disconnectGeneration == gen else {
+                throw ArkavoError.connectionFailed("Connection disconnected")
+            }
 
             // Then establish WebSocket connection
             currentState = .connecting
             try await openAndWaitForWebSocketConnection()
+            guard disconnectGeneration == gen else {
+                tearDownConnection(error: ArkavoError.connectionFailed("Connection disconnected"))
+                throw ArkavoError.connectionFailed("Connection disconnected")
+            }
             // swap keys
             try await sendInitialMessages()
+            guard disconnectGeneration == gen else {
+                tearDownConnection(error: ArkavoError.connectionFailed("Connection disconnected"))
+                throw ArkavoError.connectionFailed("Connection disconnected")
+            }
             return reply.handle
         } catch {
+            guard disconnectGeneration == gen else {
+                throw ArkavoError.connectionFailed("Connection disconnected")
+            }
             print("connect error: \(error)")
             if let kcError = error as? KeychainManager.KeychainError {
                 switch kcError {
@@ -466,6 +508,7 @@ public final class ArkavoClient: NSObject {
 
         let timeoutTask = Task { @MainActor [weak self] in
             try await Task.sleep(nanoseconds: 10_000_000_000) // 10 seconds
+            guard !Task.isCancelled else { return }
             guard let self, let continuation = self.connectionContinuation else { return }
             self.connectionContinuation = nil
             let timeoutError = ArkavoError.connectionFailed("Connection timeout")
@@ -504,8 +547,15 @@ public final class ArkavoClient: NSObject {
         }
     }
 
-    public func disconnect() async {
-        guard currentState != .disconnected || webSocket != nil || session != nil else { return }
+    /// Closes the socket/session and fails pending waiters WITHOUT touching the Keychain auth token.
+    func tearDownConnection(error: Error = ArkavoError.connectionFailed("Connection disconnected")) {
+        guard currentState != .disconnected
+            || webSocket != nil
+            || session != nil
+            || connectionContinuation != nil
+            || !messageHandlers.isEmpty
+            || !queuedMessageHandlers.isEmpty
+        else { return }
 
         currentState = .disconnected
         webSocket?.cancel()
@@ -513,7 +563,20 @@ public final class ArkavoClient: NSObject {
         session?.invalidateAndCancel()
         session = nil
         // The cancelled socket's callbacks are ignored, so nothing else fails these.
-        failPendingWaiters(ArkavoError.connectionFailed("Connection disconnected"))
+        failPendingWaiters(error)
+    }
+
+    public func disconnect() async {
+        disconnectGeneration &+= 1
+        guard currentState != .disconnected
+            || webSocket != nil
+            || session != nil
+            || connectionContinuation != nil
+            || !messageHandlers.isEmpty
+            || !queuedMessageHandlers.isEmpty
+        else { return }
+
+        tearDownConnection(error: ArkavoError.connectionFailed("Connection disconnected"))
         KeychainManager.deleteAuthenticationToken()
     }
 
@@ -761,7 +824,8 @@ public final class ArkavoClient: NSObject {
         return primary
     }
 
-    private func cancelMessageWaiter(type: UInt8, id: UUID, error: Error) {
+    @discardableResult
+    private func cancelMessageWaiter(type: UInt8, id: UUID, error: Error) -> Bool {
         if primaryMessageHandlerIDs[type] == id,
            let continuation = messageHandlers.removeValue(forKey: type)
         {
@@ -777,7 +841,7 @@ public final class ArkavoClient: NSObject {
                 }
             }
             continuation.resume(throwing: error)
-            return
+            return true
         }
         if var queue = queuedMessageHandlers[type],
            let idx = queue.firstIndex(where: { $0.id == id })
@@ -789,7 +853,9 @@ public final class ArkavoClient: NSObject {
                 queuedMessageHandlers[type] = queue
             }
             waiter.continuation.resume(throwing: error)
+            return true
         }
+        return false
     }
 
     /// What the server said about a deletion, and the token it said it to.
@@ -904,6 +970,7 @@ public final class ArkavoClient: NSObject {
 
         let timeoutTask = Task { @MainActor [weak self] in
             try await Task.sleep(nanoseconds: timeoutNanos)
+            guard !Task.isCancelled else { return }
             self?.cancelMessageWaiter(
                 type: rawType,
                 id: waiterID,
@@ -927,7 +994,7 @@ public final class ArkavoClient: NSObject {
         }
     }
 
-    private func sendAndWaitForMessage(
+    func sendAndWaitForMessage(
         _ data: Data,
         responseType: ArkavoMessageType,
         requireConnected: Bool = false,
@@ -943,19 +1010,27 @@ public final class ArkavoClient: NSObject {
         let waiterID = UUID()
         let rawResponseType = responseType.rawValue
         let timeoutNanos = UInt64(max(0.1, timeoutSeconds) * 1_000_000_000)
+        let sendState = WaiterSendState(socket: webSocket)
 
         let timeoutTask = Task { @MainActor [weak self] in
             try await Task.sleep(nanoseconds: timeoutNanos)
-            self?.cancelMessageWaiter(
+            guard !Task.isCancelled else { return }
+            sendState.sendTask?.cancel()
+            guard let self else { return }
+            let timeoutError = ArkavoError.connectionFailed("Timed out waiting for message type 0x\(String(format: "%02X", rawResponseType))")
+            let cancelled = self.cancelMessageWaiter(
                 type: rawResponseType,
                 id: waiterID,
-                error: ArkavoError.connectionFailed("Timed out waiting for message type 0x\(String(format: "%02X", rawResponseType))")
+                error: timeoutError
             )
+            // If a request was already sent on this socket and timed out, tear down the socket
+            // so a late in-flight response (e.g. 0x04) can never satisfy a subsequent waiter.
+            if cancelled, sendState.initiated, let socket = sendState.socket, self.webSocket === socket {
+                self.tearDownConnection(error: timeoutError)
+            }
         }
         defer { timeoutTask.cancel() }
-
-        var sendTask: Task<Void, Never>?
-        defer { sendTask?.cancel() }
+        defer { sendState.sendTask?.cancel() }
 
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
@@ -966,17 +1041,27 @@ public final class ArkavoClient: NSObject {
                 // Register waiter synchronously on @MainActor BEFORE sending to eliminate send-before-register races.
                 self.enqueueMessageWaiter(type: rawResponseType, id: waiterID, continuation: continuation)
 
-                sendTask = Task { @MainActor [weak self] in
+                sendState.sendTask = Task { @MainActor [weak self] in
+                    guard !Task.isCancelled else { return }
+                    guard let self, let socket = sendState.socket, self.webSocket === socket else { return }
+                    sendState.initiated = true
                     do {
-                        try await webSocket.send(.data(data))
+                        try await socket.send(.data(data))
                     } catch {
-                        self?.cancelMessageWaiter(type: rawResponseType, id: waiterID, error: error)
+                        self.cancelMessageWaiter(type: rawResponseType, id: waiterID, error: error)
                     }
                 }
             }
         } onCancel: {
             Task { @MainActor [weak self] in
-                self?.cancelMessageWaiter(type: rawResponseType, id: waiterID, error: CancellationError())
+                sendState.sendTask?.cancel()
+                guard let self else { return }
+                let cancelled = self.cancelMessageWaiter(type: rawResponseType, id: waiterID, error: CancellationError())
+                // If a request was already sent on this socket and cancelled, tear down the socket
+                // so a late in-flight response can never satisfy the next waiter.
+                if cancelled, sendState.initiated, let socket = sendState.socket, self.webSocket === socket {
+                    self.tearDownConnection(error: CancellationError())
+                }
             }
         }
     }
@@ -987,6 +1072,7 @@ public final class ArkavoClient: NSObject {
             print("Error: WebSocket is nil")
             throw ArkavoError.notConnected
         }
+        let gen = disconnectGeneration
 
         // Create key pair for the selected curve
         print("Creating key pair for curve: \(curve)")
@@ -1008,7 +1094,9 @@ public final class ArkavoClient: NSObject {
             print("Shared secret established: \(sharedSecret != nil)")
         } catch {
             print("Error handling public key response: \(error)")
-            currentState = .error(error)
+            if disconnectGeneration == gen {
+                currentState = .error(error)
+            }
             throw error
         }
 
@@ -1024,7 +1112,9 @@ public final class ArkavoClient: NSObject {
             print("Successfully processed KAS key response")
         } catch {
             print("Error handling KAS key response: \(error)")
-            currentState = .error(error)
+            if disconnectGeneration == gen {
+                currentState = .error(error)
+            }
             throw error
         }
 

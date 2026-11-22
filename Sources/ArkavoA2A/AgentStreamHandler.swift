@@ -24,7 +24,7 @@ public final class AgentStreamHandler: ObservableObject, AgentNotificationHandle
     private let sessionId: String
     private let connection: AgentConnection
     private var lastSequence: Int = 0
-    private var subscriptionId: String?
+    private var subscriptionId: AnyCodable?
 
     // Accumulated tool calls
     private var toolCalls: [String: ToolCallAccumulator] = [:]
@@ -66,7 +66,7 @@ public final class AgentStreamHandler: ObservableObject, AgentNotificationHandle
                 arrayParams: [sessionId]
             )
         } catch {
-            await connection.setNotificationHandler(nil)
+            await connection.clearNotificationHandler(ifMatching: self)
             isStreaming = false
             throw error
         }
@@ -74,7 +74,7 @@ public final class AgentStreamHandler: ObservableObject, AgentNotificationHandle
         print("[AgentStreamHandler] Got subscription response: \(response)")
 
         guard case .success(_, let result) = response else {
-            await connection.setNotificationHandler(nil)
+            await connection.clearNotificationHandler(ifMatching: self)
             isStreaming = false
             if case .error(_, let code, let message) = response {
                 print("[AgentStreamHandler] ERROR: Subscription failed: \(code) - \(message)")
@@ -84,32 +84,10 @@ public final class AgentStreamHandler: ObservableObject, AgentNotificationHandle
             throw AgentError.invalidResponse("Failed to subscribe to chat stream")
         }
 
-        // Extract subscription ID from string, int, or dictionary result
-        if let subId = result.value as? String {
+        // Extract subscription ID preserving Int vs String JSON type
+        if let subId = AgentChatSessionManager.extractSubscriptionId(from: result) {
             subscriptionId = subId
-            print("[AgentStreamHandler] Subscribed with ID: \(subId)")
-        } else if let subInt = result.value as? Int {
-            let subId = String(subInt)
-            subscriptionId = subId
-            print("[AgentStreamHandler] Subscribed with ID: \(subId)")
-        } else if let subDict = result.value as? [String: Any] {
-            if let subId = subDict["subscription"] as? String {
-                subscriptionId = subId
-                print("[AgentStreamHandler] Subscribed with ID: \(subId)")
-            } else if let subInt = subDict["subscription"] as? Int {
-                let subId = String(subInt)
-                subscriptionId = subId
-                print("[AgentStreamHandler] Subscribed with ID: \(subId)")
-            } else if let subId = subDict["subscription_id"] as? String {
-                subscriptionId = subId
-                print("[AgentStreamHandler] Subscribed with ID: \(subId)")
-            } else if let subInt = subDict["subscription_id"] as? Int {
-                let subId = String(subInt)
-                subscriptionId = subId
-                print("[AgentStreamHandler] Subscribed with ID: \(subId)")
-            } else {
-                print("[AgentStreamHandler] WARNING: No subscription ID in response")
-            }
+            print("[AgentStreamHandler] Subscribed with ID: \(subId.value)")
         } else {
             print("[AgentStreamHandler] WARNING: No subscription ID in response")
         }
@@ -129,13 +107,14 @@ public final class AgentStreamHandler: ObservableObject, AgentNotificationHandle
         ackTask = nil
 
         if let currentSubId {
+            nonisolated(unsafe) let unsubscribeParams: [Any] = [currentSubId.value]
             _ = try? await connection.call(
                 method: "chat_stream_unsubscribe",
-                arrayParams: [currentSubId]
+                arrayParams: unsubscribeParams
             )
         }
 
-        await connection.setNotificationHandler(nil)
+        await connection.clearNotificationHandler(ifMatching: self)
     }
 
     // MARK: - Notification Handling

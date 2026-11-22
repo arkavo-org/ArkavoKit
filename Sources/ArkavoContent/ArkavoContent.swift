@@ -1,13 +1,14 @@
 import AVFoundation
 import CoreImage
 import CoreML
+import os
 import Vision
 
 public class VideoClassificationProcessor {
     // MARK: - Properties
 
-    private var videoURL: URL
-    private var classificationRequest: VNCoreMLRequest?
+    private let videoURL: URL
+    private let modelLock = OSAllocatedUnfairLock<VNCoreMLModel?>(uncheckedState: nil)
 
     // MARK: - Types
 
@@ -45,8 +46,7 @@ public class VideoClassificationProcessor {
 
         do {
             let model = try VNCoreMLModel(for: MLModel(contentsOf: modelURL))
-            classificationRequest = VNCoreMLRequest(model: model)
-            classificationRequest?.imageCropAndScaleOption = .centerCrop
+            modelLock.withLockUnchecked { $0 = model }
         } catch {
             throw VideoProcessingError.modelLoadError
         }
@@ -56,9 +56,11 @@ public class VideoClassificationProcessor {
         guard frameInterval > 0, frameInterval <= Int(Int32.max) else {
             throw VideoProcessingError.processingError("frameInterval must be between 1 and \(Int32.max)")
         }
-        guard let request = classificationRequest else {
+        guard let model = modelLock.withLockUnchecked({ $0 }) else {
             throw VideoProcessingError.modelLoadError
         }
+        let request = VNCoreMLRequest(model: model)
+        request.imageCropAndScaleOption = .centerCrop
 
         let asset = AVURLAsset(url: videoURL)
         let duration: CMTime

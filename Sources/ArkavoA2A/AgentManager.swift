@@ -109,7 +109,14 @@ public final class AgentManager: ObservableObject {
             }
         } catch {
             if connections[agent.id] === connection {
-                statuses[agent.id] = .failed(reason: error.localizedDescription)
+                if autoReconnect {
+                    statuses[agent.id] = .reconnecting(attempt: 1)
+                    await connection.startWithReconnection(afterInitialFailure: true)
+                } else {
+                    connections.removeValue(forKey: agent.id)
+                    manualAgentIds.remove(agent.id)
+                    statuses[agent.id] = .failed(reason: error.localizedDescription)
+                }
             }
             throw error
         }
@@ -180,7 +187,15 @@ public final class AgentManager: ObservableObject {
                     // So all agents here are remote and need WebSocket connections
                     if self.autoConnect {
                         for agent in discoveredAgents {
+                            let shouldConnect: Bool
                             if self.connections[agent.id] == nil {
+                                shouldConnect = true
+                            } else if case .failed? = self.statuses[agent.id] {
+                                shouldConnect = true
+                            } else {
+                                shouldConnect = false
+                            }
+                            if shouldConnect {
                                 print("Auto-connecting to discovered agent: \(agent.id)")
                                 try? await self.connect(to: agent, isManual: false)
                             }

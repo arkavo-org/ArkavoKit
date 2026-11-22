@@ -60,8 +60,9 @@ public class RedditClient: ObservableObject {
         isAuthenticated = accessToken != nil
 
         if isAuthenticated {
+            let generation = sessionGeneration
             Task { @MainActor in
-                await fetchUsername()
+                await fetchUsername(expectedGeneration: generation)
             }
         }
     }
@@ -70,8 +71,13 @@ public class RedditClient: ObservableObject {
 
     @MainActor
     public var authURL: URL {
-        let state = UUID().uuidString
-        pendingOAuthState = state
+        let state: String
+        if let existing = pendingOAuthState {
+            state = existing
+        } else {
+            state = UUID().uuidString
+            pendingOAuthState = state
+        }
 
         var components = URLComponents(string: "https://www.reddit.com/api/v1/authorize")!
         components.queryItems = [
@@ -101,26 +107,30 @@ public class RedditClient: ObservableObject {
         }
 
         let queryItems = components.queryItems ?? []
-        if queryItems.contains(where: { $0.name == "error" }) {
-            pendingOAuthState = nil
-            handleError(RedditError.invalidCallback)
-            return
-        }
-
         guard let expectedState = pendingOAuthState,
               let returnedState = queryItems.first(where: { $0.name == "state" })?.value,
-              returnedState == expectedState,
-              let code = queryItems.first(where: { $0.name == "code" })?.value,
-              !code.isEmpty
+              returnedState == expectedState
         else {
-            pendingOAuthState = nil
             handleError(RedditError.invalidCallback)
             return
         }
         pendingOAuthState = nil
 
+        if queryItems.contains(where: { $0.name == "error" }) {
+            handleError(RedditError.invalidCallback)
+            return
+        }
+
+        guard let code = queryItems.first(where: { $0.name == "code" })?.value,
+              !code.isEmpty
+        else {
+            handleError(RedditError.invalidCallback)
+            return
+        }
+
+        let attemptGeneration = sessionGeneration
         Task { @MainActor in
-            await exchangeCodeForToken(code)
+            await exchangeCodeForToken(code, expectedGeneration: attemptGeneration)
         }
     }
 
@@ -191,8 +201,8 @@ public class RedditClient: ObservableObject {
     }
 
     @MainActor
-    private func exchangeCodeForToken(_ code: String) async {
-        let generation = sessionGeneration
+    private func exchangeCodeForToken(_ code: String, expectedGeneration: UInt64) async {
+        guard sessionGeneration == expectedGeneration else { return }
         isLoading = true
         error = nil
         defer { isLoading = false }
@@ -217,7 +227,7 @@ public class RedditClient: ObservableObject {
 
             let (data, response) = try await URLSession.shared.data(for: request)
 
-            guard sessionGeneration == generation else { return }
+            guard sessionGeneration == expectedGeneration else { return }
 
             guard let httpResponse = response as? HTTPURLResponse else {
                 throw RedditError.invalidResponse
@@ -225,13 +235,13 @@ public class RedditClient: ObservableObject {
 
             if httpResponse.statusCode == 200 {
                 let tokenResponse = try JSONDecoder().decode(RedditTokenResponse.self, from: data)
-                guard sessionGeneration == generation else { return }
-                handleTokenResponse(tokenResponse, fetchUser: true)
+                guard sessionGeneration == expectedGeneration else { return }
+                handleTokenResponse(tokenResponse, fetchUser: true, expectedGeneration: expectedGeneration)
             } else {
                 throw RedditError.httpError(statusCode: httpResponse.statusCode)
             }
         } catch {
-            if sessionGeneration == generation {
+            if sessionGeneration == expectedGeneration {
                 handleError(error)
             }
         }
@@ -282,7 +292,7 @@ public class RedditClient: ObservableObject {
                 guard self.sessionGeneration == generation else {
                     throw CancellationError()
                 }
-                self.handleTokenResponse(tokenResponse, fetchUser: false)
+                self.handleTokenResponse(tokenResponse, fetchUser: false, expectedGeneration: generation)
             } else {
                 throw RedditError.httpError(statusCode: httpResponse.statusCode)
             }
@@ -293,7 +303,8 @@ public class RedditClient: ObservableObject {
     }
 
     @MainActor
-    private func handleTokenResponse(_ response: RedditTokenResponse, fetchUser: Bool) {
+    private func handleTokenResponse(_ response: RedditTokenResponse, fetchUser: Bool, expectedGeneration: UInt64) {
+        guard sessionGeneration == expectedGeneration else { return }
         let expirationDate = Date().addingTimeInterval(TimeInterval(response.expires_in))
         saveTokens(
             accessToken: response.access_token,
@@ -304,7 +315,7 @@ public class RedditClient: ObservableObject {
         isAuthenticated = true
         if fetchUser {
             Task { @MainActor in
-                await fetchUsername()
+                await fetchUsername(expectedGeneration: expectedGeneration)
             }
         }
     }
@@ -359,14 +370,17 @@ public class RedditClient: ObservableObject {
     }
 
     @MainActor
-    private func fetchUsername() async {
+    private func fetchUsername(expectedGeneration: UInt64) async {
         do {
             let userInfo = try await fetchUserInfo()
+            guard sessionGeneration == expectedGeneration else { return }
             username = userInfo.name
         } catch is CancellationError {
             return
         } catch {
-            handleError(error)
+            if sessionGeneration == expectedGeneration {
+                handleError(error)
+            }
         }
     }
 

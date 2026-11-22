@@ -30,10 +30,11 @@ public actor YouTubeClient: ObservableObject {
     private let uploadSend: YouTubeSend
     /// Base retry backoff in seconds for resumable uploads (injectable in tests).
     private let uploadRetryBaseSeconds: Double
-    private let sessionGeneration = Mutex<UInt64>(0)
+    private let sessionStoreLock = Mutex<UInt64>(0)
     private var codeVerifier: String?
-    private var currentRedirectUri: String?
+    var currentRedirectUri: String?
     private var pendingOAuthState: String?
+    private var pendingOAuthGeneration: UInt64?
     #if os(macOS)
     private var callbackServer: OAuthCallbackServer?
     #endif
@@ -78,12 +79,12 @@ public actor YouTubeClient: ObservableObject {
         self.uploadRetryBaseSeconds = uploadRetryBaseSeconds
     }
 
-    private nonisolated func currentSessionGeneration() -> UInt64 {
-        sessionGeneration.withLock { $0 }
+    func setRedirectUriForTesting(_ uri: String) {
+        currentRedirectUri = uri
     }
 
-    private nonisolated func incrementSessionGeneration() {
-        sessionGeneration.withLock { $0 &+= 1 }
+    private nonisolated func currentSessionGeneration() -> UInt64 {
+        sessionStoreLock.withLock { $0 }
     }
 
     // MARK: - PKCE Support
@@ -118,35 +119,57 @@ public actor YouTubeClient: ObservableObject {
     // MARK: - Token Management
 
     private func loadStoredTokens() async {
-        let accessToken = store.value(for: KeychainKey.accessToken)
+        let (generation, accessToken) = sessionStoreLock.withLock { currentGeneration in
+            (currentGeneration, store.value(for: KeychainKey.accessToken))
+        }
 
         await MainActor.run {
+            guard self.currentSessionGeneration() == generation else { return }
             isAuthenticated = accessToken != nil
         }
 
-        if accessToken != nil {
-            await fetchChannelInfo()
+        if accessToken != nil, currentSessionGeneration() == generation {
+            await fetchChannelInfo(expectedGeneration: generation)
         }
     }
 
-    private func saveTokens(accessToken: String, refreshToken: String, expiresIn: Int) {
-        let expirationDate = Date().addingTimeInterval(TimeInterval(expiresIn))
-        store.save(accessToken, for: KeychainKey.accessToken)
-        store.save(refreshToken, for: KeychainKey.refreshToken)
-        store.save(ISO8601DateFormatter().string(from: expirationDate), for: KeychainKey.tokenExpiration)
+    private nonisolated func saveTokensIfCurrent(
+        expectedGeneration: UInt64,
+        accessToken: String,
+        refreshToken: String,
+        expiresIn: Int
+    ) -> Bool {
+        sessionStoreLock.withLock { currentGeneration in
+            guard currentGeneration == expectedGeneration else { return false }
+            let expirationDate = Date().addingTimeInterval(TimeInterval(expiresIn))
+            store.save(accessToken, for: KeychainKey.accessToken)
+            store.save(refreshToken, for: KeychainKey.refreshToken)
+            store.save(ISO8601DateFormatter().string(from: expirationDate), for: KeychainKey.tokenExpiration)
+            return true
+        }
     }
 
-    /// Removes the stored tokens and channel ID.
+    private nonisolated func saveChannelIDIfCurrent(expectedGeneration: UInt64, channelId: String) -> Bool {
+        sessionStoreLock.withLock { currentGeneration in
+            guard currentGeneration == expectedGeneration else { return false }
+            store.save(channelId, for: KeychainKey.channelId)
+            return true
+        }
+    }
+
+    /// Atomically advances the session generation and removes the stored tokens and channel ID.
     private nonisolated func clearStoredSession() {
-        store.delete(KeychainKey.accessToken)
-        store.delete(KeychainKey.refreshToken)
-        store.delete(KeychainKey.tokenExpiration)
-        store.delete(KeychainKey.channelId)
+        sessionStoreLock.withLock { currentGeneration in
+            currentGeneration &+= 1
+            store.delete(KeychainKey.accessToken)
+            store.delete(KeychainKey.refreshToken)
+            store.delete(KeychainKey.tokenExpiration)
+            store.delete(KeychainKey.channelId)
+        }
     }
 
     @MainActor
     public func logout() {
-        incrementSessionGeneration()
         clearStoredSession()
 
         isAuthenticated = false
@@ -167,13 +190,19 @@ public actor YouTubeClient: ObservableObject {
     @MainActor
     @discardableResult
     public func signOut() async -> YouTubeRevocation {
-        incrementSessionGeneration()
-        // A sign-in Google answered without a refresh token stores an empty one.
-        let refreshToken = store.value(for: KeychainKey.refreshToken)
-            .flatMap { $0.isEmpty ? nil : $0 }
-        let accessToken = store.value(for: KeychainKey.accessToken)
+        let (refreshToken, accessToken): (String?, String?) = sessionStoreLock.withLock { currentGeneration in
+            currentGeneration &+= 1
+            // A sign-in Google answered without a refresh token stores an empty one.
+            let refresh = store.value(for: KeychainKey.refreshToken)
+                .flatMap { $0.isEmpty ? nil : $0 }
+            let access = store.value(for: KeychainKey.accessToken)
+            store.delete(KeychainKey.accessToken)
+            store.delete(KeychainKey.refreshToken)
+            store.delete(KeychainKey.tokenExpiration)
+            store.delete(KeychainKey.channelId)
+            return (refresh, access)
+        }
 
-        clearStoredSession()
         isAuthenticated = false
         accessWithdrawn = false
         channelInfo = nil
@@ -220,10 +249,11 @@ public actor YouTubeClient: ObservableObject {
 
     // MARK: - Authentication
 
-    private func buildAuthURL(redirectUri: String, state: String) -> URL {
+    private func buildAuthURL(redirectUri: String, state: String, attemptGeneration: UInt64? = nil) -> URL {
         let verifier = generateCodeVerifier()
         codeVerifier = verifier
         pendingOAuthState = state
+        pendingOAuthGeneration = attemptGeneration ?? currentSessionGeneration()
         let challenge = generateCodeChallenge(from: verifier)
 
         var components = URLComponents(string: "https://accounts.google.com/o/oauth2/v2/auth")!
@@ -249,6 +279,7 @@ public actor YouTubeClient: ObservableObject {
     #if os(macOS)
     /// Authenticate using a local HTTP server to receive the OAuth callback (macOS only)
     public func authenticateWithLocalServer() async throws {
+        let attemptGeneration = currentSessionGeneration()
         await MainActor.run {
             isLoading = true
             error = nil
@@ -277,7 +308,7 @@ public actor YouTubeClient: ObservableObject {
             currentRedirectUri = redirectUri
 
             // Build auth URL with the dynamic localhost redirect
-            let authURL = buildAuthURL(redirectUri: redirectUri, state: state)
+            let authURL = buildAuthURL(redirectUri: redirectUri, state: state, attemptGeneration: attemptGeneration)
 
             // Open browser for authentication. If it doesn't open, the wait below times out.
             await MainActor.run {
@@ -287,7 +318,14 @@ public actor YouTubeClient: ObservableObject {
             // Wait for the callback with structured task cancellation support
             let code = try await server.waitForCallback(timeout: 300)
 
-            try await completeSignIn(code: code, redirectUri: redirectUri)
+            guard currentSessionGeneration() == attemptGeneration else {
+                await MainActor.run {
+                    isLoading = false
+                }
+                throw CancellationError()
+            }
+
+            try await completeSignIn(code: code, redirectUri: redirectUri, expectedGeneration: attemptGeneration)
             await MainActor.run {
                 isLoading = false
             }
@@ -327,22 +365,26 @@ public actor YouTubeClient: ObservableObject {
         }
 
         let queryItems = components.queryItems ?? []
+        guard let expectedState = pendingOAuthState,
+              let returnedState = queryItems.first(where: { $0.name == "state" })?.value,
+              returnedState == expectedState
+        else {
+            throw YouTubeError.invalidCallback
+        }
+        let attemptGeneration = pendingOAuthGeneration ?? currentSessionGeneration()
+        pendingOAuthState = nil
+        pendingOAuthGeneration = nil
+
         if let oauthError = queryItems.first(where: { $0.name == "error" })?.value {
-            pendingOAuthState = nil
             let description = queryItems.first(where: { $0.name == "error_description" })?.value ?? oauthError
             throw YouTubeError.googleError(description)
         }
 
-        guard let expectedState = pendingOAuthState,
-              let returnedState = queryItems.first(where: { $0.name == "state" })?.value,
-              returnedState == expectedState,
-              let code = queryItems.first(where: { $0.name == "code" })?.value,
+        guard let code = queryItems.first(where: { $0.name == "code" })?.value,
               !code.isEmpty
         else {
-            pendingOAuthState = nil
             throw YouTubeError.invalidCallback
         }
-        pendingOAuthState = nil
 
         await MainActor.run {
             isLoading = true
@@ -353,7 +395,7 @@ public actor YouTubeClient: ObservableObject {
             guard let redirectUri = currentRedirectUri else {
                 throw YouTubeError.invalidCallback
             }
-            try await completeSignIn(code: code, redirectUri: redirectUri)
+            try await completeSignIn(code: code, redirectUri: redirectUri, expectedGeneration: attemptGeneration)
             await MainActor.run {
                 isLoading = false
             }
@@ -368,15 +410,17 @@ public actor YouTubeClient: ObservableObject {
 
     /// Stores the tokens for `code`, marks the person signed in, then loads their channel.
     /// Signed in comes first, so a withdrawn grant the channel fetch finds is the state that remains.
-    func completeSignIn(code: String, redirectUri: String) async throws {
-        let generation = currentSessionGeneration()
+    func completeSignIn(code: String, redirectUri: String, expectedGeneration: UInt64? = nil) async throws {
+        let generation = expectedGeneration ?? currentSessionGeneration()
         let saved = try await exchangeCodeForTokens(code, redirectUri: redirectUri, expectedGeneration: generation)
         guard saved, currentSessionGeneration() == generation else { return }
         await MainActor.run {
+            guard self.currentSessionGeneration() == generation else { return }
             isAuthenticated = true
             accessWithdrawn = false
         }
-        await fetchChannelInfo()
+        guard currentSessionGeneration() == generation else { return }
+        await fetchChannelInfo(expectedGeneration: generation)
     }
 
     // Make exchangeCodeForTokens public so it can be used directly with authorization code
@@ -384,8 +428,11 @@ public actor YouTubeClient: ObservableObject {
         guard let redirectUri = currentRedirectUri else {
             throw YouTubeError.invalidCallback
         }
-        let generation = currentSessionGeneration()
-        _ = try await exchangeCodeForTokens(code, redirectUri: redirectUri, expectedGeneration: generation)
+        let generation = pendingOAuthGeneration ?? currentSessionGeneration()
+        let saved = try await exchangeCodeForTokens(code, redirectUri: redirectUri, expectedGeneration: generation)
+        guard saved else {
+            throw CancellationError()
+        }
     }
 
     private func exchangeCodeForTokens(
@@ -393,6 +440,10 @@ public actor YouTubeClient: ObservableObject {
         redirectUri: String,
         expectedGeneration: UInt64
     ) async throws -> Bool {
+        guard currentSessionGeneration() == expectedGeneration else {
+            return false
+        }
+
         let tokenURL = URL(string: "https://oauth2.googleapis.com/token")!
         var request = URLRequest(url: tokenURL)
         request.httpMethod = "POST"
@@ -425,15 +476,12 @@ public actor YouTubeClient: ObservableObject {
 
         if httpResponse.statusCode == 200 {
             let tokenResponse = try JSONDecoder().decode(YouTubeTokenResponse.self, from: data)
-            guard currentSessionGeneration() == expectedGeneration else {
-                return false
-            }
-            saveTokens(
+            return saveTokensIfCurrent(
+                expectedGeneration: expectedGeneration,
                 accessToken: tokenResponse.access_token,
                 refreshToken: tokenResponse.refresh_token ?? "",
                 expiresIn: tokenResponse.expires_in,
             )
-            return true
         } else {
             // Parse error response for better error messages
             if let errorResponse = try? JSONDecoder().decode(GoogleErrorResponse.self, from: data) {
@@ -449,8 +497,12 @@ public actor YouTubeClient: ObservableObject {
     ///   replaced while the request was out, so the answer was dropped.
     @discardableResult
     private func refreshAccessToken() async throws -> String? {
+        // Atomically capture session generation and stored refresh token.
+        let (generation, storedRefreshToken) = sessionStoreLock.withLock { currentGeneration in
+            (currentGeneration, store.value(for: KeychainKey.refreshToken))
+        }
         // A sign-in Google answered without a refresh token stores an empty one.
-        guard let refreshToken = store.value(for: KeychainKey.refreshToken), !refreshToken.isEmpty else {
+        guard let refreshToken = storedRefreshToken, !refreshToken.isEmpty else {
             throw YouTubeError.noRefreshToken
         }
 
@@ -476,20 +528,40 @@ public actor YouTubeClient: ObservableObject {
 
         // The actor may have signed out (revoking this very token) or signed in again while the
         // request was out; its answer then speaks for a grant no longer stored, and is dropped.
-        let stillStored = store.value(for: KeychainKey.refreshToken) == refreshToken
-
         if httpResponse.statusCode == 200 {
-            guard stillStored else { return nil }
             let tokenResponse = try JSONDecoder().decode(YouTubeTokenResponse.self, from: data)
-            saveTokens(
-                accessToken: tokenResponse.access_token,
-                refreshToken: refreshToken, // Keep existing refresh token
-                expiresIn: tokenResponse.expires_in,
-            )
-            return tokenResponse.access_token
-        } else if stillStored, Self.grantWithdrawn(status: httpResponse.statusCode, data: data) {
-            await endWithdrawnSession()
-            throw YouTubeError.accessWithdrawn
+            let saved = sessionStoreLock.withLock { currentGeneration -> Bool in
+                guard currentGeneration == generation,
+                      store.value(for: KeychainKey.refreshToken) == refreshToken
+                else { return false }
+                let expirationDate = Date().addingTimeInterval(TimeInterval(tokenResponse.expires_in))
+                store.save(tokenResponse.access_token, for: KeychainKey.accessToken)
+                store.save(refreshToken, for: KeychainKey.refreshToken)
+                store.save(ISO8601DateFormatter().string(from: expirationDate), for: KeychainKey.tokenExpiration)
+                return true
+            }
+            return saved ? tokenResponse.access_token : nil
+        } else if Self.grantWithdrawn(status: httpResponse.statusCode, data: data) {
+            let cleared = sessionStoreLock.withLock { currentGeneration -> Bool in
+                guard currentGeneration == generation,
+                      store.value(for: KeychainKey.refreshToken) == refreshToken
+                else { return false }
+                currentGeneration &+= 1
+                store.delete(KeychainKey.accessToken)
+                store.delete(KeychainKey.refreshToken)
+                store.delete(KeychainKey.tokenExpiration)
+                store.delete(KeychainKey.channelId)
+                return true
+            }
+            if cleared {
+                await MainActor.run {
+                    isAuthenticated = false
+                    channelInfo = nil
+                    accessWithdrawn = true
+                }
+                throw YouTubeError.accessWithdrawn
+            }
+            throw YouTubeError.httpError(statusCode: httpResponse.statusCode)
         } else {
             throw YouTubeError.httpError(statusCode: httpResponse.statusCode)
         }
@@ -503,16 +575,6 @@ public actor YouTubeClient: ObservableObject {
               let reply = try? JSONDecoder().decode(GoogleErrorResponse.self, from: data)
         else { return false }
         return reply.error == "invalid_grant"
-    }
-
-    /// Removes everything stored for a grant Google no longer honors.
-    private func endWithdrawnSession() async {
-        clearStoredSession()
-        await MainActor.run {
-            isAuthenticated = false
-            channelInfo = nil
-            accessWithdrawn = true
-        }
     }
 
     /// Checks with Google that the stored grant still stands, by refreshing the access token.
@@ -598,11 +660,15 @@ public actor YouTubeClient: ObservableObject {
         return (data, http)
     }
 
-    func fetchChannelInfo() async {
+    func fetchChannelInfo(expectedGeneration: UInt64? = nil) async {
+        let generation = expectedGeneration ?? currentSessionGeneration()
         do {
+            guard currentSessionGeneration() == generation else { return }
             let url = URL(string: "https://www.googleapis.com/youtube/v3/channels?part=snippet,statistics&mine=true")!
             let request = try await makeAuthorizedRequest(url: url)
             let (data, httpResponse) = try await sendAuthorized(request)
+
+            guard currentSessionGeneration() == generation else { return }
 
             if httpResponse.statusCode == 200 {
                 let channelResponse = try JSONDecoder().decode(YouTubeChannelResponse.self, from: data)
@@ -612,15 +678,18 @@ public actor YouTubeClient: ObservableObject {
                         title: channel.snippet.title,
                         description: channel.snippet.description,
                         thumbnailUrl: channel.snippet.thumbnails.default.url,
-                        subscriberCount: channel.statistics.subscriberCount.flatMap(Int.init) ?? 0,
+                        subscriberCount: Int(channel.statistics.subscriberCount) ?? 0,
                         videoCount: Int(channel.statistics.videoCount) ?? 0,
                         viewCount: Int(channel.statistics.viewCount) ?? 0,
                     )
 
-                    // Save channel ID for future use
-                    store.save(channel.id, for: KeychainKey.channelId)
+                    // Atomically save channel ID only if session generation is still current
+                    guard saveChannelIDIfCurrent(expectedGeneration: generation, channelId: channel.id) else {
+                        return
+                    }
 
                     await MainActor.run {
+                        guard self.currentSessionGeneration() == generation else { return }
                         self.channelInfo = info
                     }
                 }
@@ -629,6 +698,7 @@ public actor YouTubeClient: ObservableObject {
             }
         } catch {
             await MainActor.run {
+                guard self.currentSessionGeneration() == generation else { return }
                 self.error = error as? YouTubeError ?? .unknown(error)
             }
         }
@@ -1221,8 +1291,8 @@ public actor YouTubeClient: ObservableObject {
                             onProgress?(1.0)
                             return videoId
                         }
-                        if let probedOffset = probed.nextOffset,
-                           probedOffset >= 0,
+                        let probedOffset = probed.nextOffset ?? 0
+                        if probedOffset >= 0,
                            probedOffset <= totalSize,
                            probedOffset != offset
                         {
@@ -1275,8 +1345,8 @@ public actor YouTubeClient: ObservableObject {
                             onProgress?(1.0)
                             return videoId
                         }
-                        if let probedOffset = probed.nextOffset,
-                           probedOffset >= 0,
+                        let probedOffset = probed.nextOffset ?? 0
+                        if probedOffset >= 0,
                            probedOffset <= totalSize,
                            probedOffset != offset
                         {
@@ -1515,8 +1585,27 @@ struct YouTubeChannelResponse: Codable {
 
         struct Statistics: Codable {
             let viewCount: String
-            let subscriberCount: String?
+            let subscriberCount: String
             let videoCount: String
+
+            private enum CodingKeys: String, CodingKey {
+                case viewCount
+                case subscriberCount
+                case videoCount
+            }
+
+            init(viewCount: String, subscriberCount: String = "0", videoCount: String) {
+                self.viewCount = viewCount
+                self.subscriberCount = subscriberCount
+                self.videoCount = videoCount
+            }
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                viewCount = try container.decodeIfPresent(String.self, forKey: .viewCount) ?? "0"
+                subscriberCount = try container.decodeIfPresent(String.self, forKey: .subscriberCount) ?? "0"
+                videoCount = try container.decodeIfPresent(String.self, forKey: .videoCount) ?? "0"
+            }
         }
     }
 }
@@ -1598,14 +1687,41 @@ public struct YouTubeLiveChatMessage: Codable, Sendable {
 
     public struct Snippet: Codable, Sendable {
         public let type: String
-        public let displayMessage: String?
+        public let displayMessage: String
         public let publishedAt: String
         public let superChatDetails: SuperChatDetails?
+
+        private enum CodingKeys: String, CodingKey {
+            case type
+            case displayMessage
+            case publishedAt
+            case superChatDetails
+        }
 
         public struct SuperChatDetails: Codable, Sendable {
             public let amountMicros: String
             public let currency: String
             public let userComment: String?
+        }
+
+        public init(
+            type: String,
+            displayMessage: String,
+            publishedAt: String,
+            superChatDetails: SuperChatDetails? = nil
+        ) {
+            self.type = type
+            self.displayMessage = displayMessage
+            self.publishedAt = publishedAt
+            self.superChatDetails = superChatDetails
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            type = try container.decode(String.self, forKey: .type)
+            displayMessage = try container.decodeIfPresent(String.self, forKey: .displayMessage) ?? ""
+            publishedAt = try container.decode(String.self, forKey: .publishedAt)
+            superChatDetails = try container.decodeIfPresent(SuperChatDetails.self, forKey: .superChatDetails)
         }
     }
 

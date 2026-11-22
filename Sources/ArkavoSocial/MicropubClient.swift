@@ -129,8 +129,13 @@ public class MicropubClient: ObservableObject {
 
     @MainActor
     public var authURL: URL {
-        let state = UUID().uuidString
-        pendingOAuthState = state
+        let state: String
+        if let existing = pendingOAuthState {
+            state = existing
+        } else {
+            state = UUID().uuidString
+            pendingOAuthState = state
+        }
 
         var components = URLComponents(string: "https://micro.blog/indieauth/auth")!
         components.queryItems = [
@@ -145,28 +150,30 @@ public class MicropubClient: ObservableObject {
 
     @MainActor
     public func handleCallback(_ url: URL) async throws {
+        let generation = sessionGeneration
         guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
             throw MicropubError.invalidCallback
         }
 
         let queryItems = components.queryItems ?? []
-        if queryItems.contains(where: { $0.name == "error" }) {
-            pendingOAuthState = nil
-            throw MicropubError.invalidCallback
-        }
-
         guard let expectedState = pendingOAuthState,
               let returnedState = queryItems.first(where: { $0.name == "state" })?.value,
-              returnedState == expectedState,
-              let code = queryItems.first(where: { $0.name == "code" })?.value,
-              !code.isEmpty
+              returnedState == expectedState
         else {
-            pendingOAuthState = nil
             throw MicropubError.invalidCallback
         }
         pendingOAuthState = nil
 
-        let generation = sessionGeneration
+        if queryItems.contains(where: { $0.name == "error" }) {
+            throw MicropubError.invalidCallback
+        }
+
+        guard let code = queryItems.first(where: { $0.name == "code" })?.value,
+              !code.isEmpty
+        else {
+            throw MicropubError.invalidCallback
+        }
+
         isLoading = true
         error = nil
         defer { isLoading = false }

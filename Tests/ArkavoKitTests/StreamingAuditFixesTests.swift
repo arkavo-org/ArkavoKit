@@ -571,4 +571,197 @@ final class StreamingAuditFixesTests: XCTestCase {
             XCTAssertGreaterThanOrEqual(frame.pts.seconds, 10.0)
         }
     }
+
+    // MARK: - PR #88 Regression Fixes
+
+    func testRTMPPublisherTimestampNormalizationIncompatibleClockDomains() async {
+        let publisher = RTMPPublisher()
+        let hostAudioBase: CMTimeValue = 50_000 * 48_000
+
+        // (a1) 0-based stream-relative video arrives first, then 50,000s host-clock audio
+        let v0 = await publisher.normalizeTimestamp(CMTime(value: 0, timescale: 1000), for: .video)
+        let v1 = await publisher.normalizeTimestamp(CMTime(value: 33, timescale: 1000), for: .video)
+        let a0 = await publisher.normalizeTimestamp(CMTime(value: hostAudioBase, timescale: 48_000), for: .audio)
+        let a1 = await publisher.normalizeTimestamp(CMTime(value: hostAudioBase + 1008, timescale: 48_000), for: .audio)
+        let v2 = await publisher.normalizeTimestamp(CMTime(value: 66, timescale: 1000), for: .video)
+
+        XCTAssertEqual(v0, 0)
+        XCTAssertEqual(v1, 33)
+        XCTAssertEqual(a0, 0)
+        XCTAssertEqual(a1, 21)
+        XCTAssertEqual(v2, 66)
+
+        // Reset anchors on disconnect, then verify reverse arrival order (audio first, video second)
+        await publisher.disconnect()
+
+        let aRev0 = await publisher.normalizeTimestamp(CMTime(value: hostAudioBase, timescale: 48_000), for: .audio)
+        let aRev1 = await publisher.normalizeTimestamp(CMTime(value: hostAudioBase + 2016, timescale: 48_000), for: .audio)
+        let vRev0 = await publisher.normalizeTimestamp(CMTime(value: 0, timescale: 1000), for: .video)
+        let vRev1 = await publisher.normalizeTimestamp(CMTime(value: 33, timescale: 1000), for: .video)
+
+        XCTAssertEqual(aRev0, 0)
+        XCTAssertEqual(aRev1, 42)
+        XCTAssertEqual(vRev0, 0)
+        XCTAssertEqual(vRev1, 33)
+    }
+
+    func testRTMPPublisherTimestampNormalizationSameClockDomainPreservesOffset() async {
+        let publisher = RTMPPublisher()
+
+        // (b1) Same clock domain: audio arrives at 100.0s, video arrives at 100.5s -> preserves 500ms offset
+        let a0 = await publisher.normalizeTimestamp(CMTime(value: 100_000, timescale: 1000), for: .audio)
+        let v0 = await publisher.normalizeTimestamp(CMTime(value: 100_500, timescale: 1000), for: .video)
+        let a1 = await publisher.normalizeTimestamp(CMTime(value: 100_500, timescale: 1000), for: .audio)
+        let v1 = await publisher.normalizeTimestamp(CMTime(value: 101_000, timescale: 1000), for: .video)
+
+        XCTAssertEqual(a0, 0)
+        XCTAssertEqual(v0, 500)
+        XCTAssertEqual(a1, 500)
+        XCTAssertEqual(v1, 1000)
+
+        // (b2) Reverse arrival order: video at 100.5s first, then audio at 100.0s -> shares 100.0s anchor
+        await publisher.disconnect()
+
+        let vRev0 = await publisher.normalizeTimestamp(CMTime(value: 100_500, timescale: 1000), for: .video)
+        let aRev0 = await publisher.normalizeTimestamp(CMTime(value: 100_000, timescale: 1000), for: .audio)
+        let vRev1 = await publisher.normalizeTimestamp(CMTime(value: 101_000, timescale: 1000), for: .video)
+        let aRev1 = await publisher.normalizeTimestamp(CMTime(value: 100_500, timescale: 1000), for: .audio)
+
+        XCTAssertEqual(vRev0, 0)
+        XCTAssertEqual(aRev0, 0)
+        XCTAssertEqual(vRev1, 1000)
+        XCTAssertEqual(aRev1, 500)
+    }
+
+    func testRTMPSubscriberMetadataDimensionRejectsIntMaxAndTwoTo63WithoutTrapping() async {
+        let twoTo63 = Double(UInt64(1) << 63)
+
+        XCTAssertNil(RTMPSubscriber.sanitizedMetadataDimension(Double(Int.max)))
+        XCTAssertNil(RTMPSubscriber.sanitizedMetadataDimension(twoTo63))
+        XCTAssertNil(RTMPSubscriber.sanitizedMetadataDimension(Double(Int32.max) + 1.0))
+        XCTAssertNil(RTMPSubscriber.sanitizedMetadataDimension(.nan))
+        XCTAssertNil(RTMPSubscriber.sanitizedMetadataDimension(.infinity))
+        XCTAssertNil(RTMPSubscriber.sanitizedMetadataDimension(-.infinity))
+        XCTAssertNil(RTMPSubscriber.sanitizedMetadataDimension(-1.0))
+
+        XCTAssertEqual(RTMPSubscriber.sanitizedMetadataDimension(0.0), 0)
+        XCTAssertEqual(RTMPSubscriber.sanitizedMetadataDimension(1920.0), 1920)
+        XCTAssertEqual(RTMPSubscriber.sanitizedMetadataDimension(Double(Int32.max)), Int(Int32.max))
+
+        let subscriber = RTMPSubscriber()
+        let defaultMediaReadTimeout = await subscriber.mediaReadTimeout
+        XCTAssertNil(defaultMediaReadTimeout)
+
+        let invalidPayload = AMF0.encodeObject([
+            "width": .number(Double(Int.max)),
+            "height": .number(twoTo63),
+        ])
+        await subscriber.handleMetadata(invalidPayload)
+        let rejected = await subscriber.currentMetadata
+        XCTAssertNil(rejected.width)
+        XCTAssertNil(rejected.height)
+
+        let validPayload = AMF0.encodeObject([
+            "width": .number(1920.0),
+            "height": .number(1080.0),
+        ])
+        await subscriber.handleMetadata(validPayload)
+        let accepted = await subscriber.currentMetadata
+        XCTAssertEqual(accepted.width, 1920)
+        XCTAssertEqual(accepted.height, 1080)
+    }
+
+    private func makeTestPixelBuffer(width: Int = 1280, height: Int = 720) throws -> CVPixelBuffer {
+        var pixelBuffer: CVPixelBuffer?
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            width,
+            height,
+            kCVPixelFormatType_32BGRA,
+            [
+                kCVPixelBufferCGImageCompatibilityKey: true,
+                kCVPixelBufferCGBitmapContextCompatibilityKey: true,
+            ] as CFDictionary,
+            &pixelBuffer
+        )
+        XCTAssertEqual(status, kCVReturnSuccess)
+        return try XCTUnwrap(pixelBuffer)
+    }
+
+    private final class FrameCounter: Sendable {
+        private let value = Mutex<Int>(0)
+        func increment() { value.withLock { $0 += 1 } }
+        func reset() { value.withLock { $0 = 0 } }
+        var count: Int { value.withLock { $0 } }
+    }
+
+    func testVideoEncoderStopStartPreservesReplacementCallbackContext() async throws {
+        let encoder = VideoEncoder(quality: .performance)
+        let counter = FrameCounter()
+        encoder.onFrame = { _ in
+            counter.increment()
+        }
+
+        let pixelBuffer = try makeTestPixelBuffer(width: 1280, height: 720)
+
+        // Sequential start -> stop -> start must preserve an active callback context
+        try encoder.start()
+        XCTAssertTrue(encoder.hasActiveCallbackContext)
+        try encoder.encode(pixelBuffer, timestamp: CMTime(value: 0, timescale: 30))
+
+        encoder.stop()
+        XCTAssertFalse(encoder.hasActiveCallbackContext)
+
+        try encoder.start()
+        XCTAssertTrue(encoder.hasActiveCallbackContext)
+
+        counter.reset()
+        for i in 1 ... 5 {
+            try encoder.encode(pixelBuffer, timestamp: CMTime(value: CMTimeValue(i), timescale: 30))
+        }
+        for _ in 0 ..< 100 {
+            if counter.count > 0 { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertGreaterThan(counter.count, 0, "Restarted VideoEncoder session must deliver encoded frames")
+
+        // Concurrent overlapping stop/start must never leave a running session with a deactivated context
+        for iteration in 0 ..< 5 {
+            try encoder.start()
+            try encoder.encode(pixelBuffer, timestamp: CMTime(value: CMTimeValue(10 + iteration * 2), timescale: 30))
+            try encoder.encode(pixelBuffer, timestamp: CMTime(value: CMTimeValue(11 + iteration * 2), timescale: 30))
+
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask {
+                    encoder.stop()
+                }
+                group.addTask {
+                    try? encoder.start()
+                }
+            }
+
+            if encoder.isRunning {
+                XCTAssertTrue(
+                    encoder.hasActiveCallbackContext,
+                    "Concurrent stop() must never deactivate a replacement session's callback context"
+                )
+            }
+        }
+
+        // Ensure encoder is started and still delivers frames after concurrent stop/start cycles
+        try encoder.start()
+        XCTAssertTrue(encoder.hasActiveCallbackContext)
+        counter.reset()
+        for i in 100 ... 104 {
+            try encoder.encode(pixelBuffer, timestamp: CMTime(value: CMTimeValue(i), timescale: 30))
+        }
+        for _ in 0 ..< 100 {
+            if counter.count > 0 { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertGreaterThan(counter.count, 0, "VideoEncoder must remain active after concurrent stop/start")
+
+        encoder.stop()
+        XCTAssertFalse(encoder.hasActiveCallbackContext)
+    }
 }

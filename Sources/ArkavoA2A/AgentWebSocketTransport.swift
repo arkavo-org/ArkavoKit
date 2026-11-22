@@ -19,7 +19,7 @@ public actor AgentWebSocketTransport {
     private var isConnected: Bool = false
 
     // Request/response correlation
-    private var pendingRequests: [String: CheckedContinuation<AgentResponse, Error>] = [:]
+    private var pendingRequests: [JSONRPCID: CheckedContinuation<AgentResponse, Error>] = [:]
 
     // Notification handler
     private weak var notificationHandler: (any AgentNotificationHandler)?
@@ -30,6 +30,7 @@ public actor AgentWebSocketTransport {
     // Configuration
     private let timeoutMs: UInt64
     private let requireTLS: Bool
+    private let authToken: String?
 
     // Heartbeat configuration
     private let heartbeatIntervalMs: UInt64
@@ -46,12 +47,14 @@ public actor AgentWebSocketTransport {
         timeoutMs: UInt64 = 30000,
         requireTLS: Bool = false,
         heartbeatIntervalMs: UInt64 = 30000,
-        missedPongThreshold: Int = 2
+        missedPongThreshold: Int = 2,
+        authToken: String? = nil
     ) {
         self.timeoutMs = timeoutMs
         self.requireTLS = requireTLS
         self.heartbeatIntervalMs = heartbeatIntervalMs
         self.missedPongThreshold = missedPongThreshold
+        self.authToken = authToken
     }
 
     /// Set the connection state delegate
@@ -103,8 +106,9 @@ public actor AgentWebSocketTransport {
         let session = URLSession(configuration: configuration)
         self.session = session
 
-        // Create WebSocket task
-        let task = session.webSocketTask(with: url)
+        // Create WebSocket task (attaching Authorization header when configured)
+        let request = makeWebSocketRequest(for: url)
+        let task = session.webSocketTask(with: request)
         self.webSocketTask = task
         self.endpoint = endpoint
 
@@ -202,6 +206,32 @@ public actor AgentWebSocketTransport {
         self.notificationHandler = handler
     }
 
+    /// Clear the notification handler only if it matches the given handler instance
+    public func clearNotificationHandler(ifMatching handler: any AgentNotificationHandler) {
+        if let current = notificationHandler,
+           ObjectIdentifier(current as AnyObject) == ObjectIdentifier(handler as AnyObject) {
+            notificationHandler = nil
+        }
+    }
+
+    /// Current notification handler (internal for testing)
+    func getNotificationHandler() -> (any AgentNotificationHandler)? {
+        notificationHandler
+    }
+
+    /// Build a WebSocket upgrade `URLRequest` with optional bearer token auth
+    nonisolated static func makeWebSocketRequest(for url: URL, authToken: String?) -> URLRequest {
+        var request = URLRequest(url: url)
+        if let authToken, !authToken.isEmpty {
+            request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
+        }
+        return request
+    }
+
+    private func makeWebSocketRequest(for url: URL) -> URLRequest {
+        Self.makeWebSocketRequest(for: url, authToken: authToken)
+    }
+
     // MARK: - Request/Response
 
     /// Send a JSON-RPC request and await the response
@@ -211,7 +241,8 @@ public actor AgentWebSocketTransport {
             throw AgentError.notConnected
         }
 
-        guard pendingRequests[request.id] == nil else {
+        let rpcId = request.rpcId
+        guard pendingRequests[rpcId] == nil else {
             print("[AgentWebSocketTransport] ERROR: Duplicate pending request id: \(request.id)")
             throw AgentError.webSocketError("Duplicate pending request id: \(request.id)")
         }
@@ -227,15 +258,14 @@ public actor AgentWebSocketTransport {
         print("[AgentWebSocketTransport] Sending request: method=\(request.method), id=\(request.id)")
         print("[AgentWebSocketTransport] JSON payload: \(jsonString)")
 
-        let requestId = request.id
         let timeout = timeoutMs
 
         // Register pending request before sending and enforce timeout with cancellation support
         do {
             let response = try await withTimeout(ms: timeout) {
-                try await self.sendAndAwaitResponse(requestId: requestId, jsonString: jsonString)
+                try await self.sendAndAwaitResponse(requestId: rpcId, jsonString: jsonString)
             }
-            print("[AgentWebSocketTransport] Received response for request \(requestId): \(response)")
+            print("[AgentWebSocketTransport] Received response for request \(request.id): \(response)")
             return response
         } catch {
             print("[AgentWebSocketTransport] ERROR: Request failed: \(error)")
@@ -245,13 +275,13 @@ public actor AgentWebSocketTransport {
 
     // MARK: - Private Methods
 
-    private func sendAndAwaitResponse(requestId: String, jsonString: String) async throws -> AgentResponse {
+    private func sendAndAwaitResponse(requestId: JSONRPCID, jsonString: String) async throws -> AgentResponse {
         try Task.checkCancellation()
         guard isConnected, let task = webSocketTask else {
             throw AgentError.notConnected
         }
         guard pendingRequests[requestId] == nil else {
-            throw AgentError.webSocketError("Duplicate pending request id: \(requestId)")
+            throw AgentError.webSocketError("Duplicate pending request id: \(requestId.stringValue)")
         }
 
         let message = URLSessionWebSocketTask.Message.string(jsonString)
@@ -267,7 +297,7 @@ public actor AgentWebSocketTransport {
                     return
                 }
                 guard self.pendingRequests[requestId] == nil else {
-                    continuation.resume(throwing: AgentError.webSocketError("Duplicate pending request id: \(requestId)"))
+                    continuation.resume(throwing: AgentError.webSocketError("Duplicate pending request id: \(requestId.stringValue)"))
                     return
                 }
 
@@ -292,7 +322,7 @@ public actor AgentWebSocketTransport {
         }
     }
 
-    private func cancelPendingRequest(id: String, error: Error) {
+    private func cancelPendingRequest(id: JSONRPCID, error: Error) {
         if let continuation = pendingRequests.removeValue(forKey: id) {
             continuation.resume(throwing: error)
         }
@@ -345,12 +375,13 @@ public actor AgentWebSocketTransport {
                 }
             }
 
-            // Not a notification, try to decode as response
-            let response = try decoder.decode(AgentResponse.self, from: data)
+            // Not a notification, try to decode as response while preserving JSON-RPC id type
+            let envelope = try decoder.decode(AgentResponseEnvelope.self, from: data)
+            let response = envelope.response
             print("[AgentWebSocketTransport] Response received for id=\(response.id)")
 
-            // Find and resume the pending request
-            if let continuation = pendingRequests.removeValue(forKey: response.id) {
+            // Find and resume the pending request matching exact JSON-RPC id type
+            if let continuation = pendingRequests.removeValue(forKey: envelope.rpcId) {
                 continuation.resume(returning: response)
             } else {
                 print("[AgentWebSocketTransport] WARNING: No pending request for \(response.id)")

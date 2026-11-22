@@ -386,19 +386,38 @@ public final class LocalHTTPServer: @unchecked Sendable {
                 return
             }
 
-            let sliceLength = rangeEnd - rangeStart + 1
+            let requestedLength = rangeEnd - rangeStart + 1
             let body: Data?
+            let actualLength: Int
+            let actualRangeEnd: Int
+            let actualTotalLength: Int
             if request.method == "HEAD" {
                 body = nil
+                actualLength = requestedLength
+                actualRangeEnd = rangeEnd
+                actualTotalLength = fullLength
             } else {
-                guard let sliceData = readFileSlice(from: fileURL, offset: UInt64(rangeStart), length: sliceLength) else {
+                guard let sliceData = readFileSlice(from: fileURL, offset: UInt64(rangeStart), length: requestedLength) else {
                     sendResponse(to: connection, status: 500, statusText: "Internal Server Error", body: nil)
                     return
                 }
+                if sliceData.isEmpty {
+                    sendResponse(
+                        to: connection,
+                        status: 416,
+                        statusText: "Range Not Satisfiable",
+                        headers: ["Content-Range": "bytes */\(rangeStart)"],
+                        body: nil
+                    )
+                    return
+                }
                 body = sliceData
+                actualLength = sliceData.count
+                actualRangeEnd = rangeStart + actualLength - 1
+                actualTotalLength = actualLength < requestedLength ? (rangeStart + actualLength) : fullLength
             }
 
-            print("🌐 HTTP 206 \(filename) bytes=\(rangeStart)-\(rangeEnd)/\(fullLength)")
+            print("🌐 HTTP 206 \(filename) bytes=\(rangeStart)-\(actualRangeEnd)/\(actualTotalLength)")
 
             sendResponse(
                 to: connection,
@@ -406,26 +425,29 @@ public final class LocalHTTPServer: @unchecked Sendable {
                 statusText: "Partial Content",
                 headers: [
                     "Content-Type": contentType,
-                    "Content-Length": "\(sliceLength)",
-                    "Content-Range": "bytes \(rangeStart)-\(rangeEnd)/\(fullLength)",
+                    "Content-Length": "\(actualLength)",
+                    "Content-Range": "bytes \(rangeStart)-\(actualRangeEnd)/\(actualTotalLength)",
                     "Accept-Ranges": "bytes"
                 ],
                 body: body
             )
         } else {
             let body: Data?
+            let contentLength: Int
             if request.method == "HEAD" {
                 body = nil
+                contentLength = fullLength
             } else {
                 guard let fileData = try? Data(contentsOf: fileURL, options: .mappedIfSafe) else {
                     sendResponse(to: connection, status: 500, statusText: "Internal Server Error", body: nil)
                     return
                 }
                 body = fileData
+                contentLength = fileData.count
             }
 
             // Full file response
-            print("🌐 HTTP 200 \(filename) (\(fullLength) bytes)")
+            print("🌐 HTTP 200 \(filename) (\(contentLength) bytes)")
 
             sendResponse(
                 to: connection,
@@ -433,7 +455,7 @@ public final class LocalHTTPServer: @unchecked Sendable {
                 statusText: "OK",
                 headers: [
                     "Content-Type": contentType,
-                    "Content-Length": "\(fullLength)",
+                    "Content-Length": "\(contentLength)",
                     "Accept-Ranges": "bytes"
                 ],
                 body: body
@@ -442,11 +464,21 @@ public final class LocalHTTPServer: @unchecked Sendable {
     }
 
     private func readFileSlice(from fileURL: URL, offset: UInt64, length: Int) -> Data? {
+        guard length >= 0 else { return nil }
         do {
             let handle = try FileHandle(forReadingFrom: fileURL)
             defer { try? handle.close() }
             try handle.seek(toOffset: offset)
-            return try handle.read(upToCount: length) ?? Data()
+            var buffer = Data()
+            buffer.reserveCapacity(length)
+            while buffer.count < length {
+                let remaining = length - buffer.count
+                guard let chunk = try handle.read(upToCount: remaining), !chunk.isEmpty else {
+                    break
+                }
+                buffer.append(chunk)
+            }
+            return buffer
         } catch {
             print("🌐 Read slice error: \(error.localizedDescription)")
             return nil

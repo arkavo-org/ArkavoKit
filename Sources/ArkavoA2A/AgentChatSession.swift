@@ -177,7 +177,7 @@ public final class AgentChatSessionManager: ObservableObject, AgentNotificationH
     private var sessionAgentMap: [String: String] = [:] // session_id -> agent_id
     private var agentSessionMap: [String: Set<String>] = [:] // agent_id -> session_ids
     private var deltaCallbacks: [String: (MessageDelta) -> Void] = [:] // session_id -> callback
-    private var streamSubscriptionIds: [String: String] = [:] // session_id -> subscription_id
+    private var streamSubscriptionIds: [String: AnyCodable] = [:] // session_id -> subscription_id (Int or String)
 
     // MARK: - Initialization
 
@@ -341,7 +341,7 @@ public final class AgentChatSessionManager: ObservableObject, AgentNotificationH
         switch response {
         case .success(_, let result):
             if let subId = Self.extractSubscriptionId(from: result) {
-                print("[AgentChatSessionManager] Successfully subscribed to chat_stream, subscription id: \(subId)")
+                print("[AgentChatSessionManager] Successfully subscribed to chat_stream, subscription id: \(subId.value)")
                 streamSubscriptionIds[sessionId] = subId
             } else {
                 print("[AgentChatSessionManager] Subscribed to chat_stream (no subscription id returned)")
@@ -404,11 +404,12 @@ public final class AgentChatSessionManager: ObservableObject, AgentNotificationH
             agentSessionMap.removeValue(forKey: agentId)
         }
 
-        // Unsubscribe from chat_stream using positional server subscription ID
+        // Unsubscribe from chat_stream using positional server subscription ID (preserving Int vs String type)
         if let subscriptionId {
+            nonisolated(unsafe) let unsubscribeParams: [Any] = [subscriptionId.value]
             _ = try? await connection.call(
                 method: "chat_stream_unsubscribe",
-                arrayParams: [subscriptionId]
+                arrayParams: unsubscribeParams
             )
         }
 
@@ -490,7 +491,7 @@ public final class AgentChatSessionManager: ObservableObject, AgentNotificationH
         switch response {
         case .success(_, let result):
             if let subId = Self.extractSubscriptionId(from: result) {
-                print("[AgentChatSessionManager] Re-subscribed to chat_stream: \(subId)")
+                print("[AgentChatSessionManager] Re-subscribed to chat_stream: \(subId.value)")
                 streamSubscriptionIds[sessionId] = subId
             }
         case .error(_, let code, let message):
@@ -524,25 +525,25 @@ public final class AgentChatSessionManager: ObservableObject, AgentNotificationH
         return try decoder.decode(MessageDelta.self, from: data)
     }
 
-    nonisolated static func extractSubscriptionId(from result: AnyCodable) -> String? {
+    nonisolated static func extractSubscriptionId(from result: AnyCodable) -> AnyCodable? {
         if let str = result.value as? String {
-            return str
+            return AnyCodable(str)
         }
         if let intVal = result.value as? Int {
-            return String(intVal)
+            return AnyCodable(intVal)
         }
         if let dict = result.value as? [String: Any] {
             if let sub = dict["subscription"] as? String {
-                return sub
+                return AnyCodable(sub)
             }
             if let subInt = dict["subscription"] as? Int {
-                return String(subInt)
+                return AnyCodable(subInt)
             }
             if let sub = dict["subscription_id"] as? String {
-                return sub
+                return AnyCodable(sub)
             }
             if let subInt = dict["subscription_id"] as? Int {
-                return String(subInt)
+                return AnyCodable(subInt)
             }
         }
         return nil

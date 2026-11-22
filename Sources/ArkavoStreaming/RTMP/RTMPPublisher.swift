@@ -114,16 +114,32 @@ public actor RTMPPublisher {
 
     // FIFO async lock serializing `sendRTMPMessage` so multi-chunk messages on the
     // same chunk stream cannot interleave across `await sendData(chunk)`.
+    private struct SendWaiter {
+        let generation: UInt64
+        let continuation: CheckedContinuation<Void, Error>
+    }
+    private var connectionGeneration: UInt64 = 0
     private var isSendingMessage = false
-    private var sendWaiters: [CheckedContinuation<Void, Never>] = []
+    private var sendWaiters: [SendWaiter] = []
+
+    enum MediaTrack: Sendable {
+        case video
+        case audio
+    }
+
+    /// Maximum clock skew (seconds) between initial video and audio timestamps to
+    /// treat them as sharing the same clock domain for A/V lip-sync.
+    private static let sharedAnchorMaxSkewSeconds: Double = 10.0
 
     // Stream configuration
     private var destination: Destination?
     private var streamKey: String?
     private var streamId: UInt32 = 1  // Stream ID from createStream response
     private var transactionId: Double = 0  // Transaction counter for invoke commands (incremented before each use)
-    /// Single shared stream-start anchor across both video and audio for A/V lip-sync.
-    private var streamStartTimestamp: CMTime?
+    /// Per-track start anchors; shared when both tracks originate in the same clock domain
+    /// (<= 10s skew), or independent when clock domains differ (e.g. 0-based video vs host-clock audio).
+    private var firstVideoTimestamp: CMTime?
+    private var firstAudioTimestamp: CMTime?
 
     // Statistics
     private var bytesSent: UInt64 = 0
@@ -138,7 +154,8 @@ public actor RTMPPublisher {
     private var sendChunkSize: Int = 4096  // Our chunk size for sending (set via SetChunkSize message)
 
     // Per-chunk-stream state for RTMP chunk reassembly (handles Types 0/1/2/3, extended timestamps, interleaving)
-    private struct ChunkStreamState {
+    // Reference type avoids O(N^2) copy-on-write duplication of `payloadBuffer` across chunks.
+    private final class ChunkStreamState {
         var messageLength: UInt32 = 0
         var messageTypeId: UInt8 = 0
         var timestamp: UInt32 = 0
@@ -248,6 +265,7 @@ public actor RTMPPublisher {
 
         let newConnection = NWConnection(host: host, port: nwPort, using: parameters)
         connection = newConnection
+        connectionGeneration &+= 1
 
         state = .connecting
         lastWaitingError = nil
@@ -268,7 +286,11 @@ public actor RTMPPublisher {
 
             let timeout = connectTimeout
             connectTimeoutTask = Task { [weak self] in
-                try? await Task.sleep(for: .seconds(timeout))
+                do {
+                    try await Task.sleep(for: .seconds(timeout))
+                } catch {
+                    return
+                }
                 guard !Task.isCancelled else { return }
                 await self?.connectTimedOut(host: url.host, port: Int(url.port))
             }
@@ -286,9 +308,15 @@ public actor RTMPPublisher {
             newConnection.cancel()
             if connection === newConnection {
                 connection = nil
+                connectionGeneration &+= 1
+                failStaleSendWaiters()
+                state = .error(error.localizedDescription)
             }
-            state = .error(error.localizedDescription)
             throw error
+        }
+
+        guard connection === newConnection else {
+            throw RTMPError.connectionFailed("Connection superseded")
         }
 
         state = .publishing
@@ -303,22 +331,64 @@ public actor RTMPPublisher {
         print("✅ RTMP publishing started")
     }
 
-    /// Normalize a video or audio timestamp against the shared stream-start anchor.
-    private func normalizeTimestamp(_ timestamp: CMTime) -> UInt32 {
-        guard timestamp.isNumeric else { return 0 }
+    /// Normalize a video or audio timestamp relative to the stream start.
+    /// Shares a common anchor (`min(timestamp, otherAnchor)`) when video and audio
+    /// are in the same clock domain (`abs(delta) <= 10s`) to preserve A/V sync,
+    /// and anchors each track independently when clock domains differ (e.g. 0-based
+    /// stream-relative video PTS vs host-clock audio PTS).
+    func normalizeTimestamp(_ timestamp: CMTime, for track: MediaTrack) -> UInt32 {
+        guard timestamp.isNumeric, timestamp.seconds.isFinite else { return 0 }
 
         let anchor: CMTime
-        if let existing = streamStartTimestamp {
-            anchor = existing
-        } else {
-            streamStartTimestamp = timestamp
-            print("📊 First media timestamp: \(timestamp.seconds)s - normalizing stream start to 0ms")
-            return 0
+        switch track {
+        case .video:
+            if let existing = firstVideoTimestamp {
+                anchor = existing
+            } else if let audioAnchor = firstAudioTimestamp {
+                let diff = timestamp - audioAnchor
+                let skewSeconds = diff.isNumeric ? abs(diff.seconds) : abs(timestamp.seconds - audioAnchor.seconds)
+                if skewSeconds <= Self.sharedAnchorMaxSkewSeconds {
+                    let shared = timestamp.seconds < audioAnchor.seconds ? timestamp : audioAnchor
+                    firstVideoTimestamp = shared
+                    firstAudioTimestamp = shared
+                    anchor = shared
+                } else {
+                    firstVideoTimestamp = timestamp
+                    print("📊 Video clock domain differs from audio by \(Int(skewSeconds))s - anchoring video independently at 0ms")
+                    return 0
+                }
+            } else {
+                firstVideoTimestamp = timestamp
+                print("📊 First video timestamp: \(timestamp.seconds)s - normalizing stream start to 0ms")
+                return 0
+            }
+
+        case .audio:
+            if let existing = firstAudioTimestamp {
+                anchor = existing
+            } else if let videoAnchor = firstVideoTimestamp {
+                let diff = timestamp - videoAnchor
+                let skewSeconds = diff.isNumeric ? abs(diff.seconds) : abs(timestamp.seconds - videoAnchor.seconds)
+                if skewSeconds <= Self.sharedAnchorMaxSkewSeconds {
+                    let shared = timestamp.seconds < videoAnchor.seconds ? timestamp : videoAnchor
+                    firstVideoTimestamp = shared
+                    firstAudioTimestamp = shared
+                    anchor = shared
+                } else {
+                    firstAudioTimestamp = timestamp
+                    print("📊 Audio clock domain differs from video by \(Int(skewSeconds))s - anchoring audio independently at 0ms")
+                    return 0
+                }
+            } else {
+                firstAudioTimestamp = timestamp
+                print("📊 First audio timestamp: \(timestamp.seconds)s - normalizing stream start to 0ms")
+                return 0
+            }
         }
 
         let relativeTime = timestamp - anchor
-        guard relativeTime.isNumeric else { return 0 }
-        let ms = relativeTime.seconds * 1000.0
+        let relativeSeconds = relativeTime.isNumeric ? relativeTime.seconds : (timestamp.seconds - anchor.seconds)
+        let ms = relativeSeconds * 1000.0
         guard ms.isFinite, ms > 0 else { return 0 }
         if ms >= Double(UInt32.max) {
             return UInt32.max
@@ -346,7 +416,7 @@ public actor RTMPPublisher {
 
         // Create video payload and send via RTMP message
         let payload = try FLVMuxer.createVideoPayload(sampleBuffer: buffer, isKeyframe: isKeyframe)
-        let timestampMs = normalizeTimestamp(timestamp)
+        let timestampMs = normalizeTimestamp(timestamp, for: .video)
         try await sendRTMPVideoMessage(data: payload, timestamp: timestampMs)
 
         framesSent += 1
@@ -401,7 +471,7 @@ public actor RTMPPublisher {
 
         // Create audio payload and send via RTMP message
         let payload = try FLVMuxer.createAudioPayload(sampleBuffer: buffer)
-        let timestampMs = normalizeTimestamp(timestamp)
+        let timestampMs = normalizeTimestamp(timestamp, for: .audio)
         try await sendRTMPAudioMessage(data: payload, timestamp: timestampMs)
     }
 
@@ -419,7 +489,7 @@ public actor RTMPPublisher {
 
         // Create video payload from encoded frame
         let payload = FLVMuxer.createVideoPayload(from: frame)
-        let timestampMs = normalizeTimestamp(frame.pts)
+        let timestampMs = normalizeTimestamp(frame.pts, for: .video)
         try await sendRTMPVideoMessage(data: payload, timestamp: timestampMs)
 
         framesSent += 1
@@ -437,7 +507,7 @@ public actor RTMPPublisher {
 
         // Create audio payload from encoded frame
         let payload = FLVMuxer.createAudioPayload(from: frame)
-        let timestampMs = normalizeTimestamp(frame.pts)
+        let timestampMs = normalizeTimestamp(frame.pts, for: .audio)
         try await sendRTMPAudioMessage(data: payload, timestamp: timestampMs)
     }
 
@@ -561,13 +631,16 @@ public actor RTMPPublisher {
             existingConnection.cancel()
         }
         connection = nil
+        connectionGeneration &+= 1
+        failStaleSendWaiters()
         state = .disconnected
         isHandshakeComplete = false
         bytesSent = 0
         bytesReceived = 0
         framesSent = 0
         startTime = nil
-        streamStartTimestamp = nil
+        firstVideoTimestamp = nil
+        firstAudioTimestamp = nil
         receiveChunkSize = 128
         sendChunkSize = 4096
         serverWindowAckSize = 250000
@@ -608,22 +681,45 @@ public actor RTMPPublisher {
 
     // MARK: - Send Serialization
 
-    private func acquireSendLock() async {
+    private func acquireSendLock(for generation: UInt64) async throws {
+        guard connectionGeneration == generation else {
+            throw RTMPError.notConnected
+        }
         if !isSendingMessage {
             isSendingMessage = true
             return
         }
-        await withCheckedContinuation { continuation in
-            sendWaiters.append(continuation)
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            sendWaiters.append(SendWaiter(generation: generation, continuation: continuation))
         }
     }
 
     private func releaseSendLock() {
-        if !sendWaiters.isEmpty {
+        while !sendWaiters.isEmpty {
             let next = sendWaiters.removeFirst()
-            next.resume()
-        } else {
-            isSendingMessage = false
+            if next.generation == connectionGeneration {
+                next.continuation.resume()
+                return
+            } else {
+                next.continuation.resume(throwing: RTMPError.notConnected)
+            }
+        }
+        isSendingMessage = false
+    }
+
+    private func failStaleSendWaiters() {
+        var liveWaiters: [SendWaiter] = []
+        var staleWaiters: [SendWaiter] = []
+        for waiter in sendWaiters {
+            if waiter.generation == connectionGeneration {
+                liveWaiters.append(waiter)
+            } else {
+                staleWaiters.append(waiter)
+            }
+        }
+        sendWaiters = liveWaiters
+        for waiter in staleWaiters {
+            waiter.continuation.resume(throwing: RTMPError.notConnected)
         }
     }
 
@@ -655,6 +751,8 @@ public actor RTMPPublisher {
         // `connection` no longer matches.
         connection?.cancel()
         connection = nil
+        connectionGeneration &+= 1
+        failStaleSendWaiters()
 
         finishConnect(.failure(error))
     }
@@ -697,6 +795,11 @@ public actor RTMPPublisher {
     }
 
     private func performHandshake() async throws {
+        let gen = connectionGeneration
+        guard let targetConnection = connection else {
+            throw RTMPError.notConnected
+        }
+
         print("🤝 Performing RTMP handshake...")
 
         // C0: Version byte (0x03)
@@ -712,7 +815,7 @@ public actor RTMPPublisher {
         }
 
         // Send C0 + C1
-        try await sendData(c0 + c1)
+        try await sendData(c0 + c1, expectedGeneration: gen, expectedConnection: targetConnection)
 
         // Receive S0 + S1 + S2 (must receive all 3073 bytes)
         let handshakeTimeout = Duration.seconds(max(5, connectTimeout))
@@ -731,7 +834,7 @@ public actor RTMPPublisher {
 
         // Send C2 (echo of S1)
         let s1 = response.subdata(in: 1..<1537)
-        try await sendData(s1)
+        try await sendData(s1, expectedGeneration: gen, expectedConnection: targetConnection)
 
         isHandshakeComplete = true
         print("✅ RTMP handshake complete")
@@ -1207,8 +1310,17 @@ public actor RTMPPublisher {
         payload: Data,
         timestamp: UInt32 = 0
     ) async throws {
-        await acquireSendLock()
+        let gen = connectionGeneration
+        guard let targetConnection = connection else {
+            throw RTMPError.notConnected
+        }
+
+        try await acquireSendLock(for: gen)
         defer { releaseSendLock() }
+
+        guard connectionGeneration == gen, self.connection === targetConnection else {
+            throw RTMPError.notConnected
+        }
 
         let normalizedPayload = payload.startIndex == 0 ? payload : Data(payload)
         let messageLength = UInt32(normalizedPayload.count)
@@ -1242,7 +1354,7 @@ public actor RTMPPublisher {
         }
 
         if normalizedPayload.isEmpty {
-            try await sendData(header)
+            try await sendData(header, expectedGeneration: gen, expectedConnection: targetConnection)
             return
         }
 
@@ -1286,7 +1398,7 @@ public actor RTMPPublisher {
                 print("📤 Chunk[\(chunkCount)]: fmt=\(fmt) csid=\(chunkStreamId) dataLen=\(chunkSize) offset=\(offset) totalPayload=\(normalizedPayload.count)")
             }
 
-            try await sendData(chunk)
+            try await sendData(chunk, expectedGeneration: gen, expectedConnection: targetConnection)
 
             offset += chunkSize
             chunkCount += 1
@@ -1328,23 +1440,28 @@ public actor RTMPPublisher {
         )
     }
 
-    /// Send raw data packet to RTMP stream
-    private func sendData(_ data: Data) async throws {
-        guard let connection = connection else {
-            state = .error("Connection lost")
+    /// Send raw data packet to RTMP stream, verified against the caller's connection generation.
+    private func sendData(
+        _ data: Data,
+        expectedGeneration: UInt64,
+        expectedConnection: NWConnection
+    ) async throws {
+        guard connectionGeneration == expectedGeneration,
+              let currentConnection = connection,
+              currentConnection === expectedConnection else {
             throw RTMPError.notConnected
         }
 
-        guard connection.state == .ready else {
+        guard currentConnection.state == .ready else {
             state = .error("Connection not ready")
-            throw RTMPError.connectionFailed("Connection state: \(connection.state)")
+            throw RTMPError.connectionFailed("Connection state: \(currentConnection.state)")
         }
 
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            connection.send(content: data, completion: .contentProcessed { [weak self] error in
+            currentConnection.send(content: data, completion: .contentProcessed { [weak self, weak expectedConnection] error in
                 if let error = error {
                     Task { [weak self] in
-                        await self?.handleSendError(error)
+                        await self?.handleSendError(error, from: expectedGeneration, connection: expectedConnection)
                     }
                     continuation.resume(throwing: RTMPError.connectionFailed(error.localizedDescription))
                 } else {
@@ -1353,10 +1470,15 @@ public actor RTMPPublisher {
             })
         }
 
-        bytesSent += UInt64(data.count)
+        if connectionGeneration == expectedGeneration && connection === expectedConnection {
+            bytesSent += UInt64(data.count)
+        }
     }
 
-    private func handleSendError(_ error: Error) {
+    private func handleSendError(_ error: Error, from generation: UInt64, connection source: NWConnection?) {
+        guard connectionGeneration == generation, let source, connection === source else {
+            return
+        }
         state = .error("Send failed: \(error.localizedDescription)")
         print("❌ RTMP send error: \(error)")
     }
@@ -1495,7 +1617,14 @@ public actor RTMPPublisher {
                 totalBytesRead += headerSize
             }
 
-            var csState = chunkStreamStates[chunkStreamId] ?? ChunkStreamState()
+            let csState: ChunkStreamState
+            if let existing = chunkStreamStates[chunkStreamId] {
+                csState = existing
+            } else {
+                let created = ChunkStreamState()
+                chunkStreamStates[chunkStreamId] = created
+                csState = created
+            }
             var rawTimestampField: UInt32 = 0
 
             switch format {
@@ -1593,11 +1722,8 @@ public actor RTMPPublisher {
             if csState.remainingBytes == 0 {
                 let completedPayload = csState.payloadBuffer
                 csState.payloadBuffer = Data()
-                chunkStreamStates[chunkStreamId] = csState
                 lastReceivedMessageType = csState.messageTypeId
                 return (completedPayload, totalBytesRead)
-            } else {
-                chunkStreamStates[chunkStreamId] = csState
             }
         }
     }
@@ -1682,7 +1808,12 @@ public actor RTMPPublisher {
 
                 if let timeout {
                     timeoutTask = Task {
-                        try? await Task.sleep(for: timeout)
+                        do {
+                            try await Task.sleep(for: timeout)
+                        } catch {
+                            return
+                        }
+                        guard !Task.isCancelled else { return }
                         let shouldFail = settled.withLock { already -> Bool in
                             if already { return false }
                             already = true
@@ -1698,12 +1829,12 @@ public actor RTMPPublisher {
                 }
 
                 connection.receive(minimumIncompleteLength: 1, maximumLength: length) { data, _, isComplete, error in
-                    timeoutTask?.cancel()
                     let shouldResume = settled.withLock { already -> Bool in
                         if already { return false }
                         already = true
                         return true
                     }
+                    timeoutTask?.cancel()
                     guard shouldResume else { return }
 
                     // Process non-empty data BEFORE checking isComplete so final TCP bytes are never dropped

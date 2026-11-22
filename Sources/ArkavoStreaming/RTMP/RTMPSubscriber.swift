@@ -115,6 +115,11 @@ public actor RTMPSubscriber {
     private var isHandshakeComplete = false
 
     public let connectTimeout: TimeInterval
+    /// Optional idle read timeout while waiting for the first byte of the next
+    /// media message during playback. `nil` (default) waits indefinitely while
+    /// connected so idle streams waiting for publisher startup are not disconnected;
+    /// mid-message stalls still time out.
+    public let mediaReadTimeout: TimeInterval?
 
     // Pending `connect` continuation settled at most once via `finishConnect`.
     private var connectContinuation: CheckedContinuation<Void, Error>?
@@ -130,8 +135,9 @@ public actor RTMPSubscriber {
     private var windowAckSize: UInt32 = 2500000
     private var serverWindowAckSize: UInt32 = 250000
 
-    // Per-chunk-stream state for full interleaved RTMP chunk reassembly
-    private struct ChunkStreamState {
+    // Per-chunk-stream state for full interleaved RTMP chunk reassembly.
+    // Reference type avoids O(N^2) copy-on-write duplication of `payloadBuffer` across chunks.
+    private final class ChunkStreamState {
         var messageLength: UInt32 = 0
         var messageTypeId: UInt8 = 0
         var timestamp: UInt32 = 0
@@ -168,8 +174,9 @@ public actor RTMPSubscriber {
 
     // MARK: - Initialization
 
-    public init(connectTimeout: TimeInterval = 10) {
+    public init(connectTimeout: TimeInterval = 10, mediaReadTimeout: TimeInterval? = nil) {
         self.connectTimeout = connectTimeout
+        self.mediaReadTimeout = mediaReadTimeout
     }
 
     // MARK: - Public Methods
@@ -222,7 +229,11 @@ public actor RTMPSubscriber {
 
             let timeout = connectTimeout
             connectTimeoutTask = Task { [weak self] in
-                try? await Task.sleep(for: .seconds(timeout))
+                do {
+                    try await Task.sleep(for: .seconds(timeout))
+                } catch {
+                    return
+                }
                 guard !Task.isCancelled else { return }
                 await self?.connectTimedOut(host: parsedURL.host, port: Int(parsedURL.port))
             }
@@ -494,7 +505,10 @@ public actor RTMPSubscriber {
         // Wait for connect _result (rejecting _error)
         var receivedConnectResult = false
         for _ in 0 ..< 25 {
-            let (messageType, messageData, _, _) = try await receiveRTMPMessage(firstByteTimeout: controlTimeout)
+            let (messageType, messageData, _, _) = try await receiveRTMPMessage(
+                firstByteTimeout: controlTimeout,
+                inMessageTimeout: controlTimeout
+            )
 
             if try await handleControlMessage(type: messageType, data: messageData) {
                 continue
@@ -543,7 +557,10 @@ public actor RTMPSubscriber {
         // Wait for createStream _result response while handling control messages
         var receivedStreamId = false
         for _ in 0 ..< 25 {
-            let (messageType, messageData, _, _) = try await receiveRTMPMessage(firstByteTimeout: controlTimeout)
+            let (messageType, messageData, _, _) = try await receiveRTMPMessage(
+                firstByteTimeout: controlTimeout,
+                inMessageTimeout: controlTimeout
+            )
 
             if try await handleControlMessage(type: messageType, data: messageData) {
                 continue
@@ -699,7 +716,7 @@ public actor RTMPSubscriber {
         await onFrame?(frame)
     }
 
-    private func handleMetadata(_ data: Data) async {
+    func handleMetadata(_ data: Data) async {
         var parser = AMF0Parser(data: data)
 
         while parser.bytesRemaining > 0 {
@@ -726,14 +743,24 @@ public actor RTMPSubscriber {
         await onMetadata?(metadata)
     }
 
+    /// Safely converts an AMF0 numeric video dimension (width/height) to `Int`,
+    /// rejecting non-finite, negative, or out-of-range values (including
+    /// `Double(Int.max)` which rounds up to `2^63` and traps in `Int(_:)`).
+    static func sanitizedMetadataDimension(_ value: Double) -> Int? {
+        guard value.isFinite, value >= 0, value <= Double(Int32.max) else {
+            return nil
+        }
+        return Int(value)
+    }
+
     private func parseMetadataDict(_ dict: [String: AMF0Parser.Value]) {
         if case let .number(width) = dict["width"],
-           width.isFinite, width >= 0, width <= Double(Int.max) {
-            metadata.width = Int(width)
+           let sanitizedWidth = Self.sanitizedMetadataDimension(width) {
+            metadata.width = sanitizedWidth
         }
         if case let .number(height) = dict["height"],
-           height.isFinite, height >= 0, height <= Double(Int.max) {
-            metadata.height = Int(height)
+           let sanitizedHeight = Self.sanitizedMetadataDimension(height) {
+            metadata.height = sanitizedHeight
         }
         if case let .number(framerate) = dict["framerate"], framerate.isFinite {
             metadata.framerate = framerate
@@ -787,17 +814,21 @@ public actor RTMPSubscriber {
     // MARK: - RTMP Protocol
 
     private func receiveMediaMessage() async throws -> (messageType: UInt8, data: Data, timestamp: UInt32, bytes: Int) {
-        try await receiveRTMPMessage(firstByteTimeout: .seconds(10))
+        let firstByteTimeout = mediaReadTimeout.map { Duration.seconds($0) }
+        return try await receiveRTMPMessage(
+            firstByteTimeout: firstByteTimeout,
+            inMessageTimeout: .seconds(max(10, connectTimeout))
+        )
     }
 
     /// Receive and reassemble the next complete RTMP message across any number of
     /// interleaved chunk streams. Every chunk stream keeps its own `payloadBuffer`
     /// and `remainingBytes`, so interleaved messages are never dropped or desynced.
     private func receiveRTMPMessage(
-        firstByteTimeout: Duration? = .seconds(10)
+        firstByteTimeout: Duration? = .seconds(10),
+        inMessageTimeout: Duration = .seconds(10)
     ) async throws -> (messageType: UInt8, data: Data, timestamp: UInt32, bytes: Int) {
         var totalBytes = 0
-        let inMessageTimeout: Duration = firstByteTimeout ?? .seconds(10)
         var isFirstChunk = true
 
         while true {
@@ -828,7 +859,14 @@ public actor RTMPSubscriber {
                 chunkWireBytes += 2
             }
 
-            var csState = chunkStreamStates[chunkStreamId] ?? ChunkStreamState()
+            let csState: ChunkStreamState
+            if let existing = chunkStreamStates[chunkStreamId] {
+                csState = existing
+            } else {
+                let created = ChunkStreamState()
+                chunkStreamStates[chunkStreamId] = created
+                csState = created
+            }
             var rawTimestampField: UInt32 = 0
 
             switch format {
@@ -946,10 +984,7 @@ public actor RTMPSubscriber {
                 let completedType = csState.messageTypeId
                 let completedTimestamp = csState.timestamp
                 csState.payloadBuffer = Data()
-                chunkStreamStates[chunkStreamId] = csState
                 return (completedType, completedPayload, completedTimestamp, totalBytes)
-            } else {
-                chunkStreamStates[chunkStreamId] = csState
             }
         }
     }
@@ -1073,7 +1108,12 @@ public actor RTMPSubscriber {
 
                     if let stepTimeout {
                         timeoutTask = Task {
-                            try? await Task.sleep(for: stepTimeout)
+                            do {
+                                try await Task.sleep(for: stepTimeout)
+                            } catch {
+                                return
+                            }
+                            guard !Task.isCancelled else { return }
                             let shouldFail = settled.withLock { already -> Bool in
                                 if already { return false }
                                 already = true
@@ -1089,12 +1129,12 @@ public actor RTMPSubscriber {
                     }
 
                     connection.receive(minimumIncompleteLength: 1, maximumLength: remaining) { data, _, isComplete, error in
-                        timeoutTask?.cancel()
                         let shouldResume = settled.withLock { already -> Bool in
                             if already { return false }
                             already = true
                             return true
                         }
+                        timeoutTask?.cancel()
                         guard shouldResume else { return }
 
                         // Process non-empty data BEFORE checking isComplete so final TCP bytes are never dropped

@@ -138,6 +138,7 @@ public final class RecordingSession: Sendable {
     private var cameraCaptures: [String: CameraManager]
     private var latestCameraMetadata: [String: CameraMetadata] = [:]
     private var remoteCameraIdentifiers: Set<String> = []
+    private var remoteAudioSources: [String: RemoteCameraAudioSource] = [:]
     public private(set) var remoteCameraServer: RemoteCameraServer?
     nonisolated private let audioRouter: AudioRouter
     nonisolated private let audioMixer: AudioMixer
@@ -812,7 +813,11 @@ public final class RecordingSession: Sendable {
         if stopRequestedDuringStart {
             if !_streamingActive.withLock({ $0 }) {
                 await stopSources()
-                resetAudioMixer()
+                if _streamingActive.withLock({ $0 }) {
+                    restartSourcesForStream(includingFrames: false)
+                } else {
+                    resetAudioMixer()
+                }
             } else {
                 cleanupNewlyAddedCameras(newlyAddedCameras)
             }
@@ -820,8 +825,11 @@ public final class RecordingSession: Sendable {
             throw CancellationError()
         }
 
-        // STEP 5: NOW mark recording as active (all sources are ready)
+        // STEP 5: NOW mark recording as active (all sources are ready).
+        // Clear `recordingStarting` so a stop during Step 6 (`audioRouter.startAll()`)
+        // interrupts opening audio sources directly rather than hanging behind a consent prompt.
         _isRecording = true
+        recordingStarting = false
         recordingStartTime = .now
         pauseStartTime = nil
         pausedDuration = .zero
@@ -829,8 +837,17 @@ public final class RecordingSession: Sendable {
 
         // STEP 6: Start audio sources (after encoder is ready to receive samples)
         print("🎙️ RecordingSession: Starting all audio sources...")
+        let audioStartStops = audioStopCount
         try? await audioRouter.startAll()
         print("🎙️ RecordingSession: Audio sources started. Active sources: \(audioRouter.activeSourceIDs)")
+
+        guard !stopRequestedDuringStart, _isRecording, !recordingStopping, audioStartStops == audioStopCount else {
+            if !_streamingActive.withLock({ $0 }) && !_isRecording {
+                audioStopCount &+= 1
+                try? await audioRouter.stopAll()
+            }
+            return
+        }
 
         // Start camera/avatar frame driver if not using desktop (no screen capture to drive timing)
         if !mode.needsDesktop && mode.needsVideo {
@@ -909,8 +926,22 @@ public final class RecordingSession: Sendable {
     /// more into the file once finishing has begun. A stream that starts while this stops the
     /// sources, or while the file finishes, gets them back once the recording is over.
     public func stopRecording() async throws -> URL {
+        if startJoiners != nil {
+            stopRequestedDuringStart = true
+        }
         if recordingStarting {
             stopRequestedDuringStart = true
+            // Interrupt opening captures and audio sources so startup unblocks immediately
+            // rather than hanging behind a capture wait or screen-audio consent prompt.
+            if !_streamingActive.withLock({ $0 }) {
+                screenCapture.stopCapture()
+                stopCameraCaptures()
+                audioStopCount &+= 1
+                try? await audioRouter.stopAll()
+                if _streamingActive.withLock({ $0 }) {
+                    restartSourcesForStream(includingFrames: false)
+                }
+            }
             if startJoiners != nil {
                 _ = try? await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
                     startJoiners?.append(continuation)
@@ -1766,6 +1797,43 @@ extension RecordingSession: RemoteCameraServerDelegate {
         // print("   └─ Metadata forwarded to handler")
     }
 
+    public func remoteCameraServer(
+        _: RemoteCameraServer,
+        didReceiveAudio payload: RemoteCameraMessage.AudioPayload,
+        sourceID: String
+    ) {
+        registerRemoteCamera(identifier: sourceID)
+
+        let audioSource: RemoteCameraAudioSource
+        if let existing = remoteAudioSources[sourceID] {
+            audioSource = existing
+        } else {
+            let routerSourceID = "remote-camera-\(sourceID)"
+            let created = audioRouter.addRemoteCameraAudio(
+                sourceID: routerSourceID,
+                sourceName: "Remote Camera (\(sourceID))"
+            )
+            remoteAudioSources[sourceID] = created
+            syncAudioMixerRouting()
+            audioSource = created
+        }
+
+        if audioSource.isActive {
+            audioSource.processAudioPayload(payload)
+        } else if _isRecording || _streamingActive.withLock({ $0 }) {
+            Task { @MainActor [weak self, audioSource] in
+                guard let self, self.remoteAudioSources[sourceID] === audioSource else { return }
+                try? await audioSource.start()
+                guard self.remoteAudioSources[sourceID] === audioSource,
+                      self._isRecording || self._streamingActive.withLock({ $0 }) else {
+                    try? await audioSource.stop()
+                    return
+                }
+                audioSource.processAudioPayload(payload)
+            }
+        }
+    }
+
     public func remoteCameraServer(_: RemoteCameraServer, didUpdateSources sources: [String]) {
         remoteCameraIdentifiers = Set(sources)
 
@@ -1778,6 +1846,18 @@ extension RecordingSession: RemoteCameraServerDelegate {
         latestCameraMetadata.keys
             .filter { !activeRemoteSources.contains($0) && cameraCaptures[$0] == nil }
             .forEach { latestCameraMetadata.removeValue(forKey: $0) }
+
+        let disconnectedAudioIDs = remoteAudioSources.keys.filter { !activeRemoteSources.contains($0) }
+        for sourceID in disconnectedAudioIDs {
+            if let audioSource = remoteAudioSources.removeValue(forKey: sourceID) {
+                let routerID = audioSource.sourceID
+                audioSource.onSample = nil
+                audioMixer.unregisterSource(routerID)
+                Task { [audioRouter] in
+                    await audioRouter.stopAndRemoveSource(routerID)
+                }
+            }
+        }
 
         remoteSourcesHandler?(Array(remoteCameraIdentifiers).sorted())
     }
